@@ -32,7 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Get failed: %v", err)
 	}
-	fmt.Printf("Got key '%s' with value '%s' at revision %d\n", string(kv.Key), string(kv.Value), kv.Revision)
+	fmt.Printf("Got key '%s' with value '%s' at revision %d\n", string(kv.Key), string(kv.Value), kv.ModRevision)
 
 	// Update the key
 	newValue := []byte("updated-value")
@@ -70,7 +70,7 @@ func main() {
 	}
 	fmt.Printf("Listed %d keys with prefix 'prefix/':\n", len(keys))
 	for _, kv := range keys {
-		fmt.Printf("  %s = %s (revision %d)\n", string(kv.Key), string(kv.Value), kv.Revision)
+		fmt.Printf("  %s = %s (revision %d)\n", string(kv.Key), string(kv.Value), kv.ModRevision)
 	}
 
 	fmt.Println("\ncloud-etcd demo completed successfully!")

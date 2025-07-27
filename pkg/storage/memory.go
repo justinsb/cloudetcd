@@ -9,10 +9,10 @@ import (
 
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
-	mu       sync.RWMutex
-	data     map[string]*KeyValue
+	mu        sync.RWMutex
+	data      map[string]*KeyValue
 	revisions map[string][]*KeyValue // All revisions of each key
-	revision Revision
+	revision  Revision
 }
 
 // NewMemoryStorage creates a new in-memory storage instance.
@@ -30,12 +30,26 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	defer m.mu.Unlock()
 
 	m.revision++
-	kv := &KeyValue{
-		Key:      key,
-		Value:    value,
-		Revision: m.revision,
-	}
 	keyStr := string(key)
+
+	// Check if key already exists
+	existing, exists := m.data[keyStr]
+
+	kv := &KeyValue{
+		Key:         key,
+		Value:       value,
+		ModRevision: m.revision,
+		Deleted:     false,
+	}
+
+	if exists {
+		// Key exists, update it
+		kv.CreateRevision = existing.CreateRevision
+	} else {
+		// New key
+		kv.CreateRevision = m.revision
+	}
+
 	m.data[keyStr] = kv
 	m.revisions[keyStr] = append(m.revisions[keyStr], kv)
 	return m.revision, nil
@@ -52,14 +66,19 @@ func (m *MemoryStorage) Get(ctx context.Context, key []byte, atRevision Revision
 		return nil, fmt.Errorf("key not found: %s", keyStr)
 	}
 
-	// If no specific revision requested, return the latest
+	// If no specific revision requested, return the latest version
 	if atRevision == 0 {
-		return revisions[len(revisions)-1], nil
+		latest := revisions[len(revisions)-1]
+		if latest.Deleted {
+			return nil, fmt.Errorf("key not found: %s", keyStr)
+		}
+		return latest, nil
 	}
 
 	// Find the revision at or before the requested revision
 	for i := len(revisions) - 1; i >= 0; i-- {
-		if revisions[i].Revision <= atRevision {
+		if revisions[i].ModRevision <= atRevision {
+			// Return the version at this revision (could be deleted)
 			return revisions[i], nil
 		}
 	}
@@ -74,8 +93,25 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 
 	m.revision++
 	keyStr := string(key)
-	delete(m.data, keyStr)
-	delete(m.revisions, keyStr)
+
+	existing, exists := m.data[keyStr]
+	if !exists {
+		return m.revision, nil // Key doesn't exist, nothing to delete
+	}
+
+	// Create a tombstone entry
+	tombstone := &KeyValue{
+		Key:            key,
+		Value:          nil,
+		CreateRevision: existing.CreateRevision,
+		ModRevision:    m.revision,
+		Deleted:        true,
+	}
+
+	// Update the current data and add to revisions
+	m.data[keyStr] = tombstone
+	m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
+
 	return m.revision, nil
 }
 
@@ -93,11 +129,15 @@ func (m *MemoryStorage) List(ctx context.Context, prefix []byte, atRevision Revi
 			// Get the appropriate revision
 			var kv *KeyValue
 			if atRevision == 0 {
-				kv = revisions[len(revisions)-1]
+				// Get the latest version, but skip if it's deleted
+				latest := revisions[len(revisions)-1]
+				if !latest.Deleted {
+					kv = latest
+				}
 			} else {
 				// Find the revision at or before the requested revision
 				for i := len(revisions) - 1; i >= 0; i-- {
-					if revisions[i].Revision <= atRevision {
+					if revisions[i].ModRevision <= atRevision {
 						kv = revisions[i]
 						break
 					}

@@ -19,7 +19,11 @@ The project is in early development. Currently implemented:
 - **Storage Interface**: A clean abstraction for the storage layer
 - **Memory Storage**: An in-memory implementation for testing and development
 - **Core Operations**: Create, update, get, delete, and list operations
-- **Revision Support**: Full support for etcd-style revisions
+- **MVCC Support**: Full Multi-Version Concurrency Control with revision ranges
+  - `CreateRevision`: Tracks when a key was first created
+  - `ModRevision`: Tracks when a key was last modified
+  - `Deleted`: Tombstone flag for deleted entries
+- **Historical Access**: Ability to query data at specific revisions
 - **Comprehensive Tests**: Test coverage for all core operations including concurrent access
 
 ## Building and Testing

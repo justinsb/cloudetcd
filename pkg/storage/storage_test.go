@@ -53,8 +53,14 @@ func TestMemoryStorage_Get(t *testing.T) {
 	if !reflect.DeepEqual(kv.Value, value) {
 		t.Errorf("Expected value %v, got %v", value, kv.Value)
 	}
-	if kv.Revision != 1 {
-		t.Errorf("Expected revision 1, got %d", kv.Revision)
+	if kv.CreateRevision != 1 {
+		t.Errorf("Expected CreateRevision 1, got %d", kv.CreateRevision)
+	}
+	if kv.ModRevision != 1 {
+		t.Errorf("Expected ModRevision 1, got %d", kv.ModRevision)
+	}
+	if kv.Deleted {
+		t.Error("Expected Deleted to be false")
 	}
 
 	// Test get non-existent key
@@ -68,8 +74,8 @@ func TestMemoryStorage_Get(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get at revision failed: %v", err)
 	}
-	if kv.Revision != 1 {
-		t.Errorf("Expected revision 1, got %d", kv.Revision)
+	if kv.ModRevision != 1 {
+		t.Errorf("Expected ModRevision 1, got %d", kv.ModRevision)
 	}
 
 	// Test get at future revision (should fail)
@@ -103,7 +109,7 @@ func TestMemoryStorage_Delete(t *testing.T) {
 		t.Errorf("Expected revision 2, got %d", revision)
 	}
 
-	// Verify it's gone
+	// Verify it's gone (should return error for deleted key)
 	_, err = storage.Get(ctx, key, 0)
 	if err == nil {
 		t.Error("Expected error for deleted key")
@@ -197,6 +203,9 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 	if !reflect.DeepEqual(kv.Value, value1) {
 		t.Errorf("Expected value1 at revision1, got %v", kv.Value)
 	}
+	if kv.ModRevision != revision1 {
+		t.Errorf("Expected ModRevision %d, got %d", revision1, kv.ModRevision)
+	}
 
 	// Get at revision2
 	kv, err = storage.Get(ctx, key, revision2)
@@ -205,6 +214,9 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 	}
 	if !reflect.DeepEqual(kv.Value, value2) {
 		t.Errorf("Expected value2 at revision2, got %v", kv.Value)
+	}
+	if kv.ModRevision != revision2 {
+		t.Errorf("Expected ModRevision %d, got %d", revision2, kv.ModRevision)
 	}
 }
 
@@ -238,5 +250,74 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 		if err != nil {
 			t.Errorf("Key %s not found after concurrent access", string(key))
 		}
+	}
+}
+
+func TestMemoryStorage_MVCCBehavior(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	// Put a key
+	key := []byte("test-key")
+	value1 := []byte("value1")
+	revision1, _ := storage.Put(ctx, key, value1, 0)
+
+	// Update the key
+	value2 := []byte("value2")
+	revision2, _ := storage.Put(ctx, key, value2, 0)
+
+	// Delete the key
+	revision3, _ := storage.Delete(ctx, key)
+
+	// Test historical access
+	// At revision1, should get value1
+	kv, err := storage.Get(ctx, key, revision1)
+	if err != nil {
+		t.Fatalf("Get at revision1 failed: %v", err)
+	}
+	if !reflect.DeepEqual(kv.Value, value1) {
+		t.Errorf("Expected value1 at revision1, got %v", kv.Value)
+	}
+	if kv.CreateRevision != revision1 {
+		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
+	}
+	if kv.ModRevision != revision1 {
+		t.Errorf("Expected ModRevision %d, got %d", revision1, kv.ModRevision)
+	}
+
+	// At revision2, should get value2
+	kv, err = storage.Get(ctx, key, revision2)
+	if err != nil {
+		t.Fatalf("Get at revision2 failed: %v", err)
+	}
+	if !reflect.DeepEqual(kv.Value, value2) {
+		t.Errorf("Expected value2 at revision2, got %v", kv.Value)
+	}
+	if kv.CreateRevision != revision1 {
+		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
+	}
+	if kv.ModRevision != revision2 {
+		t.Errorf("Expected ModRevision %d, got %d", revision2, kv.ModRevision)
+	}
+
+	// At revision3, should get deleted version
+	kv, err = storage.Get(ctx, key, revision3)
+	if err != nil {
+		t.Fatalf("Get at revision3 failed: %v", err)
+	}
+	if !kv.Deleted {
+		t.Error("Expected deleted version at revision3")
+	}
+	if kv.CreateRevision != revision1 {
+		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
+	}
+	if kv.ModRevision != revision3 {
+		t.Errorf("Expected ModRevision %d, got %d", revision3, kv.ModRevision)
+	}
+
+	// At latest revision (0), should get error for deleted key
+	_, err = storage.Get(ctx, key, 0)
+	if err == nil {
+		t.Error("Expected error for deleted key at latest revision")
 	}
 }
