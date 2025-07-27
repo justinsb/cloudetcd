@@ -56,8 +56,12 @@ type Storage interface {
 	Delete(ctx context.Context, key []byte) (Revision, error)
 
 	// List returns a range of key-value pairs.
-	List(ctx context.Context, prefix []byte, atRevision Revision) ([]*KeyValue, error)
+	// If rangeEnd is empty, it returns all keys with the given prefix.
+	// If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
+	List(ctx context.Context, key []byte, rangeEnd []byte, atRevision Revision) ([]*KeyValue, error)
 
-	// Watch creates a watcher for the given key/prefix starting from the specified revision
-	Watch(ctx context.Context, key []byte, prefix bool, startRevision Revision) (Watcher, error)
+	// Watch creates a watcher for the given key/range starting from the specified revision
+	// If rangeEnd is empty, it watches a single key.
+	// If rangeEnd is specified, it watches the range [key, rangeEnd).
+	Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error)
 }

@@ -107,7 +107,7 @@ func runDemo() {
 	}
 
 	// List all keys with prefix
-	keys, err := store.List(ctx, []byte("prefix/"), 0)
+	keys, err := store.List(ctx, []byte("prefix/"), []byte{}, 0)
 	if err != nil {
 		log.Fatalf("List failed: %v", err)
 	}

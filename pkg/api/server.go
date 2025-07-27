@@ -29,13 +29,14 @@ type watchStream struct {
 
 // activeWatch represents a single active watch
 type activeWatch struct {
-	id      int64
-	watcher storage.Watcher
-	key     []byte
-	prefix  bool
-	prevKv  bool
-	filters []etcdserverpb.WatchCreateRequest_FilterType
-	closed  int32 // atomic flag
+	id       int64
+	watcher  storage.Watcher
+	key      []byte
+	rangeEnd []byte // Store the range end for proper filtering
+	prefix   bool
+	prevKv   bool
+	filters  []etcdserverpb.WatchCreateRequest_FilterType
+	closed   int32 // atomic flag
 }
 
 func (aw *activeWatch) isClosed() bool {
@@ -96,16 +97,16 @@ func (s *Server) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*et
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
 
-	// Handle prefix-based range queries
+	// Handle range queries with RangeEnd
 	if len(req.RangeEnd) > 0 {
 		return s.handleRangeWithEnd(ctx, req)
 	}
 
-	// Handle single key or prefix queries
-	return s.handleSingleKeyOrPrefix(ctx, req)
+	// Handle single key queries
+	return s.handleSingleKey(ctx, req)
 }
 
-func (s *Server) handleSingleKeyOrPrefix(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+func (s *Server) handleSingleKey(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	var revision storage.Revision
 	if req.Revision > 0 {
 		revision = storage.Revision(req.Revision)
@@ -115,56 +116,32 @@ func (s *Server) handleSingleKeyOrPrefix(ctx context.Context, req *etcdserverpb.
 	var count int64
 
 	if req.CountOnly {
-		// Count-only query
-		if len(req.RangeEnd) == 0 {
-			// Single key count
-			_, err := s.storage.Get(ctx, req.Key, revision)
-			if err != nil {
-				if strings.Contains(err.Error(), "not found") {
-					return &etcdserverpb.RangeResponse{
-						Header: s.createHeader(revision),
-						Count:  0,
-					}, nil
-				}
-				return nil, status.Error(codes.Internal, err.Error())
+		// Count-only query for single key
+		_, err := s.storage.Get(ctx, req.Key, revision)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return &etcdserverpb.RangeResponse{
+					Header: s.createHeader(revision),
+					Count:  0,
+				}, nil
 			}
-			count = 1
-		} else {
-			// Prefix count
-			keys, err := s.storage.List(ctx, req.Key, revision)
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			count = int64(len(keys))
+			return nil, status.Error(codes.Internal, err.Error())
 		}
+		count = 1
 	} else {
-		// Full query
-		if len(req.RangeEnd) == 0 {
-			// Single key query
-			kv, err := s.storage.Get(ctx, req.Key, revision)
-			if err != nil {
-				if strings.Contains(err.Error(), "not found") {
-					return &etcdserverpb.RangeResponse{
-						Header: s.createHeader(revision),
-						Count:  0,
-					}, nil
-				}
-				return nil, status.Error(codes.Internal, err.Error())
+		// Full query for single key
+		kv, err := s.storage.Get(ctx, req.Key, revision)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return &etcdserverpb.RangeResponse{
+					Header: s.createHeader(revision),
+					Count:  0,
+				}, nil
 			}
-			kvs = []*mvccpb.KeyValue{s.convertToMVCCKeyValue(kv)}
-			count = 1
-		} else {
-			// Prefix query
-			keys, err := s.storage.List(ctx, req.Key, revision)
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			kvs = make([]*mvccpb.KeyValue, len(keys))
-			for i, kv := range keys {
-				kvs[i] = s.convertToMVCCKeyValue(kv)
-			}
-			count = int64(len(kvs))
+			return nil, status.Error(codes.Internal, err.Error())
 		}
+		kvs = []*mvccpb.KeyValue{s.convertToMVCCKeyValue(kv)}
+		count = 1
 	}
 
 	return &etcdserverpb.RangeResponse{
@@ -175,38 +152,34 @@ func (s *Server) handleSingleKeyOrPrefix(ctx context.Context, req *etcdserverpb.
 }
 
 func (s *Server) handleRangeWithEnd(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	// For now, we'll implement a simple range query
-	// In a full implementation, we'd need to implement proper range queries
-	// This is a simplified version that treats it as a prefix query
-
 	var revision storage.Revision
 	if req.Revision > 0 {
 		revision = storage.Revision(req.Revision)
 	}
 
-	keys, err := s.storage.List(ctx, req.Key, revision)
+	// Use the storage layer's efficient range query
+	keys, err := s.storage.List(ctx, req.Key, req.RangeEnd, revision)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	// Filter keys that are less than RangeEnd
-	var filteredKeys []*storage.KeyValue
-	for _, kv := range keys {
-		if len(req.RangeEnd) > 0 && string(kv.Key) >= string(req.RangeEnd) {
-			continue
-		}
-		filteredKeys = append(filteredKeys, kv)
-	}
+	var kvs []*mvccpb.KeyValue
+	var count int64
 
-	kvs := make([]*mvccpb.KeyValue, len(filteredKeys))
-	for i, kv := range filteredKeys {
-		kvs[i] = s.convertToMVCCKeyValue(kv)
+	if req.CountOnly {
+		count = int64(len(keys))
+	} else {
+		kvs = make([]*mvccpb.KeyValue, len(keys))
+		for i, kv := range keys {
+			kvs[i] = s.convertToMVCCKeyValue(kv)
+		}
+		count = int64(len(kvs))
 	}
 
 	return &etcdserverpb.RangeResponse{
 		Header: s.createHeader(revision),
 		Kvs:    kvs,
-		Count:  int64(len(kvs)),
+		Count:  count,
 	}, nil
 }
 
@@ -273,19 +246,14 @@ func (s *Server) DeleteRange(ctx context.Context, req *etcdserverpb.DeleteRangeR
 		}, nil
 	}
 
-	// Range deletion - for now, we'll implement a simple version
-	// that deletes keys with the given prefix
-	keys, err := s.storage.List(ctx, req.Key, 0)
+	// Range deletion - use the storage layer's efficient range query
+	keys, err := s.storage.List(ctx, req.Key, req.RangeEnd, 0)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	var maxRevision storage.Revision
 	for _, kv := range keys {
-		if len(req.RangeEnd) > 0 && string(kv.Key) >= string(req.RangeEnd) {
-			continue
-		}
-
 		if req.PrevKv {
 			prevKvs = append(prevKvs, s.convertToMVCCKeyValue(kv))
 		}
@@ -431,12 +399,12 @@ func (ws *watchStream) handleCreateRequest(req *etcdserverpb.WatchCreateRequest)
 	ws.watchID++
 	watchID := ws.watchID
 
-	// Determine if this is a prefix watch
-	prefix := len(req.RangeEnd) > 0
+	// Determine if this is a range watch (when RangeEnd is specified)
+	isRangeWatch := len(req.RangeEnd) > 0
 
 	// Create storage watcher
 	startRevision := storage.Revision(req.StartRevision)
-	watcher, err := ws.server.storage.Watch(ws.ctx, req.Key, prefix, startRevision)
+	watcher, err := ws.server.storage.Watch(ws.ctx, req.Key, req.RangeEnd, startRevision)
 	if err != nil {
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
@@ -451,12 +419,13 @@ func (ws *watchStream) handleCreateRequest(req *etcdserverpb.WatchCreateRequest)
 
 	// Create active watch
 	activeWatch := &activeWatch{
-		id:      watchID,
-		watcher: watcher,
-		key:     req.Key,
-		prefix:  prefix,
-		prevKv:  req.PrevKv,
-		filters: req.Filters,
+		id:       watchID,
+		watcher:  watcher,
+		key:      req.Key,
+		rangeEnd: req.RangeEnd, // Store the range end
+		prefix:   isRangeWatch, // Reuse the prefix field to indicate range watch
+		prevKv:   req.PrevKv,
+		filters:  req.Filters,
 	}
 
 	ws.watches[watchID] = activeWatch

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -353,7 +354,7 @@ func TestWatchStorage(t *testing.T) {
 
 	t.Run("Storage Watch Interface", func(t *testing.T) {
 		// Create a watcher for exact key match
-		watcher, err := store.Watch(ctx, []byte("test-key"), false, 0)
+		watcher, err := store.Watch(ctx, []byte("test-key"), []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
@@ -438,8 +439,8 @@ func TestWatchStorage(t *testing.T) {
 	})
 
 	t.Run("Storage Prefix Watch", func(t *testing.T) {
-		// Create a watcher for prefix match
-		watcher, err := store.Watch(ctx, []byte("prefix/"), true, 0)
+		// Create a watcher for prefix match (using empty rangeEnd for prefix behavior)
+		watcher, err := store.Watch(ctx, []byte("prefix/"), []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
@@ -573,4 +574,73 @@ func TestServerMethods(t *testing.T) {
 			t.Errorf("Expected 1 deleted key, got %d", resp.Deleted)
 		}
 	})
+}
+
+func TestRangeWithRangeEnd(t *testing.T) {
+	store := storage.NewMemoryStorage()
+	server := NewServer(store)
+
+	ctx := context.Background()
+
+	// Put some test data
+	_, err := server.Put(ctx, &etcdserverpb.PutRequest{
+		Key:   []byte("a"),
+		Value: []byte("value-a"),
+	})
+	require.NoError(t, err)
+
+	_, err = server.Put(ctx, &etcdserverpb.PutRequest{
+		Key:   []byte("b"),
+		Value: []byte("value-b"),
+	})
+	require.NoError(t, err)
+
+	_, err = server.Put(ctx, &etcdserverpb.PutRequest{
+		Key:   []byte("c"),
+		Value: []byte("value-c"),
+	})
+	require.NoError(t, err)
+
+	_, err = server.Put(ctx, &etcdserverpb.PutRequest{
+		Key:   []byte("d"),
+		Value: []byte("value-d"),
+	})
+	require.NoError(t, err)
+
+	// Test range query [b, d) - should return b and c
+	resp, err := server.Range(ctx, &etcdserverpb.RangeRequest{
+		Key:      []byte("b"),
+		RangeEnd: []byte("d"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), resp.Count)
+	require.Len(t, resp.Kvs, 2)
+
+	// Verify we got b and c
+	keys := make([]string, len(resp.Kvs))
+	for i, kv := range resp.Kvs {
+		keys[i] = string(kv.Key)
+	}
+	require.Contains(t, keys, "b")
+	require.Contains(t, keys, "c")
+	require.NotContains(t, keys, "a")
+	require.NotContains(t, keys, "d")
+
+	// Test range query [a, c) - should return a and b
+	resp, err = server.Range(ctx, &etcdserverpb.RangeRequest{
+		Key:      []byte("a"),
+		RangeEnd: []byte("c"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), resp.Count)
+	require.Len(t, resp.Kvs, 2)
+
+	keys = make([]string, len(resp.Kvs))
+	for i, kv := range resp.Kvs {
+		keys[i] = string(kv.Key)
+	}
+	require.Contains(t, keys, "a")
+	require.Contains(t, keys, "b")
+	require.NotContains(t, keys, "c")
+	require.NotContains(t, keys, "d")
 }

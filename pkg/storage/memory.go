@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -13,7 +12,7 @@ import (
 type memoryWatcher struct {
 	id            int64
 	key           []byte
-	prefix        bool
+	rangeEnd      []byte // Store the range end for proper filtering
 	startRevision Revision
 	ch            chan *WatchResponse
 	closed        int32 // atomic flag
@@ -67,17 +66,26 @@ func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
 
 		// Check if this watcher should receive this event
 		shouldNotify := false
-		if watcher.prefix {
-			// Prefix match
-			if len(event.Key) >= len(watcher.key) &&
-				strings.HasPrefix(string(event.Key), string(watcher.key)) {
-				shouldNotify = true
-			}
-		} else {
-			// Exact key match
+		if len(watcher.rangeEnd) == 0 {
+			// Empty rangeEnd means prefix watch or exact key match
+			// If the key is the same as the watcher key, it's an exact match
+			// Otherwise, it's a prefix match
 			if string(event.Key) == string(watcher.key) {
 				shouldNotify = true
+			} else if len(watcher.key) > 0 {
+				// Prefix match: check if event key starts with watcher key
+				eventKey := string(event.Key)
+				watcherKey := string(watcher.key)
+				if len(eventKey) >= len(watcherKey) && eventKey[:len(watcherKey)] == watcherKey {
+					shouldNotify = true
+				}
 			}
+		} else {
+			// Range match: check if event key is in range [key, rangeEnd)
+			eventKey := string(event.Key)
+			startKey := string(watcher.key)
+			endKey := string(watcher.rangeEnd)
+			shouldNotify = eventKey >= startKey && eventKey < endKey
 		}
 
 		if shouldNotify && revision >= watcher.startRevision {
@@ -225,17 +233,30 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	return m.revision, nil
 }
 
-// List returns a range of key-value pairs with the given prefix.
-func (m *MemoryStorage) List(ctx context.Context, prefix []byte, atRevision Revision) ([]*KeyValue, error) {
+// List returns a range of key-value pairs.
+// If rangeEnd is empty, it returns all keys with the given prefix.
+// If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
+func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, atRevision Revision) ([]*KeyValue, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var result []*KeyValue
-	prefixStr := string(prefix)
+	keyStr := string(key)
+	rangeEndStr := string(rangeEnd)
 
-	for key, revisions := range m.revisions {
-		// Check if key starts with prefix
-		if len(prefix) == 0 || (len(key) >= len(prefixStr) && key[:len(prefixStr)] == prefixStr) {
+	for storageKey, revisions := range m.revisions {
+		// Check if key is in the specified range
+		var shouldInclude bool
+
+		if len(rangeEnd) == 0 {
+			// No range end specified - treat as prefix query
+			shouldInclude = len(key) == 0 || (len(storageKey) >= len(keyStr) && storageKey[:len(keyStr)] == keyStr)
+		} else {
+			// Range query: include keys where key >= startKey and key < endKey
+			shouldInclude = storageKey >= keyStr && storageKey < rangeEndStr
+		}
+
+		if shouldInclude {
 			// Get the appropriate revision
 			var kv *KeyValue
 			if atRevision == 0 {
@@ -268,8 +289,10 @@ func (m *MemoryStorage) List(ctx context.Context, prefix []byte, atRevision Revi
 	return result, nil
 }
 
-// Watch creates a watcher for the given key/prefix starting from the specified revision
-func (m *MemoryStorage) Watch(ctx context.Context, key []byte, prefix bool, startRevision Revision) (Watcher, error) {
+// Watch creates a watcher for the given key/range starting from the specified revision
+// If rangeEnd is empty, it watches a single key.
+// If rangeEnd is specified, it watches the range [key, rangeEnd).
+func (m *MemoryStorage) Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error) {
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 
@@ -277,7 +300,7 @@ func (m *MemoryStorage) Watch(ctx context.Context, key []byte, prefix bool, star
 	watcher := &memoryWatcher{
 		id:            m.watcherID,
 		key:           key,
-		prefix:        prefix,
+		rangeEnd:      rangeEnd,
 		startRevision: startRevision,
 		ch:            make(chan *WatchResponse, 100), // Buffered channel
 		closeCh:       make(chan struct{}),

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestMemoryStorage_Put(t *testing.T) {
@@ -138,7 +140,7 @@ func TestMemoryStorage_List(t *testing.T) {
 	}
 
 	// Test list all keys
-	allKeys, err := storage.List(ctx, []byte{}, 0)
+	allKeys, err := storage.List(ctx, []byte{}, []byte{}, 0)
 	if err != nil {
 		t.Fatalf("List all failed: %v", err)
 	}
@@ -146,8 +148,8 @@ func TestMemoryStorage_List(t *testing.T) {
 		t.Errorf("Expected 4 keys, got %d", len(allKeys))
 	}
 
-	// Test list with prefix
-	prefix1Keys, err := storage.List(ctx, []byte("prefix1/"), 0)
+	// Test list with prefix (using empty rangeEnd for prefix behavior)
+	prefix1Keys, err := storage.List(ctx, []byte("prefix1/"), []byte{}, 0)
 	if err != nil {
 		t.Fatalf("List with prefix failed: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestMemoryStorage_List(t *testing.T) {
 	}
 
 	// Test list with non-existent prefix
-	emptyKeys, err := storage.List(ctx, []byte("non-existent/"), 0)
+	emptyKeys, err := storage.List(ctx, []byte("non-existent/"), []byte{}, 0)
 	if err != nil {
 		t.Fatalf("List with non-existent prefix failed: %v", err)
 	}
@@ -301,4 +303,64 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for deleted key at latest revision")
 	}
+}
+
+func TestMemoryStorage_RangeQueries(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	// Put some test data
+	testData := map[string]string{
+		"a": "value-a",
+		"b": "value-b",
+		"c": "value-c",
+		"d": "value-d",
+		"e": "value-e",
+	}
+
+	for k, v := range testData {
+		_, err := storage.Put(ctx, []byte(k), []byte(v), 0)
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// Test range query [b, d) - should return b and c
+	rangeKeys, err := storage.List(ctx, []byte("b"), []byte("d"), 0)
+	if err != nil {
+		t.Fatalf("Range query failed: %v", err)
+	}
+	if len(rangeKeys) != 2 {
+		t.Errorf("Expected 2 keys in range [b, d), got %d", len(rangeKeys))
+	}
+
+	// Verify we got b and c
+	keys := make([]string, len(rangeKeys))
+	for i, kv := range rangeKeys {
+		keys[i] = string(kv.Key)
+	}
+	require.Contains(t, keys, "b")
+	require.Contains(t, keys, "c")
+	require.NotContains(t, keys, "a")
+	require.NotContains(t, keys, "d")
+	require.NotContains(t, keys, "e")
+
+	// Test range query [a, c) - should return a and b
+	rangeKeys, err = storage.List(ctx, []byte("a"), []byte("c"), 0)
+	if err != nil {
+		t.Fatalf("Range query failed: %v", err)
+	}
+	if len(rangeKeys) != 2 {
+		t.Errorf("Expected 2 keys in range [a, c), got %d", len(rangeKeys))
+	}
+
+	keys = make([]string, len(rangeKeys))
+	for i, kv := range rangeKeys {
+		keys[i] = string(kv.Key)
+	}
+	require.Contains(t, keys, "a")
+	require.Contains(t, keys, "b")
+	require.NotContains(t, keys, "c")
+	require.NotContains(t, keys, "d")
+	require.NotContains(t, keys, "e")
 }
