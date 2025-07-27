@@ -2,14 +2,57 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"justinsb.com/cloudetcd/pkg/api"
 	"justinsb.com/cloudetcd/pkg/storage"
 )
 
 func main() {
-	fmt.Println("cloud-etcd starting...")
+	// Parse command line flags
+	var (
+		addr = flag.String("addr", ":2379", "Address to listen on")
+		demo = flag.Bool("demo", false, "Run demo instead of server")
+	)
+	flag.Parse()
+
+	if *demo {
+		runDemo()
+		return
+	}
+
+	fmt.Println("Starting cloud-etcd server...")
+
+	// Create storage instance
+	store := storage.NewMemoryStorage()
+
+	// Create and start the etcd API server
+	server := api.NewServer(store)
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down server...")
+		server.Stop()
+	}()
+
+	// Start the server
+	fmt.Printf("Starting etcd API server on %s\n", *addr)
+	if err := server.Start(*addr); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func runDemo() {
+	fmt.Println("cloud-etcd demo starting...")
 
 	// Create a new storage instance
 	store := storage.NewMemoryStorage()

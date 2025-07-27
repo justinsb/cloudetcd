@@ -25,6 +25,11 @@ The project is in early development. Currently implemented:
   - `Deleted`: Tombstone flag for deleted entries
 - **Historical Access**: Ability to query data at specific revisions
 - **Comprehensive Tests**: Test coverage for all core operations including concurrent access
+- **etcd v3 API**: Full gRPC server implementing the etcd v3 API
+  - Key-Value operations (PUT, GET, DELETE, RANGE)
+  - Transactions
+  - Lease management (basic implementation)
+  - Compatible with official etcd client library
 
 ## Building and Testing
 
@@ -45,21 +50,39 @@ go test ./pkg/storage -v
 go test ./pkg/storage -race
 ```
 
-### Running the Demo
+### Running the Server
 
 ```bash
-# Run the demo program
+# Start the etcd API server (default port 2379)
 go run cmd/cloud-etcd/main.go
+
+# Start on a different port
+go run cmd/cloud-etcd/main.go -addr :2380
+
+# Run the demo instead
+go run cmd/cloud-etcd/main.go -demo
+```
+
+### Testing with etcd Client
+
+```bash
+# Start the server
+go run cmd/cloud-etcd/main.go
+
+# In another terminal, run the test client
+go run cmd/test-client/main.go
 ```
 
 ## Project Structure
 
 ```
 cloudetcd/
-├── cmd/cloud-etcd/     # Main application entry point
+├── cmd/
+│   ├── cloud-etcd/     # Main application entry point
+│   └── test-client/    # Test client using etcd client library
 ├── docs/               # Documentation
 ├── pkg/
-│   ├── api/           # etcd API layer (future)
+│   ├── api/           # etcd API layer
 │   ├── replicator/    # Replicator component (future)
 │   └── storage/       # Storage interface and implementations
 └── README.md
@@ -68,11 +91,12 @@ cloudetcd/
 ## Next Steps
 
 1. **DynamoDB Implementation**: Implement the storage interface using DynamoDB
-2. **etcd API Layer**: Implement the gRPC server with etcd v3 API
-3. **Local Cache**: Implement persistent local cache (BoltDB/LevelDB)
-4. **Replicator**: Implement the component that keeps local cache in sync
-5. **Watch API**: Implement etcd's watch functionality
-6. **Lease Management**: Implement TTL and lease management
+2. **Local Cache**: Implement persistent local cache (BoltDB/LevelDB)
+3. **Replicator**: Implement the component that keeps local cache in sync
+4. **Watch API**: Implement etcd's watch functionality
+5. **Lease Management**: Implement full TTL and lease management
+6. **Authentication**: Add authentication and authorization
+7. **TLS**: Add TLS support for secure communication
 
 ## Contributing
 

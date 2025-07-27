@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cloud-etcd-server
+  labels:
+    app: cloud-etcd
+spec:
+  containers:
+  - name: cloud-etcd
+    image: your-registry/cloud-etcd:latest
+    ports:
+    - containerPort: 2379
+      name: etcd
+    - containerPort: 2380
+      name: etcd-metrics
+    command:
+    - /cloud-etcd
+    - -addr=:2379
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-etcd-service
+  labels:
+    app: cloud-etcd
+spec:
+  ports:
+  - port: 2379
+    targetPort: 2379
+    name: etcd
+  selector:
+    app: cloud-etcd
+---
+# Example kube-apiserver configuration to use cloud-etcd
+# This would be used when starting kube-apiserver:
+#
+# kube-apiserver \
+#   --etcd-servers=http://cloud-etcd-service:2379 \
+#   --etcd-prefix=/registry \
+#   --storage-backend=etcd3 \
+#   --advertise-address=<your-api-server-ip> \
+#   --allow-privileged=true \
+#   --authorization-mode=Node,RBAC \
+#   --enable-admission-plugins=NodeRestriction \
+#   --service-account-key-file=/path/to/service-account.key \
+#   --service-account-signing-key-file=/path/to/service-account.key \
+#   --service-account-issuer=https://kubernetes.default.svc.cluster.local \
+#   --client-ca-file=/path/to/ca.crt \
+#   --tls-cert-file=/path/to/tls.crt \
+#   --tls-private-key-file=/path/to/tls.key 
