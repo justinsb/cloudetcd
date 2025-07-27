@@ -475,73 +475,54 @@ func (ws *watchStream) handleProgressRequest(req *etcdserverpb.WatchProgressRequ
 func (ws *watchStream) watchEvents(watch *activeWatch) {
 	defer watch.close()
 
-	for {
-		select {
-		case <-ws.ctx.Done():
-			return
-		case watchResp, ok := <-watch.watcher.Chan():
-			if !ok {
+	// Process watch events
+	for watchResp := range watch.watcher.Chan() {
+		// Apply filters and convert events
+		var events []*mvccpb.Event
+		for _, event := range watchResp.Events {
+			// Apply filters
+			if ws.shouldFilterEvent(event, watch.filters) {
+				continue
+			}
+
+			// Add previous KV if requested and available
+			if watch.prevKv && event.PrevKv == nil {
+				// We need to fetch the previous value if not provided
+				// This is a simplified implementation
+				prevKv, err := ws.server.storage.Get(ws.ctx, event.Kv.Key, storage.Revision(event.Kv.CreateRevision-1))
+				if err == nil && prevKv != nil {
+					event.PrevKv = ws.server.convertToMVCCKeyValue(prevKv)
+				}
+			}
+
+			events = append(events, event)
+		}
+
+		// Send response if we have events
+		if len(events) > 0 {
+			resp := &etcdserverpb.WatchResponse{
+				Header:  ws.server.createHeader(storage.Revision(watchResp.Revision)),
+				WatchId: watch.id,
+				Events:  events,
+			}
+
+			if err := ws.stream.Send(resp); err != nil {
 				return
-			}
-
-			if watch.isClosed() {
-				return
-			}
-
-			// Convert storage events to etcd events
-			var events []*mvccpb.Event
-			for _, storageEvent := range watchResp.Events {
-				// Apply filters
-				if ws.shouldFilterEvent(storageEvent, watch.filters) {
-					continue
-				}
-
-				event := &mvccpb.Event{
-					Kv: ws.server.convertToMVCCKeyValue(storageEvent.Kv),
-				}
-
-				// Set event type
-				switch storageEvent.Type {
-				case storage.WatchEventTypePut:
-					event.Type = mvccpb.PUT
-				case storage.WatchEventTypeDelete:
-					event.Type = mvccpb.DELETE
-				}
-
-				// Add previous KV if requested and available
-				if watch.prevKv && storageEvent.PrevKv != nil {
-					event.PrevKv = ws.server.convertToMVCCKeyValue(storageEvent.PrevKv)
-				}
-
-				events = append(events, event)
-			}
-
-			// Send response if we have events
-			if len(events) > 0 {
-				resp := &etcdserverpb.WatchResponse{
-					Header:  ws.server.createHeader(storage.Revision(watchResp.Revision)),
-					WatchId: watch.id,
-					Events:  events,
-				}
-
-				if err := ws.stream.Send(resp); err != nil {
-					return
-				}
 			}
 		}
 	}
 }
 
 // shouldFilterEvent checks if an event should be filtered out
-func (ws *watchStream) shouldFilterEvent(event *storage.WatchEvent, filters []etcdserverpb.WatchCreateRequest_FilterType) bool {
+func (ws *watchStream) shouldFilterEvent(event *mvccpb.Event, filters []etcdserverpb.WatchCreateRequest_FilterType) bool {
 	for _, filter := range filters {
 		switch filter {
 		case etcdserverpb.WatchCreateRequest_NOPUT:
-			if event.Type == storage.WatchEventTypePut {
+			if event.Type == mvccpb.PUT {
 				return true
 			}
 		case etcdserverpb.WatchCreateRequest_NODELETE:
-			if event.Type == storage.WatchEventTypeDelete {
+			if event.Type == mvccpb.DELETE {
 				return true
 			}
 		}

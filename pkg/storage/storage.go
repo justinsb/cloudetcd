@@ -1,6 +1,10 @@
 package storage
 
-import "context"
+import (
+	"context"
+
+	"go.etcd.io/etcd/api/v3/mvccpb"
+)
 
 // Revision is the version of the key-value store.
 type Revision int64
@@ -13,26 +17,9 @@ type KeyValue struct {
 	Deleted        bool     // Whether this is a tombstone (deleted entry)
 }
 
-// WatchEventType represents the type of watch event
-type WatchEventType int
-
-const (
-	WatchEventTypePut WatchEventType = iota
-	WatchEventTypeDelete
-)
-
-// WatchEvent represents a single watch event
-type WatchEvent struct {
-	Type   WatchEventType
-	Key    []byte
-	Value  []byte
-	Kv     *KeyValue // Current key-value pair
-	PrevKv *KeyValue // Previous key-value pair (optional)
-}
-
 // WatchResponse represents a response from watching
 type WatchResponse struct {
-	Events   []*WatchEvent
+	Events   []*mvccpb.Event
 	Revision Revision
 }
 

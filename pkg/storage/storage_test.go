@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -407,7 +408,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 		defer watcher.Close()
 
-		var events []*WatchEvent
+		var events []*mvccpb.Event
 		var mu sync.Mutex
 
 		// Goroutine to collect events
@@ -451,22 +452,22 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 
 		// Check first event (PUT)
-		if events[0].Type != WatchEventTypePut {
+		if events[0].Type != mvccpb.PUT {
 			t.Errorf("Expected PUT event, got %d", events[0].Type)
 		}
-		if string(events[0].Key) != "test-key" {
-			t.Errorf("Expected key 'test-key', got '%s'", string(events[0].Key))
+		if string(events[0].Kv.Key) != "test-key" {
+			t.Errorf("Expected key 'test-key', got '%s'", string(events[0].Kv.Key))
 		}
-		if string(events[0].Value) != "value1" {
-			t.Errorf("Expected value 'value1', got '%s'", string(events[0].Value))
+		if string(events[0].Kv.Value) != "value1" {
+			t.Errorf("Expected value 'value1', got '%s'", string(events[0].Kv.Value))
 		}
 
 		// Check second event (UPDATE)
-		if events[1].Type != WatchEventTypePut {
+		if events[1].Type != mvccpb.PUT {
 			t.Errorf("Expected PUT event, got %d", events[1].Type)
 		}
-		if string(events[1].Value) != "value2" {
-			t.Errorf("Expected value 'value2', got '%s'", string(events[1].Value))
+		if string(events[1].Kv.Value) != "value2" {
+			t.Errorf("Expected value 'value2', got '%s'", string(events[1].Kv.Value))
 		}
 		if events[1].PrevKv == nil {
 			t.Error("Expected PrevKv to be set for update")
@@ -475,7 +476,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 
 		// Check third event (DELETE)
-		if events[2].Type != WatchEventTypeDelete {
+		if events[2].Type != mvccpb.DELETE {
 			t.Errorf("Expected DELETE event, got %d", events[2].Type)
 		}
 		if events[2].PrevKv == nil {
@@ -493,7 +494,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 		defer watcher.Close()
 
-		var events []*WatchEvent
+		var events []*mvccpb.Event
 		var mu sync.Mutex
 
 		// Goroutine to collect events
@@ -546,8 +547,8 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		// Verify events are for the correct keys
 		expectedKeys := []string{"prefix/key1", "prefix/key2", "prefix/key1"}
 		for i, event := range events {
-			if string(event.Key) != expectedKeys[i] {
-				t.Errorf("Event %d: expected key '%s', got '%s'", i, expectedKeys[i], string(event.Key))
+			if string(event.Kv.Key) != expectedKeys[i] {
+				t.Errorf("Event %d: expected key '%s', got '%s'", i, expectedKeys[i], string(event.Kv.Key))
 			}
 		}
 	})

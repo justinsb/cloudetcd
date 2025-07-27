@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -150,8 +151,20 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	return nil
 }
 
+// convertToMVCCKeyValue converts a storage.KeyValue to mvccpb.KeyValue
+func convertToMVCCKeyValue(kv *KeyValue) *mvccpb.KeyValue {
+	return &mvccpb.KeyValue{
+		Key:            kv.Key,
+		Value:          kv.Value,
+		CreateRevision: int64(kv.CreateRevision),
+		ModRevision:    int64(kv.CreateRevision), // For now, use CreateRevision as ModRevision
+		Version:        1,                        // For now, always version 1
+		Lease:          0,                        // For now, no lease
+	}
+}
+
 // broadcastEvent sends an event to all relevant watchers
-func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
+func (m *MemoryStorage) broadcastEvent(event *mvccpb.Event, revision Revision) {
 	m.watcherMu.RLock()
 	defer m.watcherMu.RUnlock()
 
@@ -166,11 +179,11 @@ func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
 			// Empty rangeEnd means prefix watch or exact key match
 			// If the key is the same as the watcher key, it's an exact match
 			// Otherwise, it's a prefix match
-			if string(event.Key) == string(watcher.key) {
+			if string(event.Kv.Key) == string(watcher.key) {
 				shouldNotify = true
 			} else if len(watcher.key) > 0 {
 				// Prefix match: check if event key starts with watcher key
-				eventKey := string(event.Key)
+				eventKey := string(event.Kv.Key)
 				watcherKey := string(watcher.key)
 				if len(eventKey) >= len(watcherKey) && eventKey[:len(watcherKey)] == watcherKey {
 					shouldNotify = true
@@ -178,7 +191,7 @@ func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
 			}
 		} else {
 			// Range match: check if event key is in range [key, rangeEnd)
-			eventKey := string(event.Key)
+			eventKey := string(event.Kv.Key)
 			startKey := string(watcher.key)
 			endKey := string(watcher.rangeEnd)
 			shouldNotify = eventKey >= startKey && eventKey < endKey
@@ -186,7 +199,7 @@ func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
 
 		if shouldNotify && revision >= watcher.startRevision {
 			response := &WatchResponse{
-				Events:   []*WatchEvent{event},
+				Events:   []*mvccpb.Event{event},
 				Revision: revision,
 			}
 
@@ -240,14 +253,12 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	m.revisions[keyStr] = append(m.revisions[keyStr], kv)
 
 	// Create and broadcast watch event
-	event := &WatchEvent{
-		Type:  WatchEventTypePut,
-		Key:   key,
-		Value: value,
-		Kv:    kv,
+	event := &mvccpb.Event{
+		Type: mvccpb.PUT,
+		Kv:   convertToMVCCKeyValue(kv),
 	}
 	if existing != nil && !existing.Deleted {
-		event.PrevKv = existing
+		event.PrevKv = convertToMVCCKeyValue(existing)
 	}
 
 	m.broadcastEvent(event, m.revision)
@@ -328,12 +339,12 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
 
 	// Create and broadcast watch event
-	event := &WatchEvent{
-		Type:   WatchEventTypeDelete,
-		Key:    key,
-		Value:  nil,
-		Kv:     tombstone,
-		PrevKv: existing,
+	event := &mvccpb.Event{
+		Type: mvccpb.DELETE,
+		Kv:   convertToMVCCKeyValue(tombstone),
+	}
+	if existing != nil && !existing.Deleted {
+		event.PrevKv = convertToMVCCKeyValue(existing)
 	}
 
 	m.broadcastEvent(event, m.revision)
