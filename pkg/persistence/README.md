@@ -73,15 +73,22 @@ type Snapshotter interface {
 
 ## Integration with Storage
 
-The storage layer has been updated to integrate with the persistence layer. When you create a new `MemoryStorage`, it automatically uses a `MemoryLog` for persistence:
+The storage layer has been updated to integrate with the persistence layer. When you create a new `MemoryStorage`, you must provide a log implementation:
 
 ```go
-// Create storage with default memory log
-store := storage.NewMemoryStorage()
+// Create storage with memory log
+log := persistence.NewMemoryLog()
+store, err := storage.NewMemoryStorage(log)
+if err != nil {
+    // Handle error
+}
 
 // Or create storage with a custom log
 customLog := persistence.NewMemoryLog()
-store := storage.NewMemoryStorageWithLog(customLog)
+store, err := storage.NewMemoryStorageWithLog(customLog)
+if err != nil {
+    // Handle error
+}
 ```
 
 Every `Put` and `Delete` operation is automatically appended to the log before being applied to the in-memory storage.

@@ -13,8 +13,11 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	// Create a memory log
 	memoryLog := persistence.NewMemoryLog()
 
-	// Create storage with the log
-	store := NewMemoryStorageWithLog(memoryLog)
+	// Create store with the log
+	store, err := NewMemoryStorageWithLog(memoryLog)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	t.Log("=== Testing Cloud etcd with Persistence Integration ===")
 

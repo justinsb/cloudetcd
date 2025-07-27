@@ -9,12 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/storage"
 )
 
 func TestEtcdAPIServer(t *testing.T) {
 	// Create storage and server
-	store := storage.NewMemoryStorage()
+	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	server := NewServer(store)
 
 	defer server.Stop()
@@ -117,7 +121,10 @@ func TestEtcdAPIServer(t *testing.T) {
 
 func TestWatchFunctionality(t *testing.T) {
 	// Create storage and server
-	store := storage.NewMemoryStorage()
+	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	server := NewServer(store)
 
 	defer server.Stop()
@@ -349,7 +356,10 @@ func TestWatchFunctionality(t *testing.T) {
 
 func TestServerMethods(t *testing.T) {
 	// Create storage and server
-	store := storage.NewMemoryStorage()
+	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	server := NewServer(store)
 
 	defer server.Stop()
@@ -433,7 +443,10 @@ func TestServerMethods(t *testing.T) {
 
 func TestRangeWithRangeEnd(t *testing.T) {
 	// Create storage and server
-	store := storage.NewMemoryStorage()
+	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	server := NewServer(store)
 
 	defer server.Stop()

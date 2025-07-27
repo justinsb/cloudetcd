@@ -9,10 +9,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
 func TestMemoryStorage_Put(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Test basic put
@@ -38,7 +42,10 @@ func TestMemoryStorage_Put(t *testing.T) {
 }
 
 func TestMemoryStorage_Get(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Put a key-value pair
@@ -86,7 +93,10 @@ func TestMemoryStorage_Get(t *testing.T) {
 }
 
 func TestMemoryStorage_Delete(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, storageErr := NewMemoryStorage(persistence.NewMemoryLog())
+	if storageErr != nil {
+		t.Fatalf("Failed to create storage: %v", storageErr)
+	}
 	ctx := context.Background()
 
 	// Put a key-value pair
@@ -126,7 +136,10 @@ func TestMemoryStorage_Delete(t *testing.T) {
 }
 
 func TestMemoryStorage_List(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Put several key-value pairs
@@ -178,7 +191,10 @@ func TestMemoryStorage_List(t *testing.T) {
 }
 
 func TestMemoryStorage_RevisionOrdering(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Put a key
@@ -215,7 +231,10 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 }
 
 func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Test concurrent puts
@@ -248,7 +267,10 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 }
 
 func TestMemoryStorage_MVCCBehavior(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Put a key
@@ -308,7 +330,10 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 }
 
 func TestMemoryStorage_RangeQueries(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	// Put some test data
@@ -368,7 +393,10 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 }
 
 func TestMemoryStorage_Watch(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 	ctx := context.Background()
 
 	t.Run("Storage Watch Interface", func(t *testing.T) {

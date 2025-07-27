@@ -47,28 +47,9 @@ type MemoryStorage struct {
 	log       persistence.Log // Persistence log
 }
 
-// NewMemoryStorage creates a new in-memory storage instance.
-func NewMemoryStorage() *MemoryStorage {
-	ms := &MemoryStorage{
-		revisions: make(map[string][]*KeyValue),
-		revision:  0,
-		watchers:  make(map[int64]*memoryWatcher),
-		watcherID: 0,
-		log:       persistence.NewMemoryLog(),
-	}
-
-	// Replay the log to restore state
-	if err := ms.ReplayLog(context.Background()); err != nil {
-		// Log the error but don't fail - this allows the storage to start even if replay fails
-		// In a production system, you might want to handle this differently
-		fmt.Printf("Warning: failed to replay log on startup: %v\n", err)
-	}
-
-	return ms
-}
-
-// NewMemoryStorageWithLog creates a new in-memory storage instance with a custom log
-func NewMemoryStorageWithLog(log persistence.Log) *MemoryStorage {
+// NewMemoryStorage creates a new in-memory storage instance with the given log.
+// It returns an error if it cannot replay the log to restore the storage state.
+func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	ms := &MemoryStorage{
 		revisions: make(map[string][]*KeyValue),
 		revision:  0,
@@ -79,11 +60,17 @@ func NewMemoryStorageWithLog(log persistence.Log) *MemoryStorage {
 
 	// Replay the log to restore state
 	if err := ms.ReplayLog(context.Background()); err != nil {
-		// Log the error but don't fail - this allows the storage to start even if replay fails
-		fmt.Printf("Warning: failed to replay log on startup: %v\n", err)
+		return nil, fmt.Errorf("failed to replay log on startup: %w", err)
 	}
 
-	return ms
+	return ms, nil
+}
+
+// NewMemoryStorageWithLog creates a new in-memory storage instance with a custom log.
+// This function is deprecated in favor of NewMemoryStorage which now takes a log parameter.
+// It returns an error if it cannot replay the log to restore the storage state.
+func NewMemoryStorageWithLog(log persistence.Log) (*MemoryStorage, error) {
+	return NewMemoryStorage(log)
 }
 
 // ReplayLog replays the persistence log to restore the storage state

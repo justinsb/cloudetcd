@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"justinsb.com/cloudetcd/pkg/api"
+	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/storage"
 )
 
@@ -22,7 +23,10 @@ func main() {
 	fmt.Println("Starting cloud-etcd server...")
 
 	// Create storage instance
-	store := storage.NewMemoryStorage()
+	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	if err != nil {
+		log.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Create and start the etcd API server
 	server := api.NewServer(store)

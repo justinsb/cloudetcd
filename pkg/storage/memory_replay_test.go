@@ -14,25 +14,25 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	log := persistence.NewMemoryLog()
 
 	// Create storage with the log
-	storage := NewMemoryStorageWithLog(log)
+	storage, err := NewMemoryStorage(log)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Add some test data
 	ctx := context.Background()
 
 	// Put some keys
-	_, err := storage.Put(ctx, []byte("key1"), []byte("value1"), 0)
-	if err != nil {
+	if _, err := storage.Put(ctx, []byte("key1"), []byte("value1"), 0); err != nil {
 		t.Fatalf("Failed to put key1: %v", err)
 	}
 
-	_, err = storage.Put(ctx, []byte("key2"), []byte("value2"), 0)
-	if err != nil {
+	if _, err = storage.Put(ctx, []byte("key2"), []byte("value2"), 0); err != nil {
 		t.Fatalf("Failed to put key2: %v", err)
 	}
 
 	// Update key1
-	_, err = storage.Put(ctx, []byte("key1"), []byte("value1-updated"), 0)
-	if err != nil {
+	if _, err = storage.Put(ctx, []byte("key1"), []byte("value1-updated"), 0); err != nil {
 		t.Fatalf("Failed to update key1: %v", err)
 	}
 
@@ -58,7 +58,10 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Now create a new storage instance with the same log to test replay
-	newStorage := NewMemoryStorageWithLog(log)
+	newStorage, err := NewMemoryStorageWithLog(log)
+	if err != nil {
+		t.Fatalf("Failed to create new storage: %v", err)
+	}
 
 	// Verify that the state was replayed correctly
 	newKv1, err := newStorage.Get(ctx, []byte("key1"), 0)
@@ -98,7 +101,10 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	// Test replay with an empty log
 	log := persistence.NewMemoryLog()
-	storage := NewMemoryStorageWithLog(log)
+	storage, err := NewMemoryStorage(log)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Should not crash and should have revision 0
 	if storage.GetCurrentRevision() != 0 {
@@ -120,7 +126,10 @@ func TestMemoryStorageForceReplay(t *testing.T) {
 	log := persistence.NewMemoryLog()
 
 	// Create storage with the log
-	storage := NewMemoryStorageWithLog(log)
+	storage, err := NewMemoryStorage(log)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Add some test data
 	ctx := context.Background()
@@ -164,7 +173,10 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 2: Create storage with the filesystem log
-	storage1 := NewMemoryStorageWithLog(fsLog)
+	storage1, err := NewMemoryStorage(fsLog)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Step 3: Add some data
 	ctx := context.Background()
@@ -217,7 +229,10 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 5: Create a new storage instance with the same log (simulating restart)
-	storage2 := NewMemoryStorageWithLog(fsLog)
+	storage2, err := NewMemoryStorage(fsLog)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
 
 	// Step 6: Verify that the state was replayed correctly
 	keys, err = storage2.List(ctx, []byte(""), []byte(""), 0)
