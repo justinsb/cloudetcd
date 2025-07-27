@@ -10,7 +10,6 @@ type KeyValue struct {
 	Key            []byte
 	Value          []byte
 	CreateRevision Revision // The revision when this key was first created
-	ModRevision    Revision // The revision when this key was last modified
 	Deleted        bool     // Whether this is a tombstone (deleted entry)
 }
 

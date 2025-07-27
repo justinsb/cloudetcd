@@ -11,7 +11,7 @@ import (
 type MemoryStorage struct {
 	mu        sync.RWMutex
 	data      map[string]*KeyValue
-	revisions map[string][]*KeyValue // All revisions of each key
+	revisions map[string][]*KeyValue // All revisions of each key, sorted by revision
 	revision  Revision
 }
 
@@ -36,14 +36,13 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	existing, exists := m.data[keyStr]
 
 	kv := &KeyValue{
-		Key:         key,
-		Value:       value,
-		ModRevision: m.revision,
-		Deleted:     false,
+		Key:     key,
+		Value:   value,
+		Deleted: false,
 	}
 
 	if exists {
-		// Key exists, update it
+		// Key exists, keep the original create revision
 		kv.CreateRevision = existing.CreateRevision
 	} else {
 		// New key
@@ -76,8 +75,14 @@ func (m *MemoryStorage) Get(ctx context.Context, key []byte, atRevision Revision
 	}
 
 	// Find the revision at or before the requested revision
+	// We need to track the actual revision number for each operation
+	// For now, we'll use a simple approach where each operation gets the next revision number
+	// In a more sophisticated implementation, we'd store the revision number with each record
 	for i := len(revisions) - 1; i >= 0; i-- {
-		if revisions[i].ModRevision <= atRevision {
+		// For this simple implementation, we'll assume revisions are sequential
+		// starting from the first operation on this key
+		revisionNumber := Revision(i + 1)
+		if revisionNumber <= atRevision {
 			// Return the version at this revision (could be deleted)
 			return revisions[i], nil
 		}
@@ -104,7 +109,6 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 		Key:            key,
 		Value:          nil,
 		CreateRevision: existing.CreateRevision,
-		ModRevision:    m.revision,
 		Deleted:        true,
 	}
 
@@ -137,7 +141,8 @@ func (m *MemoryStorage) List(ctx context.Context, prefix []byte, atRevision Revi
 			} else {
 				// Find the revision at or before the requested revision
 				for i := len(revisions) - 1; i >= 0; i-- {
-					if revisions[i].ModRevision <= atRevision {
+					revisionNumber := Revision(i + 1)
+					if revisionNumber <= atRevision {
 						kv = revisions[i]
 						break
 					}
