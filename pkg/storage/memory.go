@@ -10,7 +10,6 @@ import (
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
 	mu        sync.RWMutex
-	data      map[string]*KeyValue
 	revisions map[string][]*KeyValue // All revisions of each key, sorted by revision
 	revision  Revision
 }
@@ -18,7 +17,6 @@ type MemoryStorage struct {
 // NewMemoryStorage creates a new in-memory storage instance.
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
-		data:      make(map[string]*KeyValue),
 		revisions: make(map[string][]*KeyValue),
 		revision:  0,
 	}
@@ -32,8 +30,12 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	m.revision++
 	keyStr := string(key)
 
-	// Check if key already exists
-	existing, exists := m.data[keyStr]
+	// Check if key already exists by looking at revisions
+	revisions, exists := m.revisions[keyStr]
+	var existing *KeyValue
+	if exists && len(revisions) > 0 {
+		existing = revisions[len(revisions)-1]
+	}
 
 	kv := &KeyValue{
 		Key:     key,
@@ -41,7 +43,7 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 		Deleted: false,
 	}
 
-	if exists {
+	if existing != nil && !existing.Deleted {
 		// Key exists, keep the original create revision
 		kv.CreateRevision = existing.CreateRevision
 	} else {
@@ -49,7 +51,6 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 		kv.CreateRevision = m.revision
 	}
 
-	m.data[keyStr] = kv
 	m.revisions[keyStr] = append(m.revisions[keyStr], kv)
 	return m.revision, nil
 }
@@ -99,8 +100,13 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	m.revision++
 	keyStr := string(key)
 
-	existing, exists := m.data[keyStr]
-	if !exists {
+	revisions, exists := m.revisions[keyStr]
+	var existing *KeyValue
+	if exists && len(revisions) > 0 {
+		existing = revisions[len(revisions)-1]
+	}
+
+	if existing == nil || existing.Deleted {
 		return m.revision, nil // Key doesn't exist, nothing to delete
 	}
 
@@ -112,8 +118,7 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 		Deleted:        true,
 	}
 
-	// Update the current data and add to revisions
-	m.data[keyStr] = tombstone
+	// Add to revisions
 	m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
 
 	return m.revision, nil
