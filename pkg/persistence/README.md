@@ -85,7 +85,7 @@ if err != nil {
 
 // Or create storage with a custom log
 customLog := persistence.NewMemoryLog()
-store, err := storage.NewMemoryStorageWithLog(customLog)
+store, err := storage.NewMemoryStorage(customLog)
 if err != nil {
     // Handle error
 }

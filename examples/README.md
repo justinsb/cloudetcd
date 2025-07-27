@@ -41,7 +41,7 @@ if err != nil {
 }
 
 // Create storage with the log (will automatically replay)
-storage := storage.NewMemoryStorageWithLog(log)
+storage, err := storage.NewMemoryStorage(log)
 
 // The storage is now ready with all previous state restored
 ```

@@ -58,7 +58,7 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Now create a new storage instance with the same log to test replay
-	newStorage, err := NewMemoryStorageWithLog(log)
+	newStorage, err := NewMemoryStorage(log)
 	if err != nil {
 		t.Fatalf("Failed to create new storage: %v", err)
 	}

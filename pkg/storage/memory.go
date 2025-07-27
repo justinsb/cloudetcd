@@ -66,13 +66,6 @@ func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	return ms, nil
 }
 
-// NewMemoryStorageWithLog creates a new in-memory storage instance with a custom log.
-// This function is deprecated in favor of NewMemoryStorage which now takes a log parameter.
-// It returns an error if it cannot replay the log to restore the storage state.
-func NewMemoryStorageWithLog(log persistence.Log) (*MemoryStorage, error) {
-	return NewMemoryStorage(log)
-}
-
 // ReplayLog replays the persistence log to restore the storage state
 func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	// Get the current revision from the log

@@ -14,7 +14,7 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	memoryLog := persistence.NewMemoryLog()
 
 	// Create store with the log
-	store, err := NewMemoryStorageWithLog(memoryLog)
+	store, err := NewMemoryStorage(memoryLog)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
