@@ -4,14 +4,45 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
+
+// memoryWatcher implements the Watcher interface
+type memoryWatcher struct {
+	id            int64
+	key           []byte
+	prefix        bool
+	startRevision Revision
+	ch            chan *WatchResponse
+	closed        int32 // atomic flag
+	closeCh       chan struct{}
+}
+
+func (w *memoryWatcher) Chan() <-chan *WatchResponse {
+	return w.ch
+}
+
+func (w *memoryWatcher) Close() {
+	if atomic.CompareAndSwapInt32(&w.closed, 0, 1) {
+		close(w.closeCh)
+		close(w.ch)
+	}
+}
+
+func (w *memoryWatcher) isClosed() bool {
+	return atomic.LoadInt32(&w.closed) == 1
+}
 
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
 	mu        sync.RWMutex
 	revisions map[string][]*KeyValue // All revisions of each key, sorted by revision
 	revision  Revision
+	watchers  map[int64]*memoryWatcher
+	watcherID int64
+	watcherMu sync.RWMutex
 }
 
 // NewMemoryStorage creates a new in-memory storage instance.
@@ -19,6 +50,51 @@ func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		revisions: make(map[string][]*KeyValue),
 		revision:  0,
+		watchers:  make(map[int64]*memoryWatcher),
+		watcherID: 0,
+	}
+}
+
+// broadcastEvent sends an event to all relevant watchers
+func (m *MemoryStorage) broadcastEvent(event *WatchEvent, revision Revision) {
+	m.watcherMu.RLock()
+	defer m.watcherMu.RUnlock()
+
+	for _, watcher := range m.watchers {
+		if watcher.isClosed() {
+			continue
+		}
+
+		// Check if this watcher should receive this event
+		shouldNotify := false
+		if watcher.prefix {
+			// Prefix match
+			if len(event.Key) >= len(watcher.key) &&
+				strings.HasPrefix(string(event.Key), string(watcher.key)) {
+				shouldNotify = true
+			}
+		} else {
+			// Exact key match
+			if string(event.Key) == string(watcher.key) {
+				shouldNotify = true
+			}
+		}
+
+		if shouldNotify && revision >= watcher.startRevision {
+			response := &WatchResponse{
+				Events:   []*WatchEvent{event},
+				Revision: revision,
+			}
+
+			// Non-blocking send
+			select {
+			case watcher.ch <- response:
+			case <-watcher.closeCh:
+				// Watcher was closed, skip
+			default:
+				// Channel is full, skip to avoid blocking
+			}
+		}
 	}
 }
 
@@ -52,6 +128,20 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	}
 
 	m.revisions[keyStr] = append(m.revisions[keyStr], kv)
+
+	// Create and broadcast watch event
+	event := &WatchEvent{
+		Type:  WatchEventTypePut,
+		Key:   key,
+		Value: value,
+		Kv:    kv,
+	}
+	if existing != nil && !existing.Deleted {
+		event.PrevKv = existing
+	}
+
+	m.broadcastEvent(event, m.revision)
+
 	return m.revision, nil
 }
 
@@ -121,6 +211,17 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	// Add to revisions
 	m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
 
+	// Create and broadcast watch event
+	event := &WatchEvent{
+		Type:   WatchEventTypeDelete,
+		Key:    key,
+		Value:  nil,
+		Kv:     tombstone,
+		PrevKv: existing,
+	}
+
+	m.broadcastEvent(event, m.revision)
+
 	return m.revision, nil
 }
 
@@ -165,4 +266,42 @@ func (m *MemoryStorage) List(ctx context.Context, prefix []byte, atRevision Revi
 	})
 
 	return result, nil
+}
+
+// Watch creates a watcher for the given key/prefix starting from the specified revision
+func (m *MemoryStorage) Watch(ctx context.Context, key []byte, prefix bool, startRevision Revision) (Watcher, error) {
+	m.watcherMu.Lock()
+	defer m.watcherMu.Unlock()
+
+	m.watcherID++
+	watcher := &memoryWatcher{
+		id:            m.watcherID,
+		key:           key,
+		prefix:        prefix,
+		startRevision: startRevision,
+		ch:            make(chan *WatchResponse, 100), // Buffered channel
+		closeCh:       make(chan struct{}),
+	}
+
+	m.watchers[watcher.id] = watcher
+
+	// Start a goroutine to clean up the watcher when the context is done
+	go func() {
+		select {
+		case <-ctx.Done():
+			watcher.Close()
+			m.removeWatcher(watcher.id)
+		case <-watcher.closeCh:
+			m.removeWatcher(watcher.id)
+		}
+	}()
+
+	return watcher, nil
+}
+
+// removeWatcher removes a watcher from the storage
+func (m *MemoryStorage) removeWatcher(id int64) {
+	m.watcherMu.Lock()
+	defer m.watcherMu.Unlock()
+	delete(m.watchers, id)
 }

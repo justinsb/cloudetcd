@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -13,6 +15,40 @@ import (
 	"google.golang.org/grpc/status"
 	"justinsb.com/cloudetcd/pkg/storage"
 )
+
+// watchStream represents a single watch stream with multiple watches
+type watchStream struct {
+	server  *Server
+	stream  etcdserverpb.Watch_WatchServer
+	watches map[int64]*activeWatch
+	watchID int64
+	mu      sync.RWMutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// activeWatch represents a single active watch
+type activeWatch struct {
+	id      int64
+	watcher storage.Watcher
+	key     []byte
+	prefix  bool
+	prevKv  bool
+	filters []etcdserverpb.WatchCreateRequest_FilterType
+	closed  int32 // atomic flag
+}
+
+func (aw *activeWatch) isClosed() bool {
+	return atomic.LoadInt32(&aw.closed) == 1
+}
+
+func (aw *activeWatch) close() {
+	if atomic.CompareAndSwapInt32(&aw.closed, 0, 1) {
+		if aw.watcher != nil {
+			aw.watcher.Close()
+		}
+	}
+}
 
 // Server implements the etcd v3 API
 type Server struct {
@@ -61,7 +97,7 @@ func (s *Server) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*et
 	}
 
 	// Handle prefix-based range queries
-	if req.RangeEnd != nil && len(req.RangeEnd) > 0 {
+	if len(req.RangeEnd) > 0 {
 		return s.handleRangeWithEnd(ctx, req)
 	}
 
@@ -343,9 +379,216 @@ func (s *Server) Compact(ctx context.Context, req *etcdserverpb.CompactionReques
 
 // Watch implements the Watch RPC method
 func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
-	// For now, return an error indicating watch is not implemented
-	// In a full implementation, we'd need to implement the watch functionality
-	return status.Error(codes.Unimplemented, "watch not yet implemented")
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+
+	ws := &watchStream{
+		server:  s,
+		stream:  stream,
+		watches: make(map[int64]*activeWatch),
+		watchID: 0,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+
+	// Start goroutine to handle incoming requests
+	go ws.handleRequests()
+
+	// Wait for context to be done
+	<-ctx.Done()
+
+	// Clean up all watches
+	ws.cleanup()
+
+	return nil
+}
+
+// handleRequests processes incoming watch requests
+func (ws *watchStream) handleRequests() {
+	for {
+		req, err := ws.stream.Recv()
+		if err != nil {
+			ws.cancel()
+			return
+		}
+
+		switch r := req.RequestUnion.(type) {
+		case *etcdserverpb.WatchRequest_CreateRequest:
+			ws.handleCreateRequest(r.CreateRequest)
+		case *etcdserverpb.WatchRequest_CancelRequest:
+			ws.handleCancelRequest(r.CancelRequest)
+		case *etcdserverpb.WatchRequest_ProgressRequest:
+			ws.handleProgressRequest(r.ProgressRequest)
+		}
+	}
+}
+
+// handleCreateRequest handles watch creation
+func (ws *watchStream) handleCreateRequest(req *etcdserverpb.WatchCreateRequest) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.watchID++
+	watchID := ws.watchID
+
+	// Determine if this is a prefix watch
+	prefix := len(req.RangeEnd) > 0
+
+	// Create storage watcher
+	startRevision := storage.Revision(req.StartRevision)
+	watcher, err := ws.server.storage.Watch(ws.ctx, req.Key, prefix, startRevision)
+	if err != nil {
+		// Send error response
+		resp := &etcdserverpb.WatchResponse{
+			Header:   ws.server.createHeader(0),
+			WatchId:  watchID,
+			Created:  false,
+			Canceled: true,
+		}
+		ws.stream.Send(resp)
+		return
+	}
+
+	// Create active watch
+	activeWatch := &activeWatch{
+		id:      watchID,
+		watcher: watcher,
+		key:     req.Key,
+		prefix:  prefix,
+		prevKv:  req.PrevKv,
+		filters: req.Filters,
+	}
+
+	ws.watches[watchID] = activeWatch
+
+	// Send creation response
+	resp := &etcdserverpb.WatchResponse{
+		Header:  ws.server.createHeader(0),
+		WatchId: watchID,
+		Created: true,
+	}
+	ws.stream.Send(resp)
+
+	// Start watching for events
+	go ws.watchEvents(activeWatch)
+}
+
+// handleCancelRequest handles watch cancellation
+func (ws *watchStream) handleCancelRequest(req *etcdserverpb.WatchCancelRequest) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	watchID := req.WatchId
+	if watch, exists := ws.watches[watchID]; exists {
+		watch.close()
+		delete(ws.watches, watchID)
+
+		// Send cancellation response
+		resp := &etcdserverpb.WatchResponse{
+			Header:   ws.server.createHeader(0),
+			WatchId:  watchID,
+			Canceled: true,
+		}
+		ws.stream.Send(resp)
+	}
+}
+
+// handleProgressRequest handles progress requests
+func (ws *watchStream) handleProgressRequest(req *etcdserverpb.WatchProgressRequest) {
+	// For now, just send a progress response without events
+	resp := &etcdserverpb.WatchResponse{
+		Header: ws.server.createHeader(0),
+	}
+	ws.stream.Send(resp)
+}
+
+// watchEvents monitors storage events for a specific watch
+func (ws *watchStream) watchEvents(watch *activeWatch) {
+	defer watch.close()
+
+	for {
+		select {
+		case <-ws.ctx.Done():
+			return
+		case watchResp, ok := <-watch.watcher.Chan():
+			if !ok {
+				return
+			}
+
+			if watch.isClosed() {
+				return
+			}
+
+			// Convert storage events to etcd events
+			var events []*mvccpb.Event
+			for _, storageEvent := range watchResp.Events {
+				// Apply filters
+				if ws.shouldFilterEvent(storageEvent, watch.filters) {
+					continue
+				}
+
+				event := &mvccpb.Event{
+					Kv: ws.server.convertToMVCCKeyValue(storageEvent.Kv),
+				}
+
+				// Set event type
+				switch storageEvent.Type {
+				case storage.WatchEventTypePut:
+					event.Type = mvccpb.PUT
+				case storage.WatchEventTypeDelete:
+					event.Type = mvccpb.DELETE
+				}
+
+				// Add previous KV if requested and available
+				if watch.prevKv && storageEvent.PrevKv != nil {
+					event.PrevKv = ws.server.convertToMVCCKeyValue(storageEvent.PrevKv)
+				}
+
+				events = append(events, event)
+			}
+
+			// Send response if we have events
+			if len(events) > 0 {
+				resp := &etcdserverpb.WatchResponse{
+					Header:  ws.server.createHeader(storage.Revision(watchResp.Revision)),
+					WatchId: watch.id,
+					Events:  events,
+				}
+
+				if err := ws.stream.Send(resp); err != nil {
+					return
+				}
+			}
+		}
+	}
+}
+
+// shouldFilterEvent checks if an event should be filtered out
+func (ws *watchStream) shouldFilterEvent(event *storage.WatchEvent, filters []etcdserverpb.WatchCreateRequest_FilterType) bool {
+	for _, filter := range filters {
+		switch filter {
+		case etcdserverpb.WatchCreateRequest_NOPUT:
+			if event.Type == storage.WatchEventTypePut {
+				return true
+			}
+		case etcdserverpb.WatchCreateRequest_NODELETE:
+			if event.Type == storage.WatchEventTypeDelete {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cleanup closes all watches
+func (ws *watchStream) cleanup() {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	for _, watch := range ws.watches {
+		watch.close()
+	}
+	ws.watches = make(map[int64]*activeWatch)
 }
 
 // Grant implements the Grant RPC method

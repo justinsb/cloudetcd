@@ -13,6 +13,37 @@ type KeyValue struct {
 	Deleted        bool     // Whether this is a tombstone (deleted entry)
 }
 
+// WatchEventType represents the type of watch event
+type WatchEventType int
+
+const (
+	WatchEventTypePut WatchEventType = iota
+	WatchEventTypeDelete
+)
+
+// WatchEvent represents a single watch event
+type WatchEvent struct {
+	Type   WatchEventType
+	Key    []byte
+	Value  []byte
+	Kv     *KeyValue // Current key-value pair
+	PrevKv *KeyValue // Previous key-value pair (optional)
+}
+
+// WatchResponse represents a response from watching
+type WatchResponse struct {
+	Events   []*WatchEvent
+	Revision Revision
+}
+
+// Watcher represents a single watch subscription
+type Watcher interface {
+	// Chan returns the channel to receive watch events
+	Chan() <-chan *WatchResponse
+	// Close closes the watcher
+	Close()
+}
+
 // Storage is the interface for the underlying storage layer.
 type Storage interface {
 	// Put writes a key-value pair to the storage.
@@ -26,4 +57,7 @@ type Storage interface {
 
 	// List returns a range of key-value pairs.
 	List(ctx context.Context, prefix []byte, atRevision Revision) ([]*KeyValue, error)
+
+	// Watch creates a watcher for the given key/prefix starting from the specified revision
+	Watch(ctx context.Context, key []byte, prefix bool, startRevision Revision) (Watcher, error)
 }
