@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -52,32 +53,13 @@ func (f *FilesystemLog) replay() error {
 			continue
 		}
 
-		// Parse revision from filename (hex encoded)
+		// Parse revision from filename
 		filename := entry.Name()
-		if !strings.HasSuffix(filename, ".log") {
-			continue
-		}
-
-		hexRevision := strings.TrimSuffix(filename, ".log")
-		revisionBytes, err := hex.DecodeString(hexRevision)
+		revision, err := filenameToRevision(filename)
 		if err != nil {
 			// Skip invalid filenames
 			continue
 		}
-
-		if len(revisionBytes) != 8 {
-			continue
-		}
-
-		// Convert bytes to int64
-		revision := int64(revisionBytes[0])<<56 |
-			int64(revisionBytes[1])<<48 |
-			int64(revisionBytes[2])<<40 |
-			int64(revisionBytes[3])<<32 |
-			int64(revisionBytes[4])<<24 |
-			int64(revisionBytes[5])<<16 |
-			int64(revisionBytes[6])<<8 |
-			int64(revisionBytes[7])
 
 		revisions = append(revisions, revision)
 	}
@@ -111,17 +93,7 @@ func (f *FilesystemLog) Append(ctx context.Context, operation string, key []byte
 	}
 
 	// Create filename with hex-encoded revision
-	revisionBytes := make([]byte, 8)
-	revisionBytes[0] = byte(f.revision >> 56)
-	revisionBytes[1] = byte(f.revision >> 48)
-	revisionBytes[2] = byte(f.revision >> 40)
-	revisionBytes[3] = byte(f.revision >> 32)
-	revisionBytes[4] = byte(f.revision >> 24)
-	revisionBytes[5] = byte(f.revision >> 16)
-	revisionBytes[6] = byte(f.revision >> 8)
-	revisionBytes[7] = byte(f.revision)
-
-	filename := hex.EncodeToString(revisionBytes) + ".log"
+	filename := revisionToFilename(f.revision)
 	filepath := filepath.Join(f.dir, filename)
 
 	// Serialize record to JSON
@@ -171,24 +143,10 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision int64, limit int)
 		}
 
 		// Parse revision from filename
-		hexRevision := strings.TrimSuffix(filename, ".log")
-		revisionBytes, err := hex.DecodeString(hexRevision)
+		revision, err := filenameToRevision(filename)
 		if err != nil {
 			continue
 		}
-
-		if len(revisionBytes) != 8 {
-			continue
-		}
-
-		revision := int64(revisionBytes[0])<<56 |
-			int64(revisionBytes[1])<<48 |
-			int64(revisionBytes[2])<<40 |
-			int64(revisionBytes[3])<<32 |
-			int64(revisionBytes[4])<<24 |
-			int64(revisionBytes[5])<<16 |
-			int64(revisionBytes[6])<<8 |
-			int64(revisionBytes[7])
 
 		if revision < fromRevision {
 			continue
@@ -226,4 +184,31 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision int64, limit int)
 func (f *FilesystemLog) Close() error {
 	// For filesystem implementation, there's nothing to clean up
 	return nil
+}
+
+// revisionToFilename converts a revision number to a filename
+func revisionToFilename(revision int64) string {
+	revisionBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(revisionBytes, uint64(revision))
+	return hex.EncodeToString(revisionBytes) + ".log"
+}
+
+// filenameToRevision converts a filename to a revision number
+func filenameToRevision(filename string) (int64, error) {
+	if !strings.HasSuffix(filename, ".log") {
+		return 0, fmt.Errorf("invalid filename format: %s", filename)
+	}
+
+	hexRevision := strings.TrimSuffix(filename, ".log")
+	revisionBytes, err := hex.DecodeString(hexRevision)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode hex revision: %w", err)
+	}
+
+	if len(revisionBytes) != 8 {
+		return 0, fmt.Errorf("invalid revision bytes length: %d", len(revisionBytes))
+	}
+
+	revision := int64(binary.BigEndian.Uint64(revisionBytes))
+	return revision, nil
 }
