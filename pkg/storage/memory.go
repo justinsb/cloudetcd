@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
 // memoryWatcher implements the Watcher interface
@@ -42,6 +44,7 @@ type MemoryStorage struct {
 	watchers  map[int64]*memoryWatcher
 	watcherID int64
 	watcherMu sync.RWMutex
+	log       persistence.Log // Persistence log
 }
 
 // NewMemoryStorage creates a new in-memory storage instance.
@@ -51,6 +54,18 @@ func NewMemoryStorage() *MemoryStorage {
 		revision:  0,
 		watchers:  make(map[int64]*memoryWatcher),
 		watcherID: 0,
+		log:       persistence.NewMemoryLog(),
+	}
+}
+
+// NewMemoryStorageWithLog creates a new in-memory storage instance with a custom log
+func NewMemoryStorageWithLog(log persistence.Log) *MemoryStorage {
+	return &MemoryStorage{
+		revisions: make(map[string][]*KeyValue),
+		revision:  0,
+		watchers:  make(map[int64]*memoryWatcher),
+		watcherID: 0,
+		log:       log,
 	}
 }
 
@@ -111,7 +126,13 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.revision++
+	// Append to the persistence log first
+	revision, err := m.log.Append(ctx, "PUT", key, value, leaseID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to append to log: %w", err)
+	}
+
+	m.revision = Revision(revision)
 	keyStr := string(key)
 
 	// Check if key already exists by looking at revisions
@@ -195,7 +216,13 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.revision++
+	// Append to the persistence log first
+	revision, err := m.log.Append(ctx, "DELETE", key, nil, 0)
+	if err != nil {
+		return 0, fmt.Errorf("failed to append to log: %w", err)
+	}
+
+	m.revision = Revision(revision)
 	keyStr := string(key)
 
 	revisions, exists := m.revisions[keyStr]
