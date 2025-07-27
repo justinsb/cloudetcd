@@ -49,24 +49,125 @@ type MemoryStorage struct {
 
 // NewMemoryStorage creates a new in-memory storage instance.
 func NewMemoryStorage() *MemoryStorage {
-	return &MemoryStorage{
+	ms := &MemoryStorage{
 		revisions: make(map[string][]*KeyValue),
 		revision:  0,
 		watchers:  make(map[int64]*memoryWatcher),
 		watcherID: 0,
 		log:       persistence.NewMemoryLog(),
 	}
+
+	// Replay the log to restore state
+	if err := ms.ReplayLog(context.Background()); err != nil {
+		// Log the error but don't fail - this allows the storage to start even if replay fails
+		// In a production system, you might want to handle this differently
+		fmt.Printf("Warning: failed to replay log on startup: %v\n", err)
+	}
+
+	return ms
 }
 
 // NewMemoryStorageWithLog creates a new in-memory storage instance with a custom log
 func NewMemoryStorageWithLog(log persistence.Log) *MemoryStorage {
-	return &MemoryStorage{
+	ms := &MemoryStorage{
 		revisions: make(map[string][]*KeyValue),
 		revision:  0,
 		watchers:  make(map[int64]*memoryWatcher),
 		watcherID: 0,
 		log:       log,
 	}
+
+	// Replay the log to restore state
+	if err := ms.ReplayLog(context.Background()); err != nil {
+		// Log the error but don't fail - this allows the storage to start even if replay fails
+		fmt.Printf("Warning: failed to replay log on startup: %v\n", err)
+	}
+
+	return ms
+}
+
+// ReplayLog replays the persistence log to restore the storage state
+func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
+	// Get the current revision from the log
+	currentRevision, err := m.log.GetCurrentRevision(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current revision: %w", err)
+	}
+
+	// If no log entries exist, we're done
+	if currentRevision == 0 {
+		return nil
+	}
+
+	// Read all log records starting from revision 1
+	records, err := m.log.Read(ctx, 1, 0) // 0 means no limit
+	if err != nil {
+		return fmt.Errorf("failed to read log records: %w", err)
+	}
+
+	// Replay each record in order
+	for _, record := range records {
+		switch record.Operation {
+		case "PUT":
+			// Replay PUT operation
+			keyStr := string(record.Key)
+			revisions, exists := m.revisions[keyStr]
+			var existing *KeyValue
+			if exists && len(revisions) > 0 {
+				existing = revisions[len(revisions)-1]
+			}
+
+			kv := &KeyValue{
+				Key:     record.Key,
+				Value:   record.Value,
+				Deleted: false,
+			}
+
+			if existing != nil && !existing.Deleted {
+				// Key exists, keep the original create revision
+				kv.CreateRevision = existing.CreateRevision
+			} else {
+				// New key
+				kv.CreateRevision = Revision(record.Revision)
+			}
+
+			m.revisions[keyStr] = append(m.revisions[keyStr], kv)
+
+		case "DELETE":
+			// Replay DELETE operation
+			keyStr := string(record.Key)
+			revisions, exists := m.revisions[keyStr]
+			var existing *KeyValue
+			if exists && len(revisions) > 0 {
+				existing = revisions[len(revisions)-1]
+			}
+
+			if existing == nil || existing.Deleted {
+				// Key doesn't exist, nothing to delete
+				continue
+			}
+
+			// Create a tombstone entry
+			tombstone := &KeyValue{
+				Key:            record.Key,
+				Value:          nil,
+				CreateRevision: existing.CreateRevision,
+				Deleted:        true,
+			}
+
+			// Add to revisions
+			m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
+
+		default:
+			// Skip unknown operations
+			continue
+		}
+	}
+
+	// Update the current revision to match the log
+	m.revision = Revision(currentRevision)
+
+	return nil
 }
 
 // broadcastEvent sends an event to all relevant watchers
@@ -354,4 +455,24 @@ func (m *MemoryStorage) removeWatcher(id int64) {
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 	delete(m.watchers, id)
+}
+
+// GetCurrentRevision returns the current revision number
+func (m *MemoryStorage) GetCurrentRevision() Revision {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.revision
+}
+
+// ForceReplayLog manually triggers a replay of the log
+// This can be useful for testing or explicit recovery scenarios
+func (m *MemoryStorage) ForceReplayLog(ctx context.Context) error {
+	// Clear current state
+	m.mu.Lock()
+	m.revisions = make(map[string][]*KeyValue)
+	m.revision = 0
+	m.mu.Unlock()
+
+	// Replay the log
+	return m.ReplayLog(ctx)
 }

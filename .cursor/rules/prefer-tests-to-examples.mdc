@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+If not explicitly asked to generate an example binary, create a test (e.g. `foo_test.go`) instead.
