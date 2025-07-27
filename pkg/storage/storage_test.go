@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -363,4 +365,162 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 	require.NotContains(t, keys, "c")
 	require.NotContains(t, keys, "d")
 	require.NotContains(t, keys, "e")
+}
+
+func TestMemoryStorage_Watch(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	t.Run("Storage Watch Interface", func(t *testing.T) {
+		// Create a watcher for exact key match
+		watcher, err := storage.Watch(ctx, []byte("test-key"), []byte{}, 0)
+		if err != nil {
+			t.Fatalf("Failed to create watcher: %v", err)
+		}
+		defer watcher.Close()
+
+		var events []*WatchEvent
+		var mu sync.Mutex
+
+		// Goroutine to collect events
+		go func() {
+			for resp := range watcher.Chan() {
+				mu.Lock()
+				events = append(events, resp.Events...)
+				mu.Unlock()
+			}
+		}()
+
+		// Give watcher time to establish
+		time.Sleep(50 * time.Millisecond)
+
+		// Put a key
+		_, err = storage.Put(ctx, []byte("test-key"), []byte("value1"), 0)
+		if err != nil {
+			t.Fatalf("PUT failed: %v", err)
+		}
+
+		// Update the key
+		_, err = storage.Put(ctx, []byte("test-key"), []byte("value2"), 0)
+		if err != nil {
+			t.Fatalf("PUT failed: %v", err)
+		}
+
+		// Delete the key
+		_, err = storage.Delete(ctx, []byte("test-key"))
+		if err != nil {
+			t.Fatalf("DELETE failed: %v", err)
+		}
+
+		// Wait for events
+		time.Sleep(100 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if len(events) != 3 {
+			t.Fatalf("Expected 3 events, got %d", len(events))
+		}
+
+		// Check first event (PUT)
+		if events[0].Type != WatchEventTypePut {
+			t.Errorf("Expected PUT event, got %d", events[0].Type)
+		}
+		if string(events[0].Key) != "test-key" {
+			t.Errorf("Expected key 'test-key', got '%s'", string(events[0].Key))
+		}
+		if string(events[0].Value) != "value1" {
+			t.Errorf("Expected value 'value1', got '%s'", string(events[0].Value))
+		}
+
+		// Check second event (UPDATE)
+		if events[1].Type != WatchEventTypePut {
+			t.Errorf("Expected PUT event, got %d", events[1].Type)
+		}
+		if string(events[1].Value) != "value2" {
+			t.Errorf("Expected value 'value2', got '%s'", string(events[1].Value))
+		}
+		if events[1].PrevKv == nil {
+			t.Error("Expected PrevKv to be set for update")
+		} else if string(events[1].PrevKv.Value) != "value1" {
+			t.Errorf("Expected previous value 'value1', got '%s'", string(events[1].PrevKv.Value))
+		}
+
+		// Check third event (DELETE)
+		if events[2].Type != WatchEventTypeDelete {
+			t.Errorf("Expected DELETE event, got %d", events[2].Type)
+		}
+		if events[2].PrevKv == nil {
+			t.Error("Expected PrevKv to be set for delete")
+		} else if string(events[2].PrevKv.Value) != "value2" {
+			t.Errorf("Expected previous value 'value2', got '%s'", string(events[2].PrevKv.Value))
+		}
+	})
+
+	t.Run("Storage Prefix Watch", func(t *testing.T) {
+		// Create a watcher for prefix match (using empty rangeEnd for prefix behavior)
+		watcher, err := storage.Watch(ctx, []byte("prefix/"), []byte{}, 0)
+		if err != nil {
+			t.Fatalf("Failed to create watcher: %v", err)
+		}
+		defer watcher.Close()
+
+		var events []*WatchEvent
+		var mu sync.Mutex
+
+		// Goroutine to collect events
+		go func() {
+			for resp := range watcher.Chan() {
+				mu.Lock()
+				events = append(events, resp.Events...)
+				mu.Unlock()
+			}
+		}()
+
+		// Give watcher time to establish
+		time.Sleep(50 * time.Millisecond)
+
+		// Put keys under prefix
+		_, err = storage.Put(ctx, []byte("prefix/key1"), []byte("value1"), 0)
+		if err != nil {
+			t.Fatalf("PUT failed: %v", err)
+		}
+
+		_, err = storage.Put(ctx, []byte("prefix/key2"), []byte("value2"), 0)
+		if err != nil {
+			t.Fatalf("PUT failed: %v", err)
+		}
+
+		// Put key that doesn't match prefix - should not trigger event
+		_, err = storage.Put(ctx, []byte("other"), []byte("value3"), 0)
+		if err != nil {
+			t.Fatalf("PUT failed: %v", err)
+		}
+
+		// Delete key under prefix
+		_, err = storage.Delete(ctx, []byte("prefix/key1"))
+		if err != nil {
+			t.Fatalf("DELETE failed: %v", err)
+		}
+
+		// Wait for events
+		time.Sleep(100 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Should only get events for keys under the prefix
+		expectedEventCount := 3 // prefix/key1 PUT, prefix/key2 PUT, prefix/key1 DELETE
+		if len(events) != expectedEventCount {
+			t.Fatalf("Expected %d events, got %d", expectedEventCount, len(events))
+		}
+
+		// Verify events are for the correct keys
+		expectedKeys := []string{"prefix/key1", "prefix/key2", "prefix/key1"}
+		for i, event := range events {
+			if string(event.Key) != expectedKeys[i] {
+				t.Errorf("Event %d: expected key '%s', got '%s'", i, expectedKeys[i], string(event.Key))
+			}
+		}
+	})
 }
