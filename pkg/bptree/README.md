@@ -9,7 +9,7 @@ This document describes the implementation of an in-memory B+ tree data structur
 *   It combines ideas of a B-Tree and a prefix tree. Branch pages identify common bytes of the prefix, so that we do not need to store and compare prefix bytes repeatedly.
 *   It is designed to be **in-memory**, so we accept variable page sizes and do not strictly balance the tree.
 *   Somewhat unusually, we keep **multiple revision numbers for each key**.
-
+*   In a BTree, the invariant is typically that the subtree has keys greater than or equal to the parent key (and less than the next parent key).  In our structure, the subtree has keys that strictly have as prefix the parent key; and keys in a branch do not overlap (i.e. we will not create two subtrees at the same level for `abc` and `abcd`)
 
 ## Node Splitting
 

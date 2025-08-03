@@ -18,7 +18,6 @@ const maxKeys = 32
 // and a read-write mutex for concurrent access.
 type BPTree struct {
 	root *node
-	lock sync.RWMutex
 }
 
 // New creates a new B+ tree.
@@ -31,24 +30,12 @@ func New() *BPTree {
 // AddRevision adds a new revision to a key. If the key does not exist, it is created.
 //
 // The algorithm is as follows:
-// 1. Traverse the tree to find the leaf node where the key should be inserted.
-// 2. If the key already exists, append the new revision to the existing list of revisions.
-// 3. If the key does not exist, insert the key and the new revision into the leaf node.
-// 4. If the leaf node is full, split it into two nodes and promote the middle key to the parent node.
-//    This splitting process may propagate up to the root of the tree.
+//  1. Traverse the tree to find the leaf node where the key should be inserted.
+//  2. If the key already exists, append the new revision to the existing list of revisions.
+//  3. If the key does not exist, insert the key and the new revision into the leaf node.
+//  4. If the leaf node is full, split it into two nodes and promote the middle key to the parent node.
+//     This splitting process may propagate up to the root of the tree.
 func (t *BPTree) AddRevision(key []byte, revision int64) {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	if t.root == nil {
-		t.root = &node{}
-	}
-	if len(t.root.keys) == maxKeys {
-		newRoot := &node{}
-		newRoot.children = append(newRoot.children, t.root)
-		t.root.split(newRoot, 0)
-		t.root = newRoot
-	}
 	t.root.addRevision(key, revision)
 }
 
@@ -59,37 +46,31 @@ func (t *BPTree) AddRevision(key []byte, revision int64) {
 // 2. If the key is found, iterate through its revisions and return the latest revision that is less than or equal to the given timestamp.
 // 3. If the key is not found, return 0 and false.
 func (t *BPTree) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bool) {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
-
-	if t.root == nil {
-		return 0, false
-	}
 	return t.root.getLatestRevisionByKey(key, atRevision)
 }
 
-// listRevisionsByKeyRange returns a list of revisions for keys in the given range.
+// listRevisionsByKeyRange calls the callback for each key in the given range with its revisions.
 //
 // The algorithm is as follows:
 // 1. Traverse the tree to find the leaf node where the startKey is located.
 // 2. Iterate through the leaf nodes until the endKey is reached.
-// 3. For each key in the range, find all revisions that are less than or equal to the given timestamp and add them to the result map.
-func (t *BPTree) listRevisionsByKeyRange(startKey, endKey []byte, atRevision int64) map[string][]int64 {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
-
-	if t.root == nil {
-		return nil
-	}
-	return t.root.listRevisionsByKeyRange(startKey, endKey, atRevision)
+// 3. For each key in the range, find all revisions that are less than or equal to the given timestamp and call the callback with the key and revisions.
+func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision int64, callback func(key []byte, revisions []int64) bool) {
+	t.root.listRevisionsByKeyRange(startKey, atRevision, callback)
 }
 
 // node represents a node in the B+ tree. It contains a slice of keys, a slice
 // of values (which are slices of 64-bit integers), and a slice of child nodes.
 type node struct {
-	keys     [][]byte
-	values   [][]int64
-	children []*node
+	mutex sync.RWMutex
+
+	entries []nodeEntry
+}
+
+type nodeEntry struct {
+	prefix    []byte
+	child     *node
+	revisions []int64
 }
 
 // split splits a full node into two.
@@ -97,70 +78,70 @@ type node struct {
 // The middle key is promoted to the parent node, and the remaining keys are divided between the two new nodes.
 // This process ensures that the tree remains balanced.
 func (n *node) split(parent *node, i int) {
-	newChild := &node{}
-	mid := len(n.keys) / 2
-	parent.keys = append(parent.keys, nil)
-	copy(parent.keys[i+1:], parent.keys[i:])
-	parent.keys[i] = n.keys[mid]
+	panic("not implemented")
+	// newChild := &node{}
+	// mid := len(n.keys) / 2
+	// parent.keys = append(parent.keys, nil)
+	// copy(parent.keys[i+1:], parent.keys[i:])
+	// parent.keys[i] = n.keys[mid]
 
-	newChild.keys = append(newChild.keys, n.keys[mid+1:]...)
-	n.keys = n.keys[:mid]
+	// newChild.keys = append(newChild.keys, n.keys[mid+1:]...)
+	// n.keys = n.keys[:mid]
 
-	if len(n.values) > 0 {
-		newChild.values = append(newChild.values, n.values[mid+1:]...)
-		n.values = n.values[:mid]
-	}
+	// if len(n.revisions) > 0 {
+	// 	newChild.revisions = append(newChild.revisions, n.revisions[mid+1:]...)
+	// 	n.revisions = n.revisions[:mid]
+	// }
 
-	if len(n.children) > 0 {
-		newChild.children = append(newChild.children, n.children[mid+1:]...)
-		n.children = n.children[:mid+1]
-	}
+	// if len(n.children) > 0 {
+	// 	newChild.children = append(newChild.children, n.children[mid+1:]...)
+	// 	n.children = n.children[:mid+1]
+	// }
 
-	parent.children = append(parent.children, nil)
-	copy(parent.children[i+1:], parent.children[i:])
-	parent.children[i+1] = newChild
+	// parent.children = append(parent.children, nil)
+	// copy(parent.children[i+1:], parent.children[i:])
+	// parent.children[i+1] = newChild
 }
 
-func (n *node) addRevision(key []byte, revision int64) {
-	i := 0
-	for i < len(n.keys) && bytes.Compare(n.keys[i], key) < 0 {
-		i++
-	}
+func (n *node) addRevision(remainingKey []byte, revision int64) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
 
-	if i < len(n.keys) && bytes.Equal(n.keys[i], key) {
-		n.values[i] = append(n.values[i], revision)
-		return
-	}
-
-	if len(n.children) > 0 {
-		if len(n.children[i].keys) == maxKeys {
-			n.children[i].split(n, i)
-			if bytes.Compare(key, n.keys[i]) > 0 {
-				i++
+	pos, match := n.findNextPage(remainingKey)
+	if match {
+		e := &n.entries[pos]
+		if len(e.prefix) == len(remainingKey) {
+			e.revisions = append(e.revisions, revision)
+		} else {
+			if e.child == nil {
+				e.child = &node{}
 			}
+			e.child.addRevision(remainingKey[len(e.prefix):], revision)
 		}
-		n.children[i].addRevision(key, revision)
 		return
 	}
 
-	n.keys = append(n.keys, nil)
-	copy(n.keys[i+1:], n.keys[i:])
-	n.keys[i] = key
-
-	n.values = append(n.values, nil)
-	copy(n.values[i+1:], n.values[i:])
-	n.values[i] = []int64{revision}
+	// We need to insert a new entry
+	newEntries := make([]nodeEntry, len(n.entries)+1)
+	copy(newEntries, n.entries[:pos])
+	newEntries[pos] = nodeEntry{prefix: remainingKey, revisions: []int64{revision}}
+	copy(newEntries[pos+1:], n.entries[pos:])
+	n.entries = newEntries
 }
 
+func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision int64) (int64, bool) {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
 
-func (n *node) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bool) {
-	i := 0
-	for i < len(n.keys) && bytes.Compare(n.keys[i], key) < 0 {
-		i++
+	pos, match := n.findNextPage(remainingKey)
+	if !match {
+		return 0, false
 	}
 
-	if i < len(n.keys) && bytes.Equal(n.keys[i], key) {
-		revisions := n.values[i]
+	e := &n.entries[pos]
+
+	revisions := e.revisions
+	if len(revisions) > 0 && bytes.Equal(e.prefix, remainingKey) {
 		latest := int64(0)
 		found := false
 		for _, r := range revisions {
@@ -174,48 +155,95 @@ func (n *node) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bool
 		return latest, found
 	}
 
-	if len(n.children) > 0 {
-		return n.children[i].getLatestRevisionByKey(key, atRevision)
+	if e.child != nil {
+		return e.child.getLatestRevisionByKey(remainingKey, atRevision)
 	}
 
 	return 0, false
 }
 
-func (n *node) listRevisionsByKeyRange(startKey, endKey []byte, atRevision int64) map[string][]int64 {
-	results := make(map[string][]int64)
+// findSupremumHoldingLock finds the supremum of the given prefix.
+// The supremum is the smallest entry that is greater than or equal to the given prefix.
+func (n *node) findNextPage(prefixRemaining []byte) (int, bool) {
 	i := 0
-	for i < len(n.keys) && bytes.Compare(n.keys[i], startKey) < 0 {
+
+	for ; i < len(n.entries); i++ {
+		e := &n.entries[i]
+
+		prefixLen := len(e.prefix)
+		if prefixLen > len(prefixRemaining) {
+			continue
+		}
+		cmp := bytes.Compare(e.prefix, prefixRemaining[:prefixLen])
+
+		if cmp > 0 {
+			return i, false
+		}
+
+		if cmp == 0 {
+			return i, true
+		}
+	}
+
+	return i, false
+}
+
+func (n *node) listRevisionsByKeyRange(fromPrefixRemaining []byte, atRevision int64, callback func(key []byte, revisions []int64) bool) bool {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
+
+	// pos, match := n.findSupremumHoldingLock(fromPrefixRemaining)
+	// i := pos
+	// if !match && i > 0 {
+	// 	i--
+	// }
+
+	isMatch := false
+	i := 0
+	for ; i < len(n.entries); i++ {
+		e := &n.entries[i]
+
+		minLen := min(len(e.prefix), len(fromPrefixRemaining))
+
+		cmp := bytes.Compare(e.prefix[:minLen], fromPrefixRemaining[:minLen])
+		if cmp > 0 {
+			break
+		}
+
+		if cmp == 0 {
+			isMatch = true
+			break
+		}
+	}
+
+	if isMatch {
+		e := &n.entries[i]
+		if len(e.revisions) > 0 && bytes.Compare(e.prefix, fromPrefixRemaining) >= 0 {
+			if !callback(e.prefix, e.revisions) {
+				return false
+			}
+		}
+
+		if e.child != nil {
+			if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
+				return false
+			}
+		}
 		i++
 	}
 
-	if len(n.children) > 0 {
-		for j := i; j < len(n.children); j++ {
-			childResults := n.children[j].listRevisionsByKeyRange(startKey, endKey, atRevision)
-			for k, v := range childResults {
-				results[k] = v
-			}
-			if j < len(n.keys) && bytes.Compare(n.keys[j], endKey) >= 0 {
-				break
+	for ; i < len(n.entries); i++ {
+		e := &n.entries[i]
+		if len(e.revisions) > 0 {
+			if !callback(e.prefix, e.revisions) {
+				return false
 			}
 		}
-	} else {
-		for j := i; j < len(n.keys); j++ {
-			key := n.keys[j]
-			if bytes.Compare(key, endKey) >= 0 {
-				break
-			}
-			revisions := n.values[j]
-			matchingRevisions := []int64{}
-			for _, r := range revisions {
-				if r <= atRevision {
-					matchingRevisions = append(matchingRevisions, r)
-				}
-			}
-			if len(matchingRevisions) > 0 {
-				results[string(key)] = matchingRevisions
+		if e.child != nil {
+			if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
+				return false
 			}
 		}
 	}
-
-	return results
+	return true
 }
