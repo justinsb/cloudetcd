@@ -1,3 +1,10 @@
+// Package bptree implements an in-memory B+ tree.
+//
+// This B+ tree is used as an index for key-based lookups. It does not store
+// values directly, but rather a list of 64-bit revision numbers for each key.
+//
+// The implementation is designed for in-memory use, and as such does not have
+// strictly balanced pages. It also supports multiple revision numbers for each key.
 package bptree
 
 import (
@@ -7,7 +14,8 @@ import (
 
 const maxKeys = 32
 
-// BPTree is a B+ tree implementation.
+// BPTree is a B+ tree implementation. It contains a pointer to the root node
+// and a read-write mutex for concurrent access.
 type BPTree struct {
 	root *node
 	lock sync.RWMutex
@@ -20,7 +28,14 @@ func New() *BPTree {
 	}
 }
 
-// AddRevision adds a revision for a key.
+// AddRevision adds a new revision to a key. If the key does not exist, it is created.
+//
+// The algorithm is as follows:
+// 1. Traverse the tree to find the leaf node where the key should be inserted.
+// 2. If the key already exists, append the new revision to the existing list of revisions.
+// 3. If the key does not exist, insert the key and the new revision into the leaf node.
+// 4. If the leaf node is full, split it into two nodes and promote the middle key to the parent node.
+//    This splitting process may propagate up to the root of the tree.
 func (t *BPTree) AddRevision(key []byte, revision int64) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
@@ -38,6 +53,11 @@ func (t *BPTree) AddRevision(key []byte, revision int64) {
 }
 
 // getLatestRevisionByKey returns the latest revision for a key that is less than or equal to the given timestamp.
+//
+// The algorithm is as follows:
+// 1. Traverse the tree to find the leaf node containing the key.
+// 2. If the key is found, iterate through its revisions and return the latest revision that is less than or equal to the given timestamp.
+// 3. If the key is not found, return 0 and false.
 func (t *BPTree) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bool) {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
@@ -49,6 +69,11 @@ func (t *BPTree) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bo
 }
 
 // listRevisionsByKeyRange returns a list of revisions for keys in the given range.
+//
+// The algorithm is as follows:
+// 1. Traverse the tree to find the leaf node where the startKey is located.
+// 2. Iterate through the leaf nodes until the endKey is reached.
+// 3. For each key in the range, find all revisions that are less than or equal to the given timestamp and add them to the result map.
 func (t *BPTree) listRevisionsByKeyRange(startKey, endKey []byte, atRevision int64) map[string][]int64 {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
@@ -59,12 +84,18 @@ func (t *BPTree) listRevisionsByKeyRange(startKey, endKey []byte, atRevision int
 	return t.root.listRevisionsByKeyRange(startKey, endKey, atRevision)
 }
 
+// node represents a node in the B+ tree. It contains a slice of keys, a slice
+// of values (which are slices of 64-bit integers), and a slice of child nodes.
 type node struct {
 	keys     [][]byte
 	values   [][]int64
 	children []*node
 }
 
+// split splits a full node into two.
+// When a node becomes full (i.e., it contains the maximum number of keys), it is split into two nodes.
+// The middle key is promoted to the parent node, and the remaining keys are divided between the two new nodes.
+// This process ensures that the tree remains balanced.
 func (n *node) split(parent *node, i int) {
 	newChild := &node{}
 	mid := len(n.keys) / 2
