@@ -79,8 +79,12 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Verify revision numbers
-	if newStorage.GetCurrentRevision() != Revision(rev4) {
-		t.Errorf("Expected revision to be %d after replay, got %d", rev4, newStorage.GetCurrentRevision())
+	logRevision, err := newStorage.log.GetCurrentRevision(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get current revision: %v", err)
+	}
+	if logRevision != Revision(rev4) {
+		t.Errorf("Expected revision to be %d after replay, got %d", rev4, logRevision)
 	}
 
 	// Test list functionality after replay
@@ -99,6 +103,8 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 }
 
 func TestMemoryStorageLogReplayEmpty(t *testing.T) {
+	ctx := context.TODO()
+
 	// Test replay with an empty log
 	log := persistence.NewMemoryLog()
 	storage, err := NewMemoryStorage(log)
@@ -107,8 +113,12 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	}
 
 	// Should not crash and should have revision 0
-	if storage.GetCurrentRevision() != 0 {
-		t.Errorf("Expected revision 0 for empty log, got %d", storage.GetCurrentRevision())
+	logRevision, err := storage.log.GetCurrentRevision(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get current revision: %v", err)
+	}
+	if logRevision != 0 {
+		t.Errorf("Expected revision 0 for empty log, got %d", logRevision)
 	}
 
 	// List should return empty
@@ -214,7 +224,7 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 4: Verify current state
-	keys, err := storage1.List(ctx, []byte(""), []byte(""), 0)
+	keys, err := storage1.List(ctx, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("Failed to list keys: %v", err)
 	}
@@ -235,7 +245,7 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 6: Verify that the state was replayed correctly
-	keys, err = storage2.List(ctx, []byte(""), []byte(""), 0)
+	keys, err = storage2.List(ctx, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("Failed to list keys in storage2: %v", err)
 	}
@@ -250,12 +260,19 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 7: Verify revision numbers match
-	if storage1.GetCurrentRevision() != storage2.GetCurrentRevision() {
-		t.Errorf("Revisions don't match: storage1=%d, storage2=%d",
-			storage1.GetCurrentRevision(), storage2.GetCurrentRevision())
+	logRevision1, err := storage1.log.GetCurrentRevision(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get current revision: %v", err)
 	}
-	if storage1.GetCurrentRevision() != Revision(rev4) {
-		t.Errorf("Expected revision %d, got %d", rev4, storage1.GetCurrentRevision())
+	logRevision2, err := storage2.log.GetCurrentRevision(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get current revision: %v", err)
+	}
+	if logRevision1 != logRevision2 {
+		t.Errorf("Revisions don't match: storage1=%d, storage2=%d", logRevision1, logRevision2)
+	}
+	if logRevision1 != Revision(rev4) {
+		t.Errorf("Expected revision %d, got %d", rev4, logRevision1)
 	}
 
 	// Step 8: Test that we can still write to the replayed storage

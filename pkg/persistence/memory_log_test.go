@@ -3,6 +3,7 @@ package persistence
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 )
@@ -12,8 +13,13 @@ func TestMemoryLog_Append(t *testing.T) {
 	ctx := context.Background()
 
 	// Test first append
-	revision, err := log.Append(ctx, "PUT", []byte("key1"), []byte("value1"), 0)
-	if err != nil {
+	logRecord1, ok, err := log.Append(ctx, 0, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key1"),
+		Value:     []byte("value1"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	if logRecord1.Revision != 1 {
@@ -21,8 +27,12 @@ func TestMemoryLog_Append(t *testing.T) {
 	}
 
 	// Test second append
-	revision, err = log.Append(ctx, "DELETE", []byte("key1"), nil, 0)
-	if err != nil {
+	logRecord2, ok, err := log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
+		Operation: mvccpb.DELETE,
+		Key:       []byte("key1"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	if logRecord2.Revision != 2 {
@@ -44,9 +54,29 @@ func TestMemoryLog_Read(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some records
-	log.Append(ctx, "PUT", []byte("key1"), []byte("value1"), 0)
-	log.Append(ctx, "PUT", []byte("key2"), []byte("value2"), 0)
-	log.Append(ctx, "DELETE", []byte("key1"), nil, 0)
+	_, ok, err := log.Append(ctx, 0, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key1"),
+		Value:     []byte("value1"),
+	})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	_, ok, err = log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key2"),
+		Value:     []byte("value2"),
+	})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	_, ok, err = log.Append(ctx, 2, &LogRecord{
+		Revision:  3,
+		Operation: mvccpb.DELETE,
+		Key:       []byte("key1"),
+	})
 
 	// Read all records from revision 1
 	records, err := log.Read(ctx, 1, 10)
@@ -91,9 +121,29 @@ func TestMemoryLog_ReadWithLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some records
-	log.Append(ctx, "PUT", []byte("key1"), []byte("value1"), 0)
-	log.Append(ctx, "PUT", []byte("key2"), []byte("value2"), 0)
-	log.Append(ctx, "DELETE", []byte("key1"), nil, 0)
+	_, ok, err := log.Append(ctx, 0, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key1"),
+		Value:     []byte("value1"),
+	})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	_, ok, err = log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key2"),
+		Value:     []byte("value2"),
+	})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	_, ok, err = log.Append(ctx, 2, &LogRecord{
+		Revision:  3,
+		Operation: mvccpb.DELETE,
+		Key:       []byte("key1"),
+	})
 
 	// Read with limit 2
 	records, err := log.Read(ctx, 1, 2)
@@ -133,9 +183,29 @@ func TestMemoryLog_ConcurrentAppend(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
 			for j := 0; j < appendsPerGoroutine; j++ {
-				_, err := log.Append(ctx, "PUT", []byte("key"), []byte("value"), 0)
-				if err != nil {
-					t.Errorf("Failed to append: %v", err)
+				done := false
+				for attempt := 0; attempt < 10; attempt++ {
+					revision, err := log.GetCurrentRevision(ctx)
+					if err != nil {
+						t.Errorf("Failed to get current revision: %v", err)
+					}
+					_, ok, err := log.Append(ctx, revision, &LogRecord{
+						Revision:  revision + 1,
+						Operation: mvccpb.PUT,
+						Key:       []byte("key"),
+						Value:     []byte("value"),
+					})
+					if err != nil {
+						t.Errorf("Failed to append: %v", err)
+					}
+					if ok {
+						done = true
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !done {
+					t.Errorf("Failed to append after 10 attempts")
 				}
 			}
 			done <- true

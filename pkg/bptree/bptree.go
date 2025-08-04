@@ -10,7 +10,6 @@ package bptree
 import (
 	"bytes"
 	"sync"
-	"sync/atomic"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
@@ -20,17 +19,17 @@ const maxKeys = 32
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
 type BPTree struct {
-	revision atomic.Uint64
-	root     node
+	// revision atomic.Uint64
+	root node
 }
 
 type Revision = persistence.Revision
 
-// GetCurrentRevision returns the current revision of the B+ tree.
-func (t *BPTree) GetCurrentRevision() Revision {
-	v := t.revision.Load()
-	return Revision(v)
-}
+// // GetCurrentRevision returns the current revision of the B+ tree.
+// func (t *BPTree) GetCurrentRevision() Revision {
+// 	v := t.revision.Load()
+// 	return Revision(v)
+// }
 
 // AddRevision adds a new revision to a key. If the key does not exist, it is created.
 //
@@ -43,15 +42,15 @@ func (t *BPTree) GetCurrentRevision() Revision {
 func (t *BPTree) AddRevision(key []byte, revision Revision) {
 	t.root.addRevision(key, revision)
 
-	for {
-		oldRevision := t.revision.Load()
-		if revision <= Revision(oldRevision) {
-			break
-		}
-		if t.revision.CompareAndSwap(oldRevision, uint64(revision)) {
-			break
-		}
-	}
+	// for {
+	// 	oldRevision := t.revision.Load()
+	// 	if revision <= Revision(oldRevision) {
+	// 		break
+	// 	}
+	// 	if t.revision.CompareAndSwap(oldRevision, uint64(revision)) {
+	// 		break
+	// 	}
+	// }
 }
 
 // GetLatestRevisionByKey returns the latest revision for a key that is less than or equal to the given timestamp.

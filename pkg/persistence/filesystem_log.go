@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 )
 
 // FilesystemLog is a filesystem-backed implementation of the Log interface
@@ -78,47 +77,37 @@ func (f *FilesystemLog) replay() error {
 }
 
 // Append adds a new record to the log and returns the revision number
-func (f *FilesystemLog) Txn(ctx context.Context, fn func(ctx context.Context, txn Transaction) error) (*LogRecord, error) {
+func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (*LogRecord, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	txn := &filesystemTransaction{
-		log: f,
+	if conditionPosition != f.revision {
+		return nil, false, nil
 	}
-	if err := fn(ctx, txn); err != nil {
-		return nil, err
+
+	if logRecord.Revision != f.revision+1 {
+		return nil, false, fmt.Errorf("log record revision does not match current revision")
 	}
 
 	// Increment revision number
 	f.revision++
-
-	record := &LogRecord{
-		Revision:       f.revision,
-		Version:        version,
-		CreateRevision: createRevision,
-		Timestamp:      time.Now(),
-		Operation:      operation,
-		Key:            key,
-		Value:          value,
-		LeaseID:        leaseID,
-	}
 
 	// Create filename with hex-encoded revision
 	filename := revisionToFilename(f.revision)
 	filepath := filepath.Join(f.dir, filename)
 
 	// Serialize record to JSON
-	data, err := json.Marshal(record)
+	data, err := json.Marshal(logRecord)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal log record: %w", err)
+		return nil, false, fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to file atomically
 	if err := os.WriteFile(filepath, data, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write log file: %w", err)
+		return nil, false, fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	return record, nil
+	return logRecord, true, nil
 }
 
 // GetCurrentRevision returns the current revision number

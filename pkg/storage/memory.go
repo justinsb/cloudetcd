@@ -175,9 +175,19 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	snapshotTimestamp := m.revisions.GetCurrentRevision()
+	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current revision: %w", err)
+	}
 
 	existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+
+	logRecord := &persistence.LogRecord{
+		Revision:  Revision(snapshotTimestamp + 1),
+		Operation: mvccpb.PUT,
+		Key:       key,
+		Value:     value,
+	}
 
 	var existing *KeyValue
 	if hasExisting {
@@ -186,18 +196,16 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 			klog.Fatalf("log entry not found for revision %d", existingRevision)
 		}
 		existing = logEntryToKeyValue(logEntry)
+		logRecord.CreateRevision = logEntry.CreateRevision
+		logRecord.Version = logEntry.Version + 1
+	} else {
+		logRecord.CreateRevision = logRecord.Revision
+		logRecord.Version = 1
 	}
 
 	// Let's see if we can commit this transaction without conflicts
-	newLogRecord, err := m.log.Txn(ctx, func(ctx context.Context, txn persistence.Transaction) error {
-		if txn.Timestamp() != snapshotTimestamp {
-			// TODO: We can retry
-			return fmt.Errorf("timestamp mismatch: %d != %d", txn.Timestamp(), snapshotTimestamp)
-		}
-
-		return txn.Put(ctx, key, value, leaseID)
-	})
-	if err != nil {
+	newLogRecord, ok, err := m.log.Append(ctx, snapshotTimestamp, logRecord)
+	if err != nil || !ok {
 		return 0, fmt.Errorf("failed to append to log: %w", err)
 	}
 
@@ -271,7 +279,10 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	snapshotTimestamp := MAX_REVISION
+	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current revision: %w", err)
+	}
 
 	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
 	if !exists {
@@ -284,8 +295,13 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	}
 
 	// Append to the persistence log first
-	newLogRecord, err := m.log.Append(ctx, mvccpb.DELETE, key, nil, 0)
-	if err != nil {
+	newLogRecord, ok, err := m.log.Append(ctx, snapshotTimestamp, &persistence.LogRecord{
+		Revision:  Revision(snapshotTimestamp + 1),
+		Operation: mvccpb.DELETE,
+		Key:       key,
+		Value:     nil,
+	})
+	if err != nil || !ok {
 		return 0, fmt.Errorf("failed to append to log: %w", err)
 	}
 
@@ -326,7 +342,11 @@ func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, a
 
 	if atRevision == 0 {
 		// TODO: Or max revision?
-		atRevision = m.revisions.GetCurrentRevision()
+		logRevision, err := m.log.GetCurrentRevision(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current revision: %w", err)
+		}
+		atRevision = logRevision
 	}
 
 	var result []*KeyValue
@@ -340,16 +360,25 @@ func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, a
 			}
 		}
 
-		for _, revision := range revisions {
-			if revision > atRevision {
-				continue
-			}
+		latest := Revision(0)
+		found := false
 
-			kv := m.log.GetLogEntry(revision)
-			if kv == nil {
-				klog.Fatalf("log entry not found for revision %d", revision)
+		// Find the latest revision that is less than or equal to atRevision
+		for _, revision := range revisions {
+			if revision <= atRevision {
+				latest = revision
+				found = true
 			}
-			result = append(result, logEntryToKeyValue(kv))
+		}
+
+		if found {
+			logEntry := m.log.GetLogEntry(latest)
+			if logEntry == nil {
+				klog.Fatalf("log entry not found for revision %d", latest)
+			}
+			if logEntry.Operation == mvccpb.PUT {
+				result = append(result, logEntryToKeyValue(logEntry))
+			}
 		}
 
 		return true
@@ -405,13 +434,13 @@ func (m *MemoryStorage) removeWatcher(id int64) {
 	delete(m.watchers, id)
 }
 
-// GetCurrentRevision returns the current revision number
-func (m *MemoryStorage) GetCurrentRevision() Revision {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// // GetCurrentRevision returns the current revision number
+// func (m *MemoryStorage) GetCurrentRevision() Revision {
+// 	m.mu.RLock()
+// 	defer m.mu.RUnlock()
 
-	return m.revisions.GetCurrentRevision()
-}
+// 	return m.revisions.GetCurrentRevision()
+// }
 
 // ForceReplayLog manually triggers a replay of the log
 // This can be useful for testing or explicit recovery scenarios

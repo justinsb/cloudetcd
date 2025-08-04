@@ -24,7 +24,8 @@ type LogRecord struct {
 // Log is the interface for the persistence log
 type Log interface {
 	// Append adds a new record to the log and returns the revision number
-	Append(ctx context.Context, operation string, key []byte, value []byte, leaseID int64) (int64, error)
+	// The bool indicates whether the append was successful, which is false if the condition position does not match the current revision.
+	Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (*LogRecord, bool, error)
 
 	// GetCurrentRevision returns the current revision number
 	GetCurrentRevision(ctx context.Context) (Revision, error)
@@ -37,16 +38,4 @@ type Log interface {
 
 	// GetLogEntry returns the log entry for the given key and revision
 	GetLogEntry(revision Revision) *LogRecord
-}
-
-// Transaction is the interface for a transaction on the log
-type Transaction interface {
-	// Timestamp returns the timestamp of the transaction
-	Timestamp() Revision
-
-	// Put adds a new record to the log
-	Put(ctx context.Context, newKV *mvccpb.KeyValue) error
-
-	// Delete deletes a record from the log
-	Delete(ctx context.Context, oldKV *mvccpb.KeyValue) error
 }

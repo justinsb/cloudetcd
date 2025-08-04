@@ -38,11 +38,16 @@ func TestFilesystemLog_BasicOperations(t *testing.T) {
 	// Test appending a record
 	key := []byte("test-key")
 	value := []byte("test-value")
-	revision, err = log.Append(ctx, "PUT", key, value, 0)
-	if err != nil {
+	logRecord1, ok, err := log.Append(ctx, revision, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       key,
+		Value:     value,
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record: %v", err)
 	}
-	if revision != 1 {
+	if logRecord1.Revision != 1 {
 		t.Errorf("Expected revision 1, got %d", revision)
 	}
 
@@ -87,13 +92,23 @@ func TestFilesystemLog_Restart(t *testing.T) {
 	}
 
 	// Add some records
-	revision1, err := log1.Append(ctx, "PUT", []byte("key1"), []byte("value1"), 0)
-	if err != nil {
+	logRecord1, ok, err := log1.Append(ctx, 0, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key1"),
+		Value:     []byte("value1"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append first record: %v", err)
 	}
 
-	revision2, err := log1.Append(ctx, "PUT", []byte("key2"), []byte("value2"), 0)
-	if err != nil {
+	logRecord2, ok, err := log1.Append(ctx, 1, &LogRecord{
+		Revision:  2,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key2"),
+		Value:     []byte("value2"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append second record: %v", err)
 	}
 
@@ -141,12 +156,17 @@ func TestFilesystemLog_Restart(t *testing.T) {
 	}
 
 	// Add a new record after restart
-	revision3, err := log2.Append(ctx, "PUT", []byte("key3"), []byte("value3"), 0)
-	if err != nil {
+	logRecord3, ok, err := log2.Append(ctx, 2, &LogRecord{
+		Revision:  3,
+		Operation: mvccpb.PUT,
+		Key:       []byte("key3"),
+		Value:     []byte("value3"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record after restart: %v", err)
 	}
-	if revision3.Revision != logRecord2.Revision+1 {
-		t.Errorf("Expected revision %d, got %d", logRecord2.Revision+1, revision3.Revision)
+	if logRecord3.Revision != logRecord2.Revision+1 {
+		t.Errorf("Expected revision %d, got %d", logRecord2.Revision+1, logRecord3.Revision)
 	}
 }
 
@@ -167,11 +187,16 @@ func TestFilesystemLog_ReadWithLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Add multiple records
-	for i := 1; i <= 5; i++ {
+	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
-		_, err := log.Append(ctx, "PUT", key, value, 0)
-		if err != nil {
+		_, ok, err := log.Append(ctx, Revision(i), &LogRecord{
+			Revision:  Revision(i + 1),
+			Operation: mvccpb.PUT,
+			Key:       key,
+			Value:     value,
+		})
+		if err != nil || !ok {
 			t.Fatalf("Failed to append record %d: %v", i, err)
 		}
 	}
@@ -211,11 +236,16 @@ func TestFilesystemLog_ReadFromRevision(t *testing.T) {
 	ctx := context.Background()
 
 	// Add multiple records
-	for i := 1; i <= 5; i++ {
+	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
-		_, err := log.Append(ctx, "PUT", key, value, 0)
-		if err != nil {
+		_, ok, err := log.Append(ctx, Revision(i), &LogRecord{
+			Revision:  Revision(i + 1),
+			Operation: mvccpb.PUT,
+			Key:       key,
+			Value:     value,
+		})
+		if err != nil || !ok {
 			t.Fatalf("Failed to append record %d: %v", i, err)
 		}
 	}
@@ -318,24 +348,38 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some sample records
-	revision1, err := fsLog.Append(ctx, "PUT", []byte("user:1"), []byte("Alice"), 0)
-	if err != nil {
+	logRecord1, ok, err := fsLog.Append(ctx, 0, &LogRecord{
+		Revision:  1,
+		Operation: mvccpb.PUT,
+		Key:       []byte("user:1"),
+		Value:     []byte("Alice"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record: %v", err)
 	}
 	if logRecord1.Revision != 1 {
 		t.Errorf("Expected revision 1, got %d", logRecord1.Revision)
 	}
 
-	revision2, err := fsLog.Append(ctx, "PUT", []byte("user:2"), []byte("Bob"), 0)
-	if err != nil {
+	logRecord2, ok, err := fsLog.Append(ctx, 1, &LogRecord{
+		Revision:  2,
+		Operation: mvccpb.PUT,
+		Key:       []byte("user:2"),
+		Value:     []byte("Bob"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record: %v", err)
 	}
 	if logRecord2.Revision != 2 {
 		t.Errorf("Expected revision 2, got %d", logRecord2.Revision)
 	}
 
-	revision3, err := fsLog.Append(ctx, "DELETE", []byte("user:1"), nil, 0)
-	if err != nil {
+	logRecord3, ok, err := fsLog.Append(ctx, 2, &LogRecord{
+		Revision:  3,
+		Operation: mvccpb.DELETE,
+		Key:       []byte("user:1"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record: %v", err)
 	}
 	if logRecord3.Revision != 3 {
@@ -385,8 +429,13 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	}
 
 	// Add a new record after restart
-	revision4, err := newLog.Append(ctx, "PUT", []byte("user:3"), []byte("Charlie"), 0)
-	if err != nil {
+	logRecord4, ok, err := newLog.Append(ctx, 3, &LogRecord{
+		Revision:  4,
+		Operation: mvccpb.PUT,
+		Key:       []byte("user:3"),
+		Value:     []byte("Charlie"),
+	})
+	if err != nil || !ok {
 		t.Fatalf("Failed to append record after restart: %v", err)
 	}
 	if logRecord4.Revision != 4 {

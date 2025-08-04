@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -125,10 +126,10 @@ func TestMemoryStorage_Delete(t *testing.T) {
 
 	// Test delete non-existent key (should succeed)
 	revision, err = storage.Delete(ctx, []byte("non-existent"))
-	if err != nil {
-		t.Fatalf("Delete non-existent key failed: %v", err)
+	if !isNotFound(err) {
+		t.Fatalf("expected not found error for non-existent key, got %v", err)
 	}
-	if revision != 3 {
+	if revision != 0 {
 		t.Errorf("Expected revision 3, got %d", revision)
 	}
 }
@@ -333,10 +334,10 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
 	}
 
-	// At revision3, should get deleted version
+	// At revision3, should get not-found error
 	kv, err = storage.Get(ctx, key, revision3)
-	if err != nil {
-		t.Fatalf("Get at revision3 failed: %v", err)
+	if !isNotFound(err) {
+		t.Fatalf("expected not found error at revision3, got %v", err)
 	}
 	if kv != nil {
 		t.Errorf("Expected nil key-value pair at revision3, got %v", kv)
@@ -347,6 +348,11 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for deleted key at latest revision")
 	}
+}
+
+func isNotFound(err error) bool {
+	// TODO: Fix this
+	return strings.Contains(err.Error(), "key not found")
 }
 
 func TestMemoryStorage_RangeQueries(t *testing.T) {

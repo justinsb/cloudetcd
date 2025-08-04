@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
-
-	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
 // MemoryLog is a memory-backed implementation of the Log interface
@@ -28,25 +25,24 @@ func NewMemoryLog() *MemoryLog {
 }
 
 // Append adds a new record to the log and returns the revision number
-func (m *MemoryLog) Append(ctx context.Context, operation string, key []byte, value []byte, leaseID int64) (int64, error) {
+func (m *MemoryLog) Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (*LogRecord, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Atomically increment the revision number
-	revision := atomic.AddInt64(&m.revision, 1)
-
-	record := &LogRecord{
-		Revision:  revision,
-		Timestamp: time.Now(),
-		Operation: operation,
-		Key:       key,
-		Value:     value,
-		LeaseID:   leaseID,
+	if conditionPosition != Revision(m.revision) {
+		return nil, false, nil
 	}
 
-	m.records = append(m.records, record)
+	if logRecord.Revision != Revision(m.revision+1) {
+		return nil, false, fmt.Errorf("log record revision does not match current revision")
+	}
 
-	return revision, nil
+	// Increment revision number
+	m.revision++
+
+	m.records = append(m.records, logRecord)
+
+	return logRecord, true, nil
 }
 
 // GetCurrentRevision returns the current revision number
@@ -97,47 +93,5 @@ func (m *MemoryLog) GetLogEntry(revision Revision) *LogRecord {
 		}
 	}
 
-	return nil
-}
-
-type memoryTransaction struct {
-	timestamp Revision
-	// log       *MemoryLog
-	records []*LogRecord
-}
-
-var _ Transaction = &memoryTransaction{}
-
-func (t *memoryTransaction) Timestamp() Revision {
-	return t.timestamp
-}
-
-func (t *memoryTransaction) Put(ctx context.Context, newKV *mvccpb.KeyValue, leaseID int64) error {
-	logRecord := &LogRecord{
-		Revision:       t.timestamp,
-		Operation:      mvccpb.PUT,
-		Key:            newKV.Key,
-		Value:          newKV.Value,
-		LeaseID:        leaseID,
-		CreateRevision: Revision(newKV.CreateRevision),
-		Version:        newKV.Version,
-		Timestamp:      time.Now(),
-	}
-	t.records = append(t.records, logRecord)
-	return nil
-}
-
-func (t *memoryTransaction) Delete(ctx context.Context, oldKV *mvccpb.KeyValue) error {
-	logRecord := &LogRecord{
-		Revision:       t.timestamp,
-		Operation:      mvccpb.PUT,
-		Key:            oldKV.Key,
-		Value:          oldKV.Value,
-		LeaseID:        oldKV.Lease,
-		CreateRevision: Revision(oldKV.CreateRevision),
-		Version:        oldKV.Version,
-		Timestamp:      time.Now(),
-	}
-	t.records = append(t.records, logRecord)
 	return nil
 }
