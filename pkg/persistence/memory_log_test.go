@@ -3,6 +3,8 @@ package persistence
 import (
 	"context"
 	"testing"
+
+	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
 func TestMemoryLog_Append(t *testing.T) {
@@ -14,8 +16,8 @@ func TestMemoryLog_Append(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if revision != 1 {
-		t.Errorf("Expected revision 1, got %d", revision)
+	if logRecord1.Revision != 1 {
+		t.Errorf("Expected revision 1, got %d", logRecord1.Revision)
 	}
 
 	// Test second append
@@ -23,8 +25,8 @@ func TestMemoryLog_Append(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if revision != 2 {
-		t.Errorf("Expected revision 2, got %d", revision)
+	if logRecord2.Revision != 2 {
+		t.Errorf("Expected revision 2, got %d", logRecord2.Revision)
 	}
 
 	// Test current revision
@@ -60,7 +62,7 @@ func TestMemoryLog_Read(t *testing.T) {
 	if records[0].Revision != 1 {
 		t.Errorf("Expected revision 1, got %d", records[0].Revision)
 	}
-	if records[0].Operation != "PUT" {
+	if records[0].Operation != mvccpb.PUT {
 		t.Errorf("Expected operation PUT, got %s", records[0].Operation)
 	}
 	if string(records[0].Key) != "key1" {
@@ -71,7 +73,7 @@ func TestMemoryLog_Read(t *testing.T) {
 	if records[1].Revision != 2 {
 		t.Errorf("Expected revision 2, got %d", records[1].Revision)
 	}
-	if records[1].Operation != "PUT" {
+	if records[1].Operation != mvccpb.PUT {
 		t.Errorf("Expected operation PUT, got %s", records[1].Operation)
 	}
 
@@ -79,7 +81,7 @@ func TestMemoryLog_Read(t *testing.T) {
 	if records[2].Revision != 3 {
 		t.Errorf("Expected revision 3, got %d", records[2].Revision)
 	}
-	if records[2].Operation != "DELETE" {
+	if records[2].Operation != mvccpb.DELETE {
 		t.Errorf("Expected operation DELETE, got %s", records[2].Operation)
 	}
 }
@@ -109,9 +111,12 @@ func TestMemoryLog_ReadFromInvalidRevision(t *testing.T) {
 	ctx := context.Background()
 
 	// Try to read from invalid revision
-	_, err := log.Read(ctx, -1, 10)
+	records, err := log.Read(ctx, 1234567, 10)
 	if err == nil {
 		t.Error("Expected error for invalid revision, got nil")
+	}
+	if len(records) != 0 {
+		t.Errorf("Expected 0 records, got %d", len(records))
 	}
 }
 
@@ -143,7 +148,7 @@ func TestMemoryLog_ConcurrentAppend(t *testing.T) {
 	}
 
 	// Check final revision
-	expectedRevision := int64(numGoroutines * appendsPerGoroutine)
+	expectedRevision := Revision(numGoroutines * appendsPerGoroutine)
 	currentRev, err := log.GetCurrentRevision(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)

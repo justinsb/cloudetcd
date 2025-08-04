@@ -10,6 +10,9 @@ package bptree
 import (
 	"bytes"
 	"sync"
+	"sync/atomic"
+
+	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
 const maxKeys = 32
@@ -17,14 +20,16 @@ const maxKeys = 32
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
 type BPTree struct {
-	root *node
+	revision atomic.Uint64
+	root     node
 }
 
-// New creates a new B+ tree.
-func New() *BPTree {
-	return &BPTree{
-		root: &node{},
-	}
+type Revision = persistence.Revision
+
+// GetCurrentRevision returns the current revision of the B+ tree.
+func (t *BPTree) GetCurrentRevision() Revision {
+	v := t.revision.Load()
+	return Revision(v)
 }
 
 // AddRevision adds a new revision to a key. If the key does not exist, it is created.
@@ -35,17 +40,27 @@ func New() *BPTree {
 //  3. If the key does not exist, insert the key and the new revision into the leaf node.
 //  4. If the leaf node is full, split it into two nodes and promote the middle key to the parent node.
 //     This splitting process may propagate up to the root of the tree.
-func (t *BPTree) AddRevision(key []byte, revision int64) {
+func (t *BPTree) AddRevision(key []byte, revision Revision) {
 	t.root.addRevision(key, revision)
+
+	for {
+		oldRevision := t.revision.Load()
+		if revision <= Revision(oldRevision) {
+			break
+		}
+		if t.revision.CompareAndSwap(oldRevision, uint64(revision)) {
+			break
+		}
+	}
 }
 
-// getLatestRevisionByKey returns the latest revision for a key that is less than or equal to the given timestamp.
+// GetLatestRevisionByKey returns the latest revision for a key that is less than or equal to the given timestamp.
 //
 // The algorithm is as follows:
 // 1. Traverse the tree to find the leaf node containing the key.
 // 2. If the key is found, iterate through its revisions and return the latest revision that is less than or equal to the given timestamp.
 // 3. If the key is not found, return 0 and false.
-func (t *BPTree) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bool) {
+func (t *BPTree) GetLatestRevisionByKey(key []byte, atRevision Revision) (Revision, bool) {
 	return t.root.getLatestRevisionByKey(key, atRevision)
 }
 
@@ -55,7 +70,7 @@ func (t *BPTree) getLatestRevisionByKey(key []byte, atRevision int64) (int64, bo
 // 1. Traverse the tree to find the leaf node where the startKey is located.
 // 2. Iterate through the leaf nodes until the endKey is reached.
 // 3. For each key in the range, find all revisions that are less than or equal to the given timestamp and call the callback with the key and revisions.
-func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision int64, callback func(key []byte, revisions []int64) bool) {
+func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) {
 	t.root.listRevisionsByKeyRange(startKey, atRevision, callback)
 }
 
@@ -70,7 +85,7 @@ type node struct {
 type nodeEntry struct {
 	prefix    []byte
 	child     *node
-	revisions []int64
+	revisions []Revision
 }
 
 // split splits a full node into two.
@@ -103,11 +118,11 @@ func (n *node) split(parent *node, i int) {
 	// parent.children[i+1] = newChild
 }
 
-func (n *node) addRevision(remainingKey []byte, revision int64) {
+func (n *node) addRevision(remainingKey []byte, revision Revision) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
-	pos, match := n.findNextPage(remainingKey)
+	pos, match := n.findNextPageHoldingLock(remainingKey)
 	if match {
 		e := &n.entries[pos]
 		if len(e.prefix) == len(remainingKey) {
@@ -122,18 +137,21 @@ func (n *node) addRevision(remainingKey []byte, revision int64) {
 	}
 
 	// We need to insert a new entry
+
+	// TODO: Split if we feel there are "too many" entries
+
 	newEntries := make([]nodeEntry, len(n.entries)+1)
 	copy(newEntries, n.entries[:pos])
-	newEntries[pos] = nodeEntry{prefix: remainingKey, revisions: []int64{revision}}
+	newEntries[pos] = nodeEntry{prefix: remainingKey, revisions: []Revision{revision}}
 	copy(newEntries[pos+1:], n.entries[pos:])
 	n.entries = newEntries
 }
 
-func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision int64) (int64, bool) {
+func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision Revision) (Revision, bool) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
-	pos, match := n.findNextPage(remainingKey)
+	pos, match := n.findNextPageHoldingLock(remainingKey)
 	if !match {
 		return 0, false
 	}
@@ -142,7 +160,7 @@ func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision int64) (in
 
 	revisions := e.revisions
 	if len(revisions) > 0 && bytes.Equal(e.prefix, remainingKey) {
-		latest := int64(0)
+		latest := Revision(0)
 		found := false
 		for _, r := range revisions {
 			if r <= atRevision {
@@ -164,7 +182,7 @@ func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision int64) (in
 
 // findSupremumHoldingLock finds the supremum of the given prefix.
 // The supremum is the smallest entry that is greater than or equal to the given prefix.
-func (n *node) findNextPage(prefixRemaining []byte) (int, bool) {
+func (n *node) findNextPageHoldingLock(prefixRemaining []byte) (int, bool) {
 	i := 0
 
 	for ; i < len(n.entries); i++ {
@@ -188,7 +206,7 @@ func (n *node) findNextPage(prefixRemaining []byte) (int, bool) {
 	return i, false
 }
 
-func (n *node) listRevisionsByKeyRange(fromPrefixRemaining []byte, atRevision int64, callback func(key []byte, revisions []int64) bool) bool {
+func (n *node) listRevisionsByKeyRange(fromPrefixRemaining []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) bool {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 

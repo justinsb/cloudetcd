@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -83,15 +84,15 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 
 	// Verify log records
 	expectedRecords := []struct {
-		revision  int64
-		operation string
+		revision  Revision
+		operation mvccpb.Event_EventType
 		key       string
 		value     string
 	}{
-		{1, "PUT", "key1", "value1"},
-		{2, "PUT", "key2", "value2"},
-		{3, "PUT", "key1", "updated-value1"},
-		{4, "DELETE", "key2", ""},
+		{1, mvccpb.PUT, "key1", "value1"},
+		{2, mvccpb.PUT, "key2", "value2"},
+		{3, mvccpb.PUT, "key1", "updated-value1"},
+		{4, mvccpb.DELETE, "key2", ""},
 	}
 
 	for i, expected := range expectedRecords {

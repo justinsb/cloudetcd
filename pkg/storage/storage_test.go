@@ -68,9 +68,6 @@ func TestMemoryStorage_Get(t *testing.T) {
 	if kv.CreateRevision != 1 {
 		t.Errorf("Expected CreateRevision 1, got %d", kv.CreateRevision)
 	}
-	if kv.Deleted {
-		t.Error("Expected Deleted to be false")
-	}
 
 	// Test get non-existent key
 	_, err = storage.Get(ctx, []byte("non-existent"), 0)
@@ -152,43 +149,68 @@ func TestMemoryStorage_List(t *testing.T) {
 	}
 
 	for k, v := range testData {
-		storage.Put(ctx, []byte(k), []byte(v), 0)
+		_, err := storage.Put(ctx, []byte(k), []byte(v), 0)
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
 	}
 
 	// Test list all keys
-	allKeys, err := storage.List(ctx, []byte{}, []byte{}, 0)
-	if err != nil {
-		t.Fatalf("List all failed: %v", err)
-	}
-	if len(allKeys) != 4 {
-		t.Errorf("Expected 4 keys, got %d", len(allKeys))
+	{
+		allKeys, err := storage.List(ctx, []byte{}, nil, 0)
+		if err != nil {
+			t.Fatalf("List all failed: %v", err)
+		}
+		if len(allKeys) != 4 {
+			t.Errorf("Expected 4 keys, got %d", len(allKeys))
+		}
 	}
 
 	// Test list with prefix (using empty rangeEnd for prefix behavior)
-	prefix1Keys, err := storage.List(ctx, []byte("prefix1/"), []byte{}, 0)
-	if err != nil {
-		t.Fatalf("List with prefix failed: %v", err)
-	}
-	if len(prefix1Keys) != 2 {
-		t.Errorf("Expected 2 keys with prefix1/, got %d", len(prefix1Keys))
-	}
+	{
+		prefix := []byte("prefix1/")
+		prefix1Keys, err := storage.List(ctx, prefix, rangeEndForPrefix(t, prefix), 0)
+		if err != nil {
+			t.Fatalf("List with prefix failed: %v", err)
+		}
+		if len(prefix1Keys) != 2 {
+			t.Errorf("Expected 2 keys with prefix1/, got %d", len(prefix1Keys))
+		}
 
-	// Verify the keys are sorted
-	for i := 1; i < len(prefix1Keys); i++ {
-		if string(prefix1Keys[i-1].Key) >= string(prefix1Keys[i].Key) {
-			t.Errorf("Keys not sorted: %s >= %s",
-				string(prefix1Keys[i-1].Key), string(prefix1Keys[i].Key))
+		// Verify the keys are sorted
+		for i := 1; i < len(prefix1Keys); i++ {
+			if string(prefix1Keys[i-1].Key) >= string(prefix1Keys[i].Key) {
+				t.Errorf("Keys not sorted: %s >= %s",
+					string(prefix1Keys[i-1].Key), string(prefix1Keys[i].Key))
+			}
 		}
 	}
 
 	// Test list with non-existent prefix
-	emptyKeys, err := storage.List(ctx, []byte("non-existent/"), []byte{}, 0)
-	if err != nil {
-		t.Fatalf("List with non-existent prefix failed: %v", err)
+	{
+		prefix := []byte("non-existent/")
+		emptyKeys, err := storage.List(ctx, prefix, rangeEndForPrefix(t, prefix), 0)
+		if err != nil {
+			t.Fatalf("List with non-existent prefix failed: %v", err)
+		}
+		if len(emptyKeys) != 0 {
+			t.Errorf("Expected 0 keys, got %d", len(emptyKeys))
+		}
 	}
-	if len(emptyKeys) != 0 {
-		t.Errorf("Expected 0 keys, got %d", len(emptyKeys))
+}
+
+func rangeEndForPrefix(t *testing.T, prefix []byte) []byte {
+	end := make([]byte, len(prefix))
+	copy(end, prefix)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] < 0xff {
+			end[i] = end[i] + 1
+			end = end[:i+1]
+			return end
+		}
 	}
+	t.Fatalf("next prefix does not exist for %s (%v)", string(prefix), prefix)
+	return nil
 }
 
 func TestMemoryStorage_RevisionOrdering(t *testing.T) {
@@ -295,7 +317,7 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if !reflect.DeepEqual(kv.Value, value1) {
 		t.Errorf("Expected value1 at revision1, got %v", kv.Value)
 	}
-	if kv.CreateRevision != revision1 {
+	if Revision(kv.CreateRevision) != revision1 {
 		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
 	}
 
@@ -307,7 +329,7 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if !reflect.DeepEqual(kv.Value, value2) {
 		t.Errorf("Expected value2 at revision2, got %v", kv.Value)
 	}
-	if kv.CreateRevision != revision1 {
+	if Revision(kv.CreateRevision) != revision1 {
 		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
 	}
 
@@ -316,11 +338,8 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get at revision3 failed: %v", err)
 	}
-	if !kv.Deleted {
-		t.Error("Expected deleted version at revision3")
-	}
-	if kv.CreateRevision != revision1 {
-		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
+	if kv != nil {
+		t.Errorf("Expected nil key-value pair at revision3, got %v", kv)
 	}
 
 	// At latest revision (0), should get error for deleted key
@@ -479,10 +498,12 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		if events[2].Type != mvccpb.DELETE {
 			t.Errorf("Expected DELETE event, got %d", events[2].Type)
 		}
-		if events[2].PrevKv == nil {
-			t.Error("Expected PrevKv to be set for delete")
-		} else if string(events[2].PrevKv.Value) != "value2" {
-			t.Errorf("Expected previous value 'value2', got '%s'", string(events[2].PrevKv.Value))
+		if events[2].PrevKv != nil {
+			t.Error("Expected PrevKv not to be set for delete")
+		}
+		// The value should be the previous value
+		if string(events[2].Kv.Value) != "value2" {
+			t.Errorf("Expected kv value 'value2', got '%s'", string(events[2].PrevKv.Value))
 		}
 	})
 

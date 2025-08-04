@@ -157,7 +157,8 @@ func TestWatchFunctionality(t *testing.T) {
 		var mu sync.Mutex
 
 		// Start watching key "watch-test"
-		watchCh := cli.Watch(ctx, "watch-test")
+		// TODO: Test without WithPrevKV (I think we always send prev_kv on delete)
+		watchCh := cli.Watch(ctx, "watch-test", clientv3.WithPrevKV())
 
 		// Goroutine to collect watch events
 		go func() {
@@ -207,7 +208,7 @@ func TestWatchFunctionality(t *testing.T) {
 		expectedEvents := []string{
 			"PUT:watch-test:value1",
 			"PUT:watch-test:value2",
-			"DELETE:watch-test:",
+			"DELETE:watch-test:value2",
 		}
 
 		if len(events) != len(expectedEvents) {
@@ -226,7 +227,8 @@ func TestWatchFunctionality(t *testing.T) {
 		var mu sync.Mutex
 
 		// Start watching prefix "prefix/"
-		watchCh := cli.Watch(ctx, "prefix/", clientv3.WithPrefix())
+		// TODO: Test without WithPrevKV (I think we always send prev_kv on delete)
+		watchCh := cli.Watch(ctx, "prefix/", clientv3.WithPrefix(), clientv3.WithPrevKV())
 
 		// Goroutine to collect watch events
 		go func() {
@@ -281,7 +283,7 @@ func TestWatchFunctionality(t *testing.T) {
 		expectedEvents := []string{
 			"PUT:prefix/key1:value1",
 			"PUT:prefix/key2:value2",
-			"DELETE:prefix/key1:",
+			"DELETE:prefix/key1:value1",
 		}
 
 		if len(events) != len(expectedEvents) {

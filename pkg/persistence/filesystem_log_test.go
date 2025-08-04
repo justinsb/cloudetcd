@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
 func TestFilesystemLog_BasicOperations(t *testing.T) {
@@ -57,7 +59,7 @@ func TestFilesystemLog_BasicOperations(t *testing.T) {
 	if record.Revision != 1 {
 		t.Errorf("Expected revision 1, got %d", record.Revision)
 	}
-	if record.Operation != "PUT" {
+	if record.Operation != mvccpb.PUT {
 		t.Errorf("Expected operation PUT, got %s", record.Operation)
 	}
 	if string(record.Key) != "test-key" {
@@ -109,8 +111,8 @@ func TestFilesystemLog_Restart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)
 	}
-	if currentRevision != revision2 {
-		t.Errorf("Expected revision %d after restart, got %d", revision2, currentRevision)
+	if currentRevision != logRecord2.Revision {
+		t.Errorf("Expected revision %d after restart, got %d", logRecord2.Revision, currentRevision)
 	}
 
 	// Read all records to verify they were preserved
@@ -123,16 +125,16 @@ func TestFilesystemLog_Restart(t *testing.T) {
 	}
 
 	// Verify first record
-	if records[0].Revision != revision1 {
-		t.Errorf("Expected first record revision %d, got %d", revision1, records[0].Revision)
+	if records[0].Revision != logRecord1.Revision {
+		t.Errorf("Expected first record revision %d, got %d", logRecord1.Revision, records[0].Revision)
 	}
 	if string(records[0].Key) != "key1" {
 		t.Errorf("Expected first record key key1, got %s", string(records[0].Key))
 	}
 
 	// Verify second record
-	if records[1].Revision != revision2 {
-		t.Errorf("Expected second record revision %d, got %d", revision2, records[1].Revision)
+	if records[1].Revision != logRecord2.Revision {
+		t.Errorf("Expected second record revision %d, got %d", logRecord2.Revision, records[1].Revision)
 	}
 	if string(records[1].Key) != "key2" {
 		t.Errorf("Expected second record key key2, got %s", string(records[1].Key))
@@ -143,8 +145,8 @@ func TestFilesystemLog_Restart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to append record after restart: %v", err)
 	}
-	if revision3 != revision2+1 {
-		t.Errorf("Expected revision %d, got %d", revision2+1, revision3)
+	if revision3.Revision != logRecord2.Revision+1 {
+		t.Errorf("Expected revision %d, got %d", logRecord2.Revision+1, revision3.Revision)
 	}
 }
 
@@ -185,7 +187,7 @@ func TestFilesystemLog_ReadWithLimit(t *testing.T) {
 
 	// Verify the records are in order
 	for i, record := range records {
-		expectedRevision := int64(i + 1)
+		expectedRevision := Revision(i + 1)
 		if record.Revision != expectedRevision {
 			t.Errorf("Expected revision %d at position %d, got %d", expectedRevision, i, record.Revision)
 		}
@@ -229,7 +231,7 @@ func TestFilesystemLog_ReadFromRevision(t *testing.T) {
 
 	// Verify the records start from revision 3
 	for i, record := range records {
-		expectedRevision := int64(i + 3)
+		expectedRevision := Revision(i + 3)
 		if record.Revision != expectedRevision {
 			t.Errorf("Expected revision %d at position %d, got %d", expectedRevision, i, record.Revision)
 		}
@@ -253,9 +255,12 @@ func TestFilesystemLog_InvalidFromRevision(t *testing.T) {
 	ctx := context.Background()
 
 	// Test reading with invalid fromRevision
-	_, err = log.Read(ctx, -1, 10)
-	if err == nil {
-		t.Error("Expected error for invalid fromRevision, got nil")
+	records, err := log.Read(ctx, 1234567, 10)
+	if err != nil {
+		t.Errorf("Expected no error from invalid fromRevision, got %v", err)
+	}
+	if len(records) != 0 {
+		t.Errorf("Expected 0 records, got %d", len(records))
 	}
 }
 
@@ -317,24 +322,24 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
-	if revision1 != 1 {
-		t.Errorf("Expected revision 1, got %d", revision1)
+	if logRecord1.Revision != 1 {
+		t.Errorf("Expected revision 1, got %d", logRecord1.Revision)
 	}
 
 	revision2, err := fsLog.Append(ctx, "PUT", []byte("user:2"), []byte("Bob"), 0)
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
-	if revision2 != 2 {
-		t.Errorf("Expected revision 2, got %d", revision2)
+	if logRecord2.Revision != 2 {
+		t.Errorf("Expected revision 2, got %d", logRecord2.Revision)
 	}
 
 	revision3, err := fsLog.Append(ctx, "DELETE", []byte("user:1"), nil, 0)
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
-	if revision3 != 3 {
-		t.Errorf("Expected revision 3, got %d", revision3)
+	if logRecord3.Revision != 3 {
+		t.Errorf("Expected revision 3, got %d", logRecord3.Revision)
 	}
 
 	// Read all records
@@ -347,17 +352,17 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	}
 
 	// Verify first record
-	if records[0].Revision != 1 || records[0].Operation != "PUT" || string(records[0].Key) != "user:1" || string(records[0].Value) != "Alice" {
+	if records[0].Revision != 1 || records[0].Operation != mvccpb.PUT || string(records[0].Key) != "user:1" || string(records[0].Value) != "Alice" {
 		t.Errorf("First record mismatch: %+v", records[0])
 	}
 
 	// Verify second record
-	if records[1].Revision != 2 || records[1].Operation != "PUT" || string(records[1].Key) != "user:2" || string(records[1].Value) != "Bob" {
+	if records[1].Revision != 2 || records[1].Operation != mvccpb.PUT || string(records[1].Key) != "user:2" || string(records[1].Value) != "Bob" {
 		t.Errorf("Second record mismatch: %+v", records[1])
 	}
 
 	// Verify third record
-	if records[2].Revision != 3 || records[2].Operation != "DELETE" || string(records[2].Key) != "user:1" {
+	if records[2].Revision != 3 || records[2].Operation != mvccpb.DELETE || string(records[2].Key) != "user:1" {
 		t.Errorf("Third record mismatch: %+v", records[2])
 	}
 
@@ -384,8 +389,8 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to append record after restart: %v", err)
 	}
-	if revision4 != 4 {
-		t.Errorf("Expected revision 4, got %d", revision4)
+	if logRecord4.Revision != 4 {
+		t.Errorf("Expected revision 4, got %d", logRecord4.Revision)
 	}
 
 	// Read all records again
@@ -398,7 +403,7 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	}
 
 	// Verify the new record
-	if records[3].Revision != 4 || records[3].Operation != "PUT" || string(records[3].Key) != "user:3" || string(records[3].Value) != "Charlie" {
+	if records[3].Revision != 4 || records[3].Operation != mvccpb.PUT || string(records[3].Key) != "user:3" || string(records[3].Value) != "Charlie" {
 		t.Errorf("Fourth record mismatch: %+v", records[3])
 	}
 }

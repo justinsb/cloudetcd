@@ -18,8 +18,10 @@ import (
 type FilesystemLog struct {
 	mu       sync.RWMutex
 	dir      string
-	revision int64 // Current revision number
+	revision Revision // Current revision number
 }
+
+var _ Log = &FilesystemLog{}
 
 // NewFilesystemLog creates a new filesystem-backed log
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
@@ -47,7 +49,7 @@ func (f *FilesystemLog) replay() error {
 		return fmt.Errorf("failed to read log directory: %w", err)
 	}
 
-	var revisions []int64
+	var revisions []Revision
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -76,20 +78,29 @@ func (f *FilesystemLog) replay() error {
 }
 
 // Append adds a new record to the log and returns the revision number
-func (f *FilesystemLog) Append(ctx context.Context, operation string, key []byte, value []byte, leaseID int64) (int64, error) {
+func (f *FilesystemLog) Txn(ctx context.Context, fn func(ctx context.Context, txn Transaction) error) (*LogRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	txn := &filesystemTransaction{
+		log: f,
+	}
+	if err := fn(ctx, txn); err != nil {
+		return nil, err
+	}
 
 	// Increment revision number
 	f.revision++
 
 	record := &LogRecord{
-		Revision:  f.revision,
-		Timestamp: time.Now(),
-		Operation: operation,
-		Key:       key,
-		Value:     value,
-		LeaseID:   leaseID,
+		Revision:       f.revision,
+		Version:        version,
+		CreateRevision: createRevision,
+		Timestamp:      time.Now(),
+		Operation:      operation,
+		Key:            key,
+		Value:          value,
+		LeaseID:        leaseID,
 	}
 
 	// Create filename with hex-encoded revision
@@ -99,26 +110,48 @@ func (f *FilesystemLog) Append(ctx context.Context, operation string, key []byte
 	// Serialize record to JSON
 	data, err := json.Marshal(record)
 	if err != nil {
-		return 0, fmt.Errorf("failed to marshal log record: %w", err)
+		return nil, fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to file atomically
 	if err := os.WriteFile(filepath, data, 0644); err != nil {
-		return 0, fmt.Errorf("failed to write log file: %w", err)
+		return nil, fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	return f.revision, nil
+	return record, nil
 }
 
 // GetCurrentRevision returns the current revision number
-func (f *FilesystemLog) GetCurrentRevision(ctx context.Context) (int64, error) {
+func (f *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.revision, nil
 }
 
+// GetLogEntry returns the log entry for the given revision
+func (f *FilesystemLog) GetLogEntry(revision Revision) *LogRecord {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.getLogEntry(revision)
+}
+
+func (f *FilesystemLog) getLogEntry(revision Revision) *LogRecord {
+	filename := revisionToFilename(revision)
+	filepath := filepath.Join(f.dir, filename)
+	data, err := os.ReadFile(filepath)
+	if err != nil {
+		return nil
+	}
+
+	var record LogRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil
+	}
+	return &record
+}
+
 // Read reads records from the log starting from the given revision
-func (f *FilesystemLog) Read(ctx context.Context, fromRevision int64, limit int) ([]*LogRecord, error) {
+func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, limit int) ([]*LogRecord, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -187,14 +220,14 @@ func (f *FilesystemLog) Close() error {
 }
 
 // revisionToFilename converts a revision number to a filename
-func revisionToFilename(revision int64) string {
+func revisionToFilename(revision Revision) string {
 	revisionBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(revisionBytes, uint64(revision))
 	return hex.EncodeToString(revisionBytes) + ".log"
 }
 
 // filenameToRevision converts a filename to a revision number
-func filenameToRevision(filename string) (int64, error) {
+func filenameToRevision(filename string) (Revision, error) {
 	if !strings.HasSuffix(filename, ".log") {
 		return 0, fmt.Errorf("invalid filename format: %s", filename)
 	}
@@ -209,6 +242,6 @@ func filenameToRevision(filename string) (int64, error) {
 		return 0, fmt.Errorf("invalid revision bytes length: %d", len(revisionBytes))
 	}
 
-	revision := int64(binary.BigEndian.Uint64(revisionBytes))
+	revision := Revision(binary.BigEndian.Uint64(revisionBytes))
 	return revision, nil
 }

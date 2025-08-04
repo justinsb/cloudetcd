@@ -84,14 +84,14 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Test list functionality after replay
-	keys, err := newStorage.List(ctx, []byte(""), []byte(""), 0)
+	keys, err := newStorage.List(ctx, []byte("aaa"), []byte("zzz"), 0)
 	if err != nil {
 		t.Fatalf("Failed to list keys after replay: %v", err)
 	}
 
 	// Should only have key1 (key2 is deleted)
 	if len(keys) != 1 {
-		t.Errorf("Expected 1 key after replay, got %d", len(keys))
+		t.Errorf("Expected 1 key after replay, got %d: %+v", len(keys), keys)
 	}
 	if string(keys[0].Key) != "key1" {
 		t.Errorf("Expected key1 to be the only key, got %s", string(keys[0].Key))
@@ -112,7 +112,7 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	}
 
 	// List should return empty
-	keys, err := storage.List(context.Background(), []byte(""), []byte(""), 0)
+	keys, err := storage.List(context.Background(), []byte("aaa"), []byte("zzz"), 0)
 	if err != nil {
 		t.Fatalf("Failed to list keys: %v", err)
 	}

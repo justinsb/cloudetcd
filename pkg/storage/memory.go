@@ -1,14 +1,16 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"justinsb.com/cloudetcd/pkg/bptree"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"k8s.io/klog/v2"
 )
 
 // memoryWatcher implements the Watcher interface
@@ -39,9 +41,9 @@ func (w *memoryWatcher) isClosed() bool {
 
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
-	mu        sync.RWMutex
-	revisions map[string][]*KeyValue // All revisions of each key, sorted by revision
-	revision  Revision
+	mu sync.RWMutex
+
+	revisions bptree.BPTree
 	watchers  map[int64]*memoryWatcher
 	watcherID int64
 	watcherMu sync.RWMutex
@@ -52,8 +54,6 @@ type MemoryStorage struct {
 // It returns an error if it cannot replay the log to restore the storage state.
 func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	ms := &MemoryStorage{
-		revisions: make(map[string][]*KeyValue),
-		revision:  0,
 		watchers:  make(map[int64]*memoryWatcher),
 		watcherID: 0,
 		log:       log,
@@ -89,77 +89,32 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	// Replay each record in order
 	for _, record := range records {
 		switch record.Operation {
-		case "PUT":
+		case mvccpb.PUT:
 			// Replay PUT operation
-			keyStr := string(record.Key)
-			revisions, exists := m.revisions[keyStr]
-			var existing *KeyValue
-			if exists && len(revisions) > 0 {
-				existing = revisions[len(revisions)-1]
-			}
+			m.revisions.AddRevision(record.Key, record.Revision)
 
-			kv := &KeyValue{
-				Key:     record.Key,
-				Value:   record.Value,
-				Deleted: false,
-			}
-
-			if existing != nil && !existing.Deleted {
-				// Key exists, keep the original create revision
-				kv.CreateRevision = existing.CreateRevision
-			} else {
-				// New key
-				kv.CreateRevision = Revision(record.Revision)
-			}
-
-			m.revisions[keyStr] = append(m.revisions[keyStr], kv)
-
-		case "DELETE":
+		case mvccpb.DELETE:
 			// Replay DELETE operation
-			keyStr := string(record.Key)
-			revisions, exists := m.revisions[keyStr]
-			var existing *KeyValue
-			if exists && len(revisions) > 0 {
-				existing = revisions[len(revisions)-1]
-			}
-
-			if existing == nil || existing.Deleted {
-				// Key doesn't exist, nothing to delete
-				continue
-			}
-
-			// Create a tombstone entry
-			tombstone := &KeyValue{
-				Key:            record.Key,
-				Value:          nil,
-				CreateRevision: existing.CreateRevision,
-				Deleted:        true,
-			}
-
-			// Add to revisions
-			m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
+			m.revisions.AddRevision(record.Key, record.Revision)
 
 		default:
 			// Skip unknown operations
-			continue
+			klog.Fatalf("unknown operation: %s", record.Operation)
 		}
 	}
-
-	// Update the current revision to match the log
-	m.revision = Revision(currentRevision)
 
 	return nil
 }
 
 // convertToMVCCKeyValue converts a storage.KeyValue to mvccpb.KeyValue
-func convertToMVCCKeyValue(kv *KeyValue) *mvccpb.KeyValue {
+func logEntryToKeyValue(r *persistence.LogRecord) *mvccpb.KeyValue {
 	return &mvccpb.KeyValue{
-		Key:            kv.Key,
-		Value:          kv.Value,
-		CreateRevision: int64(kv.CreateRevision),
-		ModRevision:    int64(kv.CreateRevision), // For now, use CreateRevision as ModRevision
-		Version:        1,                        // For now, always version 1
-		Lease:          0,                        // For now, no lease
+		Key:            r.Key,
+		Value:          r.Value,
+		CreateRevision: int64(r.CreateRevision),
+		ModRevision:    int64(r.Revision),
+		Version:        r.Version,
+		Lease:          0, // For now, no lease
 	}
 }
 
@@ -220,50 +175,61 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Append to the persistence log first
-	revision, err := m.log.Append(ctx, "PUT", key, value, leaseID)
+	snapshotTimestamp := m.revisions.GetCurrentRevision()
+
+	existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+
+	var existing *KeyValue
+	if hasExisting {
+		logEntry := m.log.GetLogEntry(existingRevision)
+		if logEntry == nil {
+			klog.Fatalf("log entry not found for revision %d", existingRevision)
+		}
+		existing = logEntryToKeyValue(logEntry)
+	}
+
+	// Let's see if we can commit this transaction without conflicts
+	newLogRecord, err := m.log.Txn(ctx, func(ctx context.Context, txn persistence.Transaction) error {
+		if txn.Timestamp() != snapshotTimestamp {
+			// TODO: We can retry
+			return fmt.Errorf("timestamp mismatch: %d != %d", txn.Timestamp(), snapshotTimestamp)
+		}
+
+		return txn.Put(ctx, key, value, leaseID)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("failed to append to log: %w", err)
 	}
 
-	m.revision = Revision(revision)
-	keyStr := string(key)
+	kv := logEntryToKeyValue(newLogRecord)
 
-	// Check if key already exists by looking at revisions
-	revisions, exists := m.revisions[keyStr]
-	var existing *KeyValue
-	if exists && len(revisions) > 0 {
-		existing = revisions[len(revisions)-1]
-	}
+	// kv := &KeyValue{
+	// 	Key:   key,
+	// 	Value: value,
+	// }
 
-	kv := &KeyValue{
-		Key:     key,
-		Value:   value,
-		Deleted: false,
-	}
+	// if existing != nil {
+	// 	// Key exists, keep the original create revision
+	// 	kv.CreateRevision = existing.CreateRevision
+	// } else {
+	// 	// New key
+	// 	kv.CreateRevision = m.revision
+	// }
 
-	if existing != nil && !existing.Deleted {
-		// Key exists, keep the original create revision
-		kv.CreateRevision = existing.CreateRevision
-	} else {
-		// New key
-		kv.CreateRevision = m.revision
-	}
-
-	m.revisions[keyStr] = append(m.revisions[keyStr], kv)
+	m.revisions.AddRevision(kv.Key, newLogRecord.Revision)
 
 	// Create and broadcast watch event
 	event := &mvccpb.Event{
 		Type: mvccpb.PUT,
-		Kv:   convertToMVCCKeyValue(kv),
+		Kv:   kv,
 	}
-	if existing != nil && !existing.Deleted {
-		event.PrevKv = convertToMVCCKeyValue(existing)
+	if existing != nil {
+		event.PrevKv = existing
 	}
 
-	m.broadcastEvent(event, m.revision)
+	m.broadcastEvent(event, newLogRecord.Revision)
 
-	return m.revision, nil
+	return newLogRecord.Revision, nil
 }
 
 // Get retrieves a key-value pair from the storage.
@@ -272,35 +238,32 @@ func (m *MemoryStorage) Get(ctx context.Context, key []byte, atRevision Revision
 	defer m.mu.RUnlock()
 
 	keyStr := string(key)
-	revisions, exists := m.revisions[keyStr]
+
+	snapshotTimestamp := Revision(atRevision)
+	if snapshotTimestamp == 0 {
+		// TODO: Get latest revision from log?
+		snapshotTimestamp = MAX_REVISION
+	}
+
+	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
 	if !exists {
 		return nil, fmt.Errorf("key not found: %s", keyStr)
 	}
 
-	// If no specific revision requested, return the latest version
-	if atRevision == 0 {
-		latest := revisions[len(revisions)-1]
-		if latest.Deleted {
-			return nil, fmt.Errorf("key not found: %s", keyStr)
-		}
-		return latest, nil
+	logEntry := m.log.GetLogEntry(latestRevision)
+	if logEntry == nil {
+		klog.Fatalf("log entry not found for revision %d", latestRevision)
 	}
 
-	// Find the revision at or before the requested revision
-	// We need to track the actual revision number for each operation
-	// For now, we'll use a simple approach where each operation gets the next revision number
-	// In a more sophisticated implementation, we'd store the revision number with each record
-	for i := len(revisions) - 1; i >= 0; i-- {
-		// For this simple implementation, we'll assume revisions are sequential
-		// starting from the first operation on this key
-		revisionNumber := Revision(i + 1)
-		if revisionNumber <= atRevision {
-			// Return the version at this revision (could be deleted)
-			return revisions[i], nil
-		}
+	switch logEntry.Operation {
+	case mvccpb.PUT:
+		kv := logEntryToKeyValue(logEntry)
+		return kv, nil
+	case mvccpb.DELETE:
+		return nil, fmt.Errorf("key not found: %s", keyStr)
+	default:
+		panic(fmt.Sprintf("unknown operation: %s", logEntry.Operation))
 	}
-
-	return nil, fmt.Errorf("key not found at revision %d", atRevision)
 }
 
 // Delete removes a key from the storage.
@@ -308,48 +271,48 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	snapshotTimestamp := MAX_REVISION
+
+	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+	if !exists {
+		return 0, fmt.Errorf("key not found: %s", key)
+	}
+
+	oldLogEntry := m.log.GetLogEntry(latestRevision)
+	if oldLogEntry == nil {
+		klog.Fatalf("log entry not found for revision %d", latestRevision)
+	}
+
 	// Append to the persistence log first
-	revision, err := m.log.Append(ctx, "DELETE", key, nil, 0)
+	newLogRecord, err := m.log.Append(ctx, mvccpb.DELETE, key, nil, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to append to log: %w", err)
 	}
 
-	m.revision = Revision(revision)
-	keyStr := string(key)
-
-	revisions, exists := m.revisions[keyStr]
-	var existing *KeyValue
-	if exists && len(revisions) > 0 {
-		existing = revisions[len(revisions)-1]
-	}
-
-	if existing == nil || existing.Deleted {
-		return m.revision, nil // Key doesn't exist, nothing to delete
-	}
-
-	// Create a tombstone entry
-	tombstone := &KeyValue{
-		Key:            key,
-		Value:          nil,
-		CreateRevision: existing.CreateRevision,
-		Deleted:        true,
-	}
-
-	// Add to revisions
-	m.revisions[keyStr] = append(m.revisions[keyStr], tombstone)
+	m.revisions.AddRevision(key, newLogRecord.Revision)
 
 	// Create and broadcast watch event
+
+	// A DELETE/EXPIRE event contains the deleted key with
+	// its modification revision set to the revision of deletion.
+
 	event := &mvccpb.Event{
 		Type: mvccpb.DELETE,
-		Kv:   convertToMVCCKeyValue(tombstone),
+		Kv: &mvccpb.KeyValue{
+			Key:            key,
+			Value:          oldLogEntry.Value,
+			CreateRevision: int64(oldLogEntry.CreateRevision),
+			ModRevision:    int64(newLogRecord.Revision),
+			Version:        0, // TODO: Is this right?
+		},
 	}
-	if existing != nil && !existing.Deleted {
-		event.PrevKv = convertToMVCCKeyValue(existing)
-	}
+	// Note: we do not set prev_kv; we only send the value if prev_kv is requested in the watch.
+	// (But to reuse the event, we just send it to all watchers.)
+	// TODO: Only send Value if prev_kv is requested in the watch.
 
-	m.broadcastEvent(event, m.revision)
+	m.broadcastEvent(event, newLogRecord.Revision)
 
-	return m.revision, nil
+	return newLogRecord.Revision, nil
 }
 
 // List returns a range of key-value pairs.
@@ -359,51 +322,45 @@ func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, a
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var result []*KeyValue
-	keyStr := string(key)
-	rangeEndStr := string(rangeEnd)
+	// TODO: Convert to callback?
 
-	for storageKey, revisions := range m.revisions {
-		// Check if key is in the specified range
-		var shouldInclude bool
-
-		if len(rangeEnd) == 0 {
-			// No range end specified - treat as prefix query
-			shouldInclude = len(key) == 0 || (len(storageKey) >= len(keyStr) && storageKey[:len(keyStr)] == keyStr)
-		} else {
-			// Range query: include keys where key >= startKey and key < endKey
-			shouldInclude = storageKey >= keyStr && storageKey < rangeEndStr
-		}
-
-		if shouldInclude {
-			// Get the appropriate revision
-			var kv *KeyValue
-			if atRevision == 0 {
-				// Get the latest version, but skip if it's deleted
-				latest := revisions[len(revisions)-1]
-				if !latest.Deleted {
-					kv = latest
-				}
-			} else {
-				// Find the revision at or before the requested revision
-				for i := len(revisions) - 1; i >= 0; i-- {
-					revisionNumber := Revision(i + 1)
-					if revisionNumber <= atRevision {
-						kv = revisions[i]
-						break
-					}
-				}
-			}
-			if kv != nil {
-				result = append(result, kv)
-			}
-		}
+	if atRevision == 0 {
+		// TODO: Or max revision?
+		atRevision = m.revisions.GetCurrentRevision()
 	}
 
-	// Sort by key for consistent ordering
-	sort.Slice(result, func(i, j int) bool {
-		return string(result[i].Key) < string(result[j].Key)
+	var result []*KeyValue
+	// keyStr := string(key)
+	// rangeEndStr := string(rangeEnd)
+
+	m.revisions.ListRevisionsByKeyRange(key, atRevision, func(key []byte, revisions []Revision) bool {
+		if len(rangeEnd) != 0 {
+			if bytes.Compare(key, rangeEnd) >= 0 {
+				return false
+			}
+		}
+
+		for _, revision := range revisions {
+			if revision > atRevision {
+				continue
+			}
+
+			kv := m.log.GetLogEntry(revision)
+			if kv == nil {
+				klog.Fatalf("log entry not found for revision %d", revision)
+			}
+			result = append(result, logEntryToKeyValue(kv))
+		}
+
+		return true
 	})
+
+	// TODO: Do we need to sort?
+
+	// // Sort by key for consistent ordering
+	// sort.Slice(result, func(i, j int) bool {
+	// 	return string(result[i].Key) < string(result[j].Key)
+	// })
 
 	return result, nil
 }
@@ -452,7 +409,8 @@ func (m *MemoryStorage) removeWatcher(id int64) {
 func (m *MemoryStorage) GetCurrentRevision() Revision {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.revision
+
+	return m.revisions.GetCurrentRevision()
 }
 
 // ForceReplayLog manually triggers a replay of the log
@@ -460,8 +418,7 @@ func (m *MemoryStorage) GetCurrentRevision() Revision {
 func (m *MemoryStorage) ForceReplayLog(ctx context.Context) error {
 	// Clear current state
 	m.mu.Lock()
-	m.revisions = make(map[string][]*KeyValue)
-	m.revision = 0
+	m.revisions = bptree.BPTree{}
 	m.mu.Unlock()
 
 	// Replay the log

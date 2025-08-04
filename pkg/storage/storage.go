@@ -4,18 +4,22 @@ import (
 	"context"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
 // Revision is the version of the key-value store.
-type Revision int64
+type Revision = persistence.Revision
 
-// KeyValue represents a single key-value pair from the store with MVCC support.
-type KeyValue struct {
-	Key            []byte
-	Value          []byte
-	CreateRevision Revision // The revision when this key was first created
-	Deleted        bool     // Whether this is a tombstone (deleted entry)
-}
+// TODO: Just use zero to mean latest revision?
+const MAX_REVISION = Revision(^uint64(0))
+
+// // KeyValue represents a single key-value pair from the store with MVCC support.
+// type KeyValue struct {
+// 	Key            []byte
+// 	Value          []byte
+// 	CreateRevision Revision // The revision when this key was first created
+// 	Deleted        bool     // Whether this is a tombstone (deleted entry)
+// }
 
 // WatchResponse represents a response from watching
 type WatchResponse struct {
@@ -52,3 +56,5 @@ type Storage interface {
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
 	Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error)
 }
+
+type KeyValue = mvccpb.KeyValue

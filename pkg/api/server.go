@@ -140,7 +140,7 @@ func (s *Server) handleSingleKey(ctx context.Context, req *etcdserverpb.RangeReq
 			}
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-		kvs = []*mvccpb.KeyValue{s.convertToMVCCKeyValue(kv)}
+		kvs = []*mvccpb.KeyValue{kv}
 		count = 1
 	}
 
@@ -171,7 +171,7 @@ func (s *Server) handleRangeWithEnd(ctx context.Context, req *etcdserverpb.Range
 	} else {
 		kvs = make([]*mvccpb.KeyValue, len(keys))
 		for i, kv := range keys {
-			kvs[i] = s.convertToMVCCKeyValue(kv)
+			kvs[i] = kv
 		}
 		count = int64(len(kvs))
 	}
@@ -194,7 +194,7 @@ func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdse
 	if req.PrevKv {
 		existing, err := s.storage.Get(ctx, req.Key, 0)
 		if err == nil {
-			prevKv = s.convertToMVCCKeyValue(existing)
+			prevKv = existing
 		}
 	}
 
@@ -224,16 +224,20 @@ func (s *Server) DeleteRange(ctx context.Context, req *etcdserverpb.DeleteRangeR
 		if req.PrevKv {
 			existing, err := s.storage.Get(ctx, req.Key, 0)
 			if err == nil {
-				prevKvs = []*mvccpb.KeyValue{s.convertToMVCCKeyValue(existing)}
+				prevKvs = []*mvccpb.KeyValue{existing}
 			}
 		}
 
 		// Check if key exists before deleting
-		existing, err := s.storage.Get(ctx, req.Key, 0)
-		if err == nil && !existing.Deleted {
-			deleted = 1
+		_, err := s.storage.Get(ctx, req.Key, 0)
+		if err != nil {
+			// TODO: Handle not found?
+			return nil, fmt.Errorf("failed to get key: %w", err)
 		}
 
+		deleted = 1
+
+		// TODO: Compare and swap or similar?
 		revision, err := s.storage.Delete(ctx, req.Key)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -255,9 +259,10 @@ func (s *Server) DeleteRange(ctx context.Context, req *etcdserverpb.DeleteRangeR
 	var maxRevision storage.Revision
 	for _, kv := range keys {
 		if req.PrevKv {
-			prevKvs = append(prevKvs, s.convertToMVCCKeyValue(kv))
+			prevKvs = append(prevKvs, kv)
 		}
 
+		// TODO: Compare and swap or similar?
 		revision, err := s.storage.Delete(ctx, kv.Key)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -491,7 +496,7 @@ func (ws *watchStream) watchEvents(watch *activeWatch) {
 				// This is a simplified implementation
 				prevKv, err := ws.server.storage.Get(ws.ctx, event.Kv.Key, storage.Revision(event.Kv.CreateRevision-1))
 				if err == nil && prevKv != nil {
-					event.PrevKv = ws.server.convertToMVCCKeyValue(prevKv)
+					event.PrevKv = prevKv
 				}
 			}
 
@@ -594,13 +599,13 @@ func (s *Server) createHeader(revision storage.Revision) *etcdserverpb.ResponseH
 	}
 }
 
-func (s *Server) convertToMVCCKeyValue(kv *storage.KeyValue) *mvccpb.KeyValue {
-	return &mvccpb.KeyValue{
-		Key:            kv.Key,
-		Value:          kv.Value,
-		CreateRevision: int64(kv.CreateRevision),
-		ModRevision:    int64(kv.CreateRevision), // For now, use CreateRevision as ModRevision
-		Version:        1,                        // For now, always version 1
-		Lease:          0,                        // For now, no lease
-	}
-}
+// func (s *Server) convertToMVCCKeyValue(kv *storage.KeyValue) *mvccpb.KeyValue {
+// 	return &mvccpb.KeyValue{
+// 		Key:            kv.Key,
+// 		Value:          kv.Value,
+// 		CreateRevision: int64(kv.CreateRevision),
+// 		ModRevision:    int64(kv.CreateRevision), // For now, use CreateRevision as ModRevision
+// 		Version:        1,                        // For now, always version 1
+// 		Lease:          0,                        // For now, no lease
+// 	}
+// }

@@ -40,7 +40,7 @@ import (
 // }
 
 func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
-	tree := New()
+	var tree BPTree
 	tree.AddRevision([]byte("key1"), 1)
 	tree.AddRevision([]byte("key3"), 2)
 	tree.AddRevision([]byte("key5"), 3)
@@ -49,8 +49,8 @@ func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
 
 	scenarios := []struct {
 		key          []byte
-		atRevision   int64
-		wantRevision int64
+		atRevision   Revision
+		wantRevision Revision
 		wantOk       bool
 	}{
 		{[]byte("key1"), 4, 4, true},
@@ -67,7 +67,7 @@ func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
 	}
 	for _, scenario := range scenarios {
 		t.Run(fmt.Sprintf("%s-revision-%d", string(scenario.key), scenario.atRevision), func(t *testing.T) {
-			rev, ok := tree.getLatestRevisionByKey(scenario.key, scenario.atRevision)
+			rev, ok := tree.GetLatestRevisionByKey(scenario.key, scenario.atRevision)
 			if ok != scenario.wantOk {
 				if scenario.wantOk {
 					t.Errorf("expected to find key %s", string(scenario.key))
@@ -83,7 +83,7 @@ func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
 }
 
 func TestBPTree_ListRevisionsByKeyRange(t *testing.T) {
-	tree := New()
+	var tree BPTree
 	tree.AddRevision([]byte("key1"), 1)
 	tree.AddRevision([]byte("key3"), 2)
 	tree.AddRevision([]byte("key5"), 3)
@@ -91,12 +91,12 @@ func TestBPTree_ListRevisionsByKeyRange(t *testing.T) {
 	tree.AddRevision([]byte("key3"), 5)
 
 	{
-		got := make(map[string][]int64)
-		tree.ListRevisionsByKeyRange([]byte("key"), 3, func(key []byte, revisions []int64) bool {
+		got := make(map[string][]Revision)
+		tree.ListRevisionsByKeyRange([]byte("key"), 3, func(key []byte, revisions []Revision) bool {
 			got[string(key)] = revisions
 			return true
 		})
-		want := map[string][]int64{
+		want := map[string][]Revision{
 			"key1": {1, 4},
 			"key3": {2, 5},
 			"key5": {3},
@@ -107,12 +107,12 @@ func TestBPTree_ListRevisionsByKeyRange(t *testing.T) {
 	}
 
 	{
-		got := make(map[string][]int64)
-		tree.ListRevisionsByKeyRange([]byte("key3"), 3, func(key []byte, revisions []int64) bool {
+		got := make(map[string][]Revision)
+		tree.ListRevisionsByKeyRange([]byte("key3"), 3, func(key []byte, revisions []Revision) bool {
 			got[string(key)] = revisions
 			return true
 		})
-		want := map[string][]int64{
+		want := map[string][]Revision{
 			"key3": {2, 5},
 			"key5": {3},
 		}
@@ -122,12 +122,12 @@ func TestBPTree_ListRevisionsByKeyRange(t *testing.T) {
 	}
 
 	{
-		got := make(map[string][]int64)
-		tree.ListRevisionsByKeyRange([]byte("key5b"), 3, func(key []byte, revisions []int64) bool {
+		got := make(map[string][]Revision)
+		tree.ListRevisionsByKeyRange([]byte("key5b"), 3, func(key []byte, revisions []Revision) bool {
 			got[string(key)] = revisions
 			return true
 		})
-		want := map[string][]int64{}
+		want := map[string][]Revision{}
 		if diff := cmp.Diff(got, want); diff != "" {
 			t.Errorf("results mismatch for key5b (-want +got):\n%s", diff)
 		}
