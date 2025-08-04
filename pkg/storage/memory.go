@@ -315,16 +315,25 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 	event := &mvccpb.Event{
 		Type: mvccpb.DELETE,
 		Kv: &mvccpb.KeyValue{
-			Key:            key,
-			Value:          oldLogEntry.Value,
-			CreateRevision: int64(oldLogEntry.CreateRevision),
-			ModRevision:    int64(newLogRecord.Revision),
-			Version:        0, // TODO: Is this right?
+			Key:         key,
+			ModRevision: int64(newLogRecord.Revision),
+			Version:     0, // version is set to 0 for DELETE events
 		},
 	}
+
 	// Note: we do not set prev_kv; we only send the value if prev_kv is requested in the watch.
 	// (But to reuse the event, we just send it to all watchers.)
 	// TODO: Only send Value if prev_kv is requested in the watch.
+	includePrevKv := true
+	if includePrevKv {
+		event.PrevKv = &mvccpb.KeyValue{
+			Key:            key,
+			CreateRevision: int64(oldLogEntry.CreateRevision),
+			ModRevision:    int64(oldLogEntry.Revision),
+			Value:          oldLogEntry.Value,
+			Version:        oldLogEntry.Version,
+		}
+	}
 
 	m.broadcastEvent(event, newLogRecord.Revision)
 

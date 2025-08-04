@@ -504,11 +504,11 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		if events[2].Type != mvccpb.DELETE {
 			t.Errorf("Expected DELETE event, got %d", events[2].Type)
 		}
-		if events[2].PrevKv != nil {
-			t.Error("Expected PrevKv not to be set for delete")
+		if events[2].PrevKv == nil {
+			t.Error("Expected PrevKv to be set for delete")
 		}
 		// The value should be the previous value
-		if string(events[2].Kv.Value) != "value2" {
+		if string(events[2].PrevKv.Value) != "value2" {
 			t.Errorf("Expected kv value 'value2', got '%s'", string(events[2].PrevKv.Value))
 		}
 	})

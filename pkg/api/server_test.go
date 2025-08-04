@@ -208,7 +208,7 @@ func TestWatchFunctionality(t *testing.T) {
 		expectedEvents := []string{
 			"PUT:watch-test:value1",
 			"PUT:watch-test:value2",
-			"DELETE:watch-test:value2",
+			"DELETE:watch-test:",
 		}
 
 		if len(events) != len(expectedEvents) {
@@ -283,7 +283,7 @@ func TestWatchFunctionality(t *testing.T) {
 		expectedEvents := []string{
 			"PUT:prefix/key1:value1",
 			"PUT:prefix/key2:value2",
-			"DELETE:prefix/key1:value1",
+			"DELETE:prefix/key1:",
 		}
 
 		if len(events) != len(expectedEvents) {
