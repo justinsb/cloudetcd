@@ -13,8 +13,8 @@ func TestMemoryLog_Append(t *testing.T) {
 	ctx := context.Background()
 
 	// Test first append
-	logRecord1, ok, err := log.Append(ctx, 0, &LogRecord{
-		Revision:  1,
+	logRecord1, ok, err := log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
 		Operation: mvccpb.PUT,
 		Key:       []byte("key1"),
 		Value:     []byte("value1"),
@@ -22,21 +22,21 @@ func TestMemoryLog_Append(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if logRecord1.Revision != 1 {
-		t.Errorf("Expected revision 1, got %d", logRecord1.Revision)
+	if logRecord1.Revision != 2 {
+		t.Errorf("Expected revision 2, got %d", logRecord1.Revision)
 	}
 
 	// Test second append
-	logRecord2, ok, err := log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
+	logRecord2, ok, err := log.Append(ctx, 2, &LogRecord{
+		Revision:  3,
 		Operation: mvccpb.DELETE,
 		Key:       []byte("key1"),
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if logRecord2.Revision != 2 {
-		t.Errorf("Expected revision 2, got %d", logRecord2.Revision)
+	if logRecord2.Revision != 3 {
+		t.Errorf("Expected revision 3, got %d", logRecord2.Revision)
 	}
 
 	// Test current revision
@@ -44,8 +44,8 @@ func TestMemoryLog_Append(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)
 	}
-	if currentRev != 2 {
-		t.Errorf("Expected current revision 2, got %d", currentRev)
+	if currentRev != 3 {
+		t.Errorf("Expected current revision 3, got %d", currentRev)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestMemoryLog_Read(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some records
-	_, ok, err := log.Append(ctx, 0, &LogRecord{
-		Revision:  1,
+	_, ok, err := log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
 		Operation: mvccpb.PUT,
 		Key:       []byte("key1"),
 		Value:     []byte("value1"),
@@ -63,8 +63,8 @@ func TestMemoryLog_Read(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	_, ok, err = log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
+	_, ok, err = log.Append(ctx, 2, &LogRecord{
+		Revision:  3,
 		Operation: mvccpb.PUT,
 		Key:       []byte("key2"),
 		Value:     []byte("value2"),
@@ -72,8 +72,8 @@ func TestMemoryLog_Read(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	_, ok, err = log.Append(ctx, 2, &LogRecord{
-		Revision:  3,
+	_, ok, err = log.Append(ctx, 3, &LogRecord{
+		Revision:  4,
 		Operation: mvccpb.DELETE,
 		Key:       []byte("key1"),
 	})
@@ -89,8 +89,8 @@ func TestMemoryLog_Read(t *testing.T) {
 	}
 
 	// Check first record
-	if records[0].Revision != 1 {
-		t.Errorf("Expected revision 1, got %d", records[0].Revision)
+	if records[0].Revision != 2 {
+		t.Errorf("Expected revision 2, got %d", records[0].Revision)
 	}
 	if records[0].Operation != mvccpb.PUT {
 		t.Errorf("Expected operation PUT, got %s", records[0].Operation)
@@ -100,16 +100,16 @@ func TestMemoryLog_Read(t *testing.T) {
 	}
 
 	// Check second record
-	if records[1].Revision != 2 {
-		t.Errorf("Expected revision 2, got %d", records[1].Revision)
+	if records[1].Revision != 3 {
+		t.Errorf("Expected revision 3, got %d", records[1].Revision)
 	}
 	if records[1].Operation != mvccpb.PUT {
 		t.Errorf("Expected operation PUT, got %s", records[1].Operation)
 	}
 
 	// Check third record
-	if records[2].Revision != 3 {
-		t.Errorf("Expected revision 3, got %d", records[2].Revision)
+	if records[2].Revision != 4 {
+		t.Errorf("Expected revision 4, got %d", records[2].Revision)
 	}
 	if records[2].Operation != mvccpb.DELETE {
 		t.Errorf("Expected operation DELETE, got %s", records[2].Operation)
@@ -121,8 +121,8 @@ func TestMemoryLog_ReadWithLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some records
-	_, ok, err := log.Append(ctx, 0, &LogRecord{
-		Revision:  1,
+	_, ok, err := log.Append(ctx, 1, &LogRecord{
+		Revision:  2,
 		Operation: mvccpb.PUT,
 		Key:       []byte("key1"),
 		Value:     []byte("value1"),
@@ -130,8 +130,8 @@ func TestMemoryLog_ReadWithLimit(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	_, ok, err = log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
+	_, ok, err = log.Append(ctx, 2, &LogRecord{
+		Revision:  3,
 		Operation: mvccpb.PUT,
 		Key:       []byte("key2"),
 		Value:     []byte("value2"),
@@ -139,8 +139,8 @@ func TestMemoryLog_ReadWithLimit(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	_, ok, err = log.Append(ctx, 2, &LogRecord{
-		Revision:  3,
+	_, ok, err = log.Append(ctx, 3, &LogRecord{
+		Revision:  4,
 		Operation: mvccpb.DELETE,
 		Key:       []byte("key1"),
 	})
@@ -218,7 +218,7 @@ func TestMemoryLog_ConcurrentAppend(t *testing.T) {
 	}
 
 	// Check final revision
-	expectedRevision := Revision(numGoroutines * appendsPerGoroutine)
+	expectedRevision := Revision(1 + numGoroutines*appendsPerGoroutine)
 	currentRev, err := log.GetCurrentRevision(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)

@@ -30,8 +30,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 		t.Fatalf("Failed to put key1: %v", err)
 	}
 	rev1 := getRevision(t, resp1)
-	if rev1 != 1 {
-		t.Errorf("Expected revision 1, got %d", rev1)
+	if rev1 != 2 {
+		t.Errorf("Expected revision 2, got %d", rev1)
 	}
 	t.Logf("   Put key1=value1 at revision %d", rev1)
 
@@ -40,8 +40,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 		t.Fatalf("Failed to put key2: %v", err)
 	}
 	rev2 := getRevision(t, resp2)
-	if rev2 != 2 {
-		t.Errorf("Expected revision 2, got %d", rev2)
+	if rev2 != 3 {
+		t.Errorf("Expected revision 3, got %d", rev2)
 	}
 	t.Logf("   Put key2=value2 at revision %d", rev2)
 
@@ -50,8 +50,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 		t.Fatalf("Failed to update key1: %v", err)
 	}
 	rev3 := getRevision(t, resp3)
-	if rev3 != 3 {
-		t.Errorf("Expected revision 3, got %d", rev3)
+	if rev3 != 4 {
+		t.Errorf("Expected revision 4, got %d", rev3)
 	}
 	t.Logf("   Updated key1=updated-value1 at revision %d", rev3)
 
@@ -62,8 +62,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 		t.Fatalf("Failed to delete key2: %v", err)
 	}
 	rev4 := delResp.Header.Revision
-	if rev4 != 4 {
-		t.Errorf("Expected revision 4, got %d", rev4)
+	if rev4 != 5 {
+		t.Errorf("Expected revision 5, got %d", rev4)
 	}
 	t.Logf("   Deleted key2 at revision %d", rev4)
 
@@ -94,10 +94,10 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 		key       string
 		value     string
 	}{
-		{1, mvccpb.PUT, "key1", "value1"},
-		{2, mvccpb.PUT, "key2", "value2"},
-		{3, mvccpb.PUT, "key1", "updated-value1"},
-		{4, mvccpb.DELETE, "key2", ""},
+		{2, mvccpb.PUT, "key1", "value1"},
+		{3, mvccpb.PUT, "key2", "value2"},
+		{4, mvccpb.PUT, "key1", "updated-value1"},
+		{5, mvccpb.DELETE, "key2", ""},
 	}
 
 	for i, expected := range expectedRecords {
@@ -125,7 +125,7 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)
 	}
-	if currentRev != 4 {
+	if currentRev != 5 {
 		t.Errorf("Expected current revision 4, got %d", currentRev)
 	}
 	t.Logf("4. Current revision: %d", currentRev)
@@ -140,8 +140,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	if string(kv1.Value) != "updated-value1" {
 		t.Errorf("Expected key1=updated-value1, got %s", string(kv1.Value))
 	}
-	if kv1.CreateRevision != 1 {
-		t.Errorf("Expected key1 create revision 1, got %d", kv1.CreateRevision)
+	if kv1.CreateRevision != 2 {
+		t.Errorf("Expected key1 create revision 2, got %d", kv1.CreateRevision)
 	}
 	t.Logf("   key1 = %s (revision %d)", string(kv1.Value), kv1.CreateRevision)
 

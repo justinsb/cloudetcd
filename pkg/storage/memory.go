@@ -81,7 +81,7 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	}
 
 	// If no log entries exist, we're done
-	if currentRevision == 0 {
+	if currentRevision <= 1 {
 		return nil
 	}
 

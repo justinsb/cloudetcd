@@ -9,9 +9,9 @@ import (
 
 // MemoryLog is a memory-backed implementation of the Log interface
 type MemoryLog struct {
-	mu       sync.RWMutex
-	records  []*LogRecord
-	revision uint64 // Atomic counter for revision numbers
+	mu           sync.RWMutex
+	records      []*LogRecord
+	lastRevision uint64 // Atomic counter for revision numbers
 }
 
 var _ Log = &MemoryLog{}
@@ -19,8 +19,8 @@ var _ Log = &MemoryLog{}
 // NewMemoryLog creates a new memory-backed log
 func NewMemoryLog() *MemoryLog {
 	return &MemoryLog{
-		records:  make([]*LogRecord, 0),
-		revision: 0,
+		records:      make([]*LogRecord, 0),
+		lastRevision: 1,
 	}
 }
 
@@ -29,16 +29,16 @@ func (m *MemoryLog) Append(ctx context.Context, conditionPosition Revision, logR
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if conditionPosition != Revision(m.revision) {
+	if conditionPosition != Revision(m.lastRevision) {
 		return nil, false, nil
 	}
 
-	if logRecord.Revision != Revision(m.revision+1) {
+	if logRecord.Revision != Revision(m.lastRevision+1) {
 		return nil, false, fmt.Errorf("log record revision does not match current revision")
 	}
 
 	// Increment revision number
-	m.revision++
+	m.lastRevision++
 
 	m.records = append(m.records, logRecord)
 
@@ -47,7 +47,7 @@ func (m *MemoryLog) Append(ctx context.Context, conditionPosition Revision, logR
 
 // GetCurrentRevision returns the current revision number
 func (m *MemoryLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
-	return Revision(atomic.LoadUint64(&m.revision)), nil
+	return Revision(atomic.LoadUint64(&m.lastRevision)), nil
 }
 
 // Read reads records from the log starting from the given revision

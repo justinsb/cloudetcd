@@ -39,8 +39,8 @@ func TestMemoryStorage_Put(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if getRevision(t, resp) != 1 {
-		t.Errorf("Expected revision 1, got %d", getRevision(t, resp))
+	if getRevision(t, resp) != 2 {
+		t.Errorf("Expected revision 2, got %d", getRevision(t, resp))
 	}
 
 	// Test update
@@ -50,8 +50,8 @@ func TestMemoryStorage_Put(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
-	if getRevision(t, resp) != 2 {
-		t.Errorf("Expected revision 2, got %d", getRevision(t, resp))
+	if getRevision(t, resp) != 3 {
+		t.Errorf("Expected revision 3, got %d", getRevision(t, resp))
 	}
 }
 
@@ -79,7 +79,7 @@ func TestMemoryStorage_Get(t *testing.T) {
 	if !reflect.DeepEqual(kv.Value, value) {
 		t.Errorf("Expected value %v, got %v", value, kv.Value)
 	}
-	if kv.CreateRevision != 1 {
+	if kv.CreateRevision != 2 {
 		t.Errorf("Expected CreateRevision 1, got %d", kv.CreateRevision)
 	}
 
@@ -126,8 +126,8 @@ func TestMemoryStorage_Delete(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 	revision := delResp.Header.Revision
-	if revision != 2 {
-		t.Errorf("Expected revision 2, got %d", revision)
+	if revision != 3 {
+		t.Errorf("Expected revision 3, got %d", revision)
 	}
 
 	// Verify it's gone (should return error for deleted key)
@@ -140,8 +140,8 @@ func TestMemoryStorage_Delete(t *testing.T) {
 		t.Fatalf("unexpected error for deletion of non-existent key: %v", err)
 	}
 	// Revision should not advance because we didn't do anything
-	if delResp.Header.Revision != 2 {
-		t.Errorf("Expected revision 2, got %d", revision)
+	if delResp.Header.Revision != 3 {
+		t.Errorf("Expected revision 3, got %d", revision)
 	}
 }
 

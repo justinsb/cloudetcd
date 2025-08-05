@@ -117,8 +117,8 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get current revision: %v", err)
 	}
-	if logRevision != 0 {
-		t.Errorf("Expected revision 0 for empty log, got %d", logRevision)
+	if logRevision != 1 {
+		t.Errorf("Expected revision 1 for empty log, got %d", logRevision)
 	}
 
 	// List should return empty
