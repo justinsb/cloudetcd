@@ -53,6 +53,8 @@ type MemoryStorage struct {
 	nextWatcherID int64
 }
 
+var _ Storage = &MemoryStorage{}
+
 // NewMemoryStorage creates a new in-memory storage instance with the given log.
 // It returns an error if it cannot replay the log to restore the storage state.
 func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
@@ -245,21 +247,41 @@ func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (
 }
 
 // Get retrieves a key-value pair from the storage.
-func (m *MemoryStorage) Get(ctx context.Context, key []byte, atRevision Revision) (*KeyValue, error) {
+func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keyStr := string(key)
-
-	snapshotTimestamp := Revision(atRevision)
-	if snapshotTimestamp == 0 {
-		// TODO: Get latest revision from log?
-		snapshotTimestamp = MAX_REVISION
+	if req.Key == nil {
+		return nil, fmt.Errorf("key is required by Get")
 	}
 
-	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+	if req.RangeEnd != nil {
+		return nil, fmt.Errorf("range end is not supported by Get")
+	}
+
+	snapshotTimestamp := Revision(0)
+	if req.Revision > 0 {
+		snapshotTimestamp = Revision(req.Revision)
+	} else {
+		currentRevision, err := m.log.GetCurrentRevision(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current revision: %w", err)
+		}
+		snapshotTimestamp = currentRevision
+	}
+
+	if req.CountOnly {
+		return nil, fmt.Errorf("count only is not supported by Get")
+	}
+
+	resp := &etcdserverpb.RangeResponse{
+		Header: createHeader(snapshotTimestamp),
+		Count:  0,
+	}
+
+	latestRevision, exists := m.revisions.GetLatestRevisionByKey(req.Key, snapshotTimestamp)
 	if !exists {
-		return nil, fmt.Errorf("key not found: %s", keyStr)
+		return resp, nil
 	}
 
 	logEntry := m.log.GetLogEntry(latestRevision)
@@ -270,27 +292,112 @@ func (m *MemoryStorage) Get(ctx context.Context, key []byte, atRevision Revision
 	switch logEntry.Operation {
 	case mvccpb.PUT:
 		kv := logEntryToKeyValue(logEntry)
-		return kv, nil
+		resp.Kvs = []*mvccpb.KeyValue{kv}
+		resp.Count = 1
+		return resp, nil
+
 	case mvccpb.DELETE:
-		return nil, fmt.Errorf("key not found: %s", keyStr)
+		return resp, nil
+
 	default:
 		panic(fmt.Sprintf("unknown operation: %s", logEntry.Operation))
 	}
 }
 
 // Delete removes a key from the storage.
-func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error) {
+func (m *MemoryStorage) Delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if req.RangeEnd != nil {
+		return nil, fmt.Errorf("range end is not yet supported by Delete")
+	}
+
+	// if req.Key == nil {
+	// 	return nil, status.Error(codes.InvalidArgument, "key is required")
+	// }
+
+	// var deleted int64
+	// var prevKvs []*mvccpb.KeyValue
+
+	// if len(req.RangeEnd) == 0 {
+	// 	// Single key deletion
+	// 	if req.PrevKv {
+	// 		existingResp, err := s.storage.Get(ctx, &etcdserverpb.RangeRequest{Key: req.Key})
+	// 		if err != nil {
+	// 			return nil, status.Error(codes.Internal, err.Error())
+	// 		}
+	// 		if len(existingResp.Kvs) > 0 {
+	// 			prevKvs = []*mvccpb.KeyValue{existingResp.Kvs[0]}
+	// 		}
+	// 	}
+
+	// 	// Check if key exists before deleting
+	// 	_, err := s.storage.Get(ctx, &etcdserverpb.RangeRequest{Key: req.Key})
+	// 	if err != nil {
+	// 		// TODO: Handle not found?
+	// 		return nil, fmt.Errorf("failed to get key: %w", err)
+	// 	}
+
+	// 	deleted = 1
+
+	// 	// TODO: Compare and swap or similar?
+	// 	deleteResponse, err := s.storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: req.Key})
+	// 	if err != nil {
+	// 		return nil, status.Error(codes.Internal, err.Error())
+	// 	}
+
+	// 	return &etcdserverpb.DeleteRangeResponse{
+	// 		Header:  s.createHeader(storage.Revision(deleteResponse.Header.Revision)),
+	// 		Deleted: deleted,
+	// 		PrevKvs: prevKvs,
+	// 	}, nil
+	// }
+
+	// // Range deletion - use the storage layer's efficient range query
+	// keysResp, err := s.storage.List(ctx, &etcdserverpb.RangeRequest{Key: req.Key, RangeEnd: req.RangeEnd})
+	// if err != nil {
+	// 	return nil, status.Error(codes.Internal, err.Error())
+	// }
+	// keys := keysResp.Kvs
+	// var maxRevision storage.Revision
+	// for _, kv := range keys {
+	// 	if req.PrevKv {
+	// 		prevKvs = append(prevKvs, kv)
+	// 	}
+
+	// 	// TODO: Compare and swap or similar?
+	// 	deleteResponse, err := s.storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: kv.Key})
+	// 	if err != nil {
+	// 		return nil, status.Error(codes.Internal, err.Error())
+	// 	}
+	// 	if storage.Revision(deleteResponse.Header.Revision) > maxRevision {
+	// 		maxRevision = storage.Revision(deleteResponse.Header.Revision)
+	// 	}
+	// 	deleted++
+	// }
+
+	// return &etcdserverpb.DeleteRangeResponse{
+	// 	Header:  s.createHeader(maxRevision),
+	// 	Deleted: deleted,
+	// 	PrevKvs: prevKvs,
+	// }, nil
+
+	key := req.Key
+
 	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get current revision: %w", err)
+		return nil, fmt.Errorf("failed to get current revision: %w", err)
 	}
 
 	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
 	if !exists {
-		return 0, fmt.Errorf("key not found: %s", key)
+		resp := &etcdserverpb.DeleteRangeResponse{
+			Header:  createHeader(snapshotTimestamp),
+			Deleted: 0,
+		}
+
+		return resp, nil
 	}
 
 	oldLogEntry := m.log.GetLogEntry(latestRevision)
@@ -306,10 +413,15 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 		Value:     nil,
 	})
 	if err != nil || !ok {
-		return 0, fmt.Errorf("failed to append to log: %w", err)
+		return nil, fmt.Errorf("failed to append to log: %w", err)
 	}
 
 	m.revisions.AddRevision(key, newLogRecord.Revision)
+
+	resp := &etcdserverpb.DeleteRangeResponse{
+		Header:  createHeader(newLogRecord.Revision),
+		Deleted: 1,
+	}
 
 	// Create and broadcast watch event
 
@@ -341,36 +453,41 @@ func (m *MemoryStorage) Delete(ctx context.Context, key []byte) (Revision, error
 
 	m.broadcastEvent(event, newLogRecord.Revision)
 
-	return newLogRecord.Revision, nil
+	return resp, nil
 }
 
 // List returns a range of key-value pairs.
 // If rangeEnd is empty, it returns all keys with the given prefix.
 // If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
-func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, atRevision Revision) ([]*KeyValue, error) {
+func (m *MemoryStorage) List(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// TODO: Convert to callback?
+	if req.RangeEnd == nil {
+		return nil, fmt.Errorf("range end is required by List")
+	}
 
-	if atRevision == 0 {
-		// TODO: Or max revision?
-		logRevision, err := m.log.GetCurrentRevision(ctx)
+	snapshotTimestamp := Revision(0)
+	if req.Revision > 0 {
+		snapshotTimestamp = Revision(req.Revision)
+	} else {
+		currentRevision, err := m.log.GetCurrentRevision(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get current revision: %w", err)
 		}
-		atRevision = logRevision
+		snapshotTimestamp = currentRevision
 	}
 
-	var result []*KeyValue
-	// keyStr := string(key)
-	// rangeEndStr := string(rangeEnd)
+	resp := &etcdserverpb.RangeResponse{
+		Header: createHeader(snapshotTimestamp),
+	}
 
-	m.revisions.ListRevisionsByKeyRange(key, atRevision, func(key []byte, revisions []Revision) bool {
-		if len(rangeEnd) != 0 {
-			if bytes.Compare(key, rangeEnd) >= 0 {
-				return false
-			}
+	hasRangeEnd := req.RangeEnd != nil && !bytes.Equal(req.RangeEnd, []byte{0})
+
+	m.revisions.ListRevisionsByKeyRange(req.Key, snapshotTimestamp, func(key []byte, revisions []Revision) bool {
+		if hasRangeEnd && bytes.Compare(key, req.RangeEnd) >= 0 {
+			// Stop iterating
+			return false
 		}
 
 		latest := Revision(0)
@@ -378,7 +495,7 @@ func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, a
 
 		// Find the latest revision that is less than or equal to atRevision
 		for _, revision := range revisions {
-			if revision <= atRevision {
+			if revision <= snapshotTimestamp {
 				latest = revision
 				found = true
 			}
@@ -390,21 +507,23 @@ func (m *MemoryStorage) List(ctx context.Context, key []byte, rangeEnd []byte, a
 				klog.Fatalf("log entry not found for revision %d", latest)
 			}
 			if logEntry.Operation == mvccpb.PUT {
-				result = append(result, logEntryToKeyValue(logEntry))
+				resp.Count++
+				// TODO: Can we store whether this is a delete, so we don't need a log lookup?
+				if !req.CountOnly {
+					resp.Kvs = append(resp.Kvs, logEntryToKeyValue(logEntry))
+				}
+			}
+			if req.Limit > 0 && resp.Count >= req.Limit {
+				resp.More = true
+				// Stop iterating
+				return false
 			}
 		}
 
 		return true
 	})
 
-	// TODO: Do we need to sort?
-
-	// // Sort by key for consistent ordering
-	// sort.Slice(result, func(i, j int) bool {
-	// 	return string(result[i].Key) < string(result[j].Key)
-	// })
-
-	return result, nil
+	return resp, nil
 }
 
 // Watch creates a watcher for the given key/range starting from the specified revision

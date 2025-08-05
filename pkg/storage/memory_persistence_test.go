@@ -57,10 +57,11 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 
 	// Delete a key
 	t.Log("2. Deleting a key...")
-	rev4, err := store.Delete(ctx, []byte("key2"))
+	delResp, err := store.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("key2")})
 	if err != nil {
 		t.Fatalf("Failed to delete key2: %v", err)
 	}
+	rev4 := delResp.Header.Revision
 	if rev4 != 4 {
 		t.Errorf("Expected revision 4, got %d", rev4)
 	}
@@ -131,10 +132,11 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 
 	// Retrieve values from storage
 	t.Log("5. Retrieving values from storage...")
-	kv1, err := store.Get(ctx, []byte("key1"), 0)
+	kvResp1, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key1")})
 	if err != nil {
 		t.Fatalf("Failed to get key1: %v", err)
 	}
+	kv1 := kvResp1.Kvs[0]
 	if string(kv1.Value) != "updated-value1" {
 		t.Errorf("Expected key1=updated-value1, got %s", string(kv1.Value))
 	}
@@ -144,12 +146,8 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	t.Logf("   key1 = %s (revision %d)", string(kv1.Value), kv1.CreateRevision)
 
 	// Try to get deleted key
-	_, err = store.Get(ctx, []byte("key2"), 0)
-	if err == nil {
-		t.Error("Expected key2 to be not found, but got a value")
-	} else {
-		t.Logf("   key2 = not found (as expected, it was deleted)")
-	}
+	kvResp2, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key2")})
+	assertNotFound(t, kvResp2, err)
 
 	t.Log("=== Integration test completed successfully! ===")
 }

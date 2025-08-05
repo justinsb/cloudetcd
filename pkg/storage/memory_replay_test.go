@@ -38,25 +38,25 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Delete key2
-	rev4, err := storage.Delete(ctx, []byte("key2"))
+	delResp, err := storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("key2")})
 	if err != nil {
 		t.Fatalf("Failed to delete key2: %v", err)
 	}
+	rev4 := delResp.Header.Revision
 
 	// Verify current state
-	kv1, err := storage.Get(ctx, []byte("key1"), 0)
+	kv1Resp, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key1")})
 	if err != nil {
 		t.Fatalf("Failed to get key1: %v", err)
 	}
+	kv1 := kv1Resp.Kvs[0]
 	if string(kv1.Value) != "value1-updated" {
 		t.Errorf("Expected key1 value to be 'value1-updated', got '%s'", string(kv1.Value))
 	}
 
 	// key2 should be deleted
-	_, err = storage.Get(ctx, []byte("key2"), 0)
-	if err == nil {
-		t.Error("Expected key2 to be deleted")
-	}
+	kvResp2, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key2")})
+	assertNotFound(t, kvResp2, err)
 
 	// Now create a new storage instance with the same log to test replay
 	newStorage, err := NewMemoryStorage(log)
@@ -65,19 +65,18 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Verify that the state was replayed correctly
-	newKv1, err := newStorage.Get(ctx, []byte("key1"), 0)
+	newKv1Resp, err := newStorage.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key1")})
 	if err != nil {
 		t.Fatalf("Failed to get key1 after replay: %v", err)
 	}
+	newKv1 := newKv1Resp.Kvs[0]
 	if string(newKv1.Value) != "value1-updated" {
 		t.Errorf("After replay: expected key1 value to be 'value1-updated', got '%s'", string(newKv1.Value))
 	}
 
 	// key2 should still be deleted
-	_, err = newStorage.Get(ctx, []byte("key2"), 0)
-	if err == nil {
-		t.Error("After replay: expected key2 to be deleted")
-	}
+	kvResp2, err = newStorage.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("key2")})
+	assertNotFound(t, kvResp2, err)
 
 	// Verify revision numbers
 	logRevision, err := newStorage.log.GetCurrentRevision(ctx)
@@ -89,11 +88,11 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Test list functionality after replay
-	keys, err := newStorage.List(ctx, []byte("aaa"), []byte("zzz"), 0)
+	keysResp, err := newStorage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys after replay: %v", err)
 	}
-
+	keys := keysResp.Kvs
 	// Should only have key1 (key2 is deleted)
 	if len(keys) != 1 {
 		t.Errorf("Expected 1 key after replay, got %d: %+v", len(keys), keys)
@@ -123,10 +122,11 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	}
 
 	// List should return empty
-	keys, err := storage.List(context.Background(), []byte("aaa"), []byte("zzz"), 0)
+	keysResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys: %v", err)
 	}
+	keys := keysResp.Kvs
 	if len(keys) != 0 {
 		t.Errorf("Expected empty list for empty log, got %d keys", len(keys))
 	}
@@ -148,10 +148,11 @@ func TestMemoryStorageForceReplay(t *testing.T) {
 	storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key2"), Value: []byte("value2")})
 
 	// Verify initial state
-	keys, err := storage.List(ctx, []byte(""), []byte(""), 0)
+	keysResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys: %v", err)
 	}
+	keys := keysResp.Kvs
 	if len(keys) != 2 {
 		t.Errorf("Expected 2 keys initially, got %d", len(keys))
 	}
@@ -163,7 +164,7 @@ func TestMemoryStorageForceReplay(t *testing.T) {
 	}
 
 	// Verify state is restored
-	keys, err = storage.List(ctx, []byte(""), []byte(""), 0)
+	keysResp, err = storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys after force replay: %v", err)
 	}
@@ -216,19 +217,21 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 		t.Errorf("Expected revision 3, got %d", getRevision(t, resp3))
 	}
 
-	rev4, err := storage1.Delete(ctx, []byte("app/version"))
+	delResp, err := storage1.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("app/version")})
 	if err != nil {
 		t.Fatalf("Failed to delete app/version: %v", err)
 	}
+	rev4 := delResp.Header.Revision
 	if rev4 != 4 {
 		t.Errorf("Expected revision 4, got %d", rev4)
 	}
 
 	// Step 4: Verify current state
-	keys, err := storage1.List(ctx, nil, nil, 0)
+	keysResp, err := storage1.List(ctx, &etcdserverpb.RangeRequest{Key: []byte{0}, RangeEnd: []byte{0}})
 	if err != nil {
 		t.Fatalf("Failed to list keys: %v", err)
 	}
+	keys := keysResp.Kvs
 	if len(keys) != 1 {
 		t.Errorf("Expected 1 key, got %d", len(keys))
 	}
@@ -246,10 +249,11 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 6: Verify that the state was replayed correctly
-	keys, err = storage2.List(ctx, nil, nil, 0)
+	keysResp, err = storage2.List(ctx, &etcdserverpb.RangeRequest{Key: []byte{0}, RangeEnd: []byte{0}})
 	if err != nil {
 		t.Fatalf("Failed to list keys in storage2: %v", err)
 	}
+	keys = keysResp.Kvs
 	if len(keys) != 1 {
 		t.Errorf("After replay: expected 1 key, got %d", len(keys))
 	}
@@ -286,26 +290,26 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 9: Verify the new data is visible in storage2 but not storage1
-	keys, err = storage2.List(ctx, []byte(""), []byte(""), 0)
+	keysResp, err = storage2.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys in storage2: %v", err)
 	}
+	keys = keysResp.Kvs
 	if len(keys) != 2 {
 		t.Errorf("Expected 2 keys in storage2, got %d", len(keys))
 	}
 
 	// storage1 should still only have the original key
-	keys, err = storage1.List(ctx, []byte(""), []byte(""), 0)
+	keysResp, err = storage1.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
 	if err != nil {
 		t.Fatalf("Failed to list keys in storage1: %v", err)
 	}
+	keys = keysResp.Kvs
 	if len(keys) != 1 {
 		t.Errorf("Expected 1 key in storage1, got %d", len(keys))
 	}
 
 	// Test that deleted key is still deleted after replay
-	_, err = storage2.Get(ctx, []byte("app/version"), 0)
-	if err == nil {
-		t.Error("Expected app/version to be deleted after replay")
-	}
+	kvResp2, err := storage2.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("app/version")})
+	assertNotFound(t, kvResp2, err)
 }

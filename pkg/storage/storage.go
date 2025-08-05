@@ -42,15 +42,14 @@ type Storage interface {
 	Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error)
 
 	// Get retrieves a key-value pair from the storage.
-	Get(ctx context.Context, key []byte, atRevision Revision) (*KeyValue, error)
+	Get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error)
 
 	// Delete removes a key from the storage.
-	Delete(ctx context.Context, key []byte) (Revision, error)
+	Delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error)
 
 	// List returns a range of key-value pairs.
-	// If rangeEnd is empty, it returns all keys with the given prefix.
 	// If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
-	List(ctx context.Context, key []byte, rangeEnd []byte, atRevision Revision) ([]*KeyValue, error)
+	List(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error)
 
 	// Watch creates a watcher for the given key/range starting from the specified revision
 	// If rangeEnd is empty, it watches a single key.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,10 +68,11 @@ func TestMemoryStorage_Get(t *testing.T) {
 	storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value})
 
 	// Test get existing key
-	kv, err := storage.Get(ctx, key, 0)
+	kvResp, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
+	kv := kvResp.Kvs[0]
 	if !reflect.DeepEqual(kv.Key, key) {
 		t.Errorf("Expected key %v, got %v", key, kv.Key)
 	}
@@ -84,13 +84,11 @@ func TestMemoryStorage_Get(t *testing.T) {
 	}
 
 	// Test get non-existent key
-	_, err = storage.Get(ctx, []byte("non-existent"), 0)
-	if err == nil {
-		t.Error("Expected error for non-existent key")
-	}
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("non-existent")})
+	assertNotFound(t, kvResp, err)
 
 	// Test get at specific revision
-	kv, err = storage.Get(ctx, key, 1)
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: 1})
 	if err != nil {
 		t.Fatalf("Get at revision failed: %v", err)
 	}
@@ -98,7 +96,7 @@ func TestMemoryStorage_Get(t *testing.T) {
 	// For now, just verify we get a valid result
 
 	// Test get at future revision (should fail)
-	_, err = storage.Get(ctx, key, 0)
+	_, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
 	if err != nil {
 		t.Errorf("Get at revision 0 should succeed, got error: %v", err)
 	}
@@ -117,33 +115,33 @@ func TestMemoryStorage_Delete(t *testing.T) {
 	storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value})
 
 	// Verify it exists
-	_, err := storage.Get(ctx, key, 0)
+	_, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
 	if err != nil {
 		t.Fatalf("Key should exist before delete: %v", err)
 	}
 
 	// Delete the key
-	revision, err := storage.Delete(ctx, key)
+	delResp, err := storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: key})
 	if err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
+	revision := delResp.Header.Revision
 	if revision != 2 {
 		t.Errorf("Expected revision 2, got %d", revision)
 	}
 
 	// Verify it's gone (should return error for deleted key)
-	_, err = storage.Get(ctx, key, 0)
-	if err == nil {
-		t.Error("Expected error for deleted key")
-	}
+	getResp, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
+	assertNotFound(t, getResp, err)
 
 	// Test delete non-existent key (should succeed)
-	revision, err = storage.Delete(ctx, []byte("non-existent"))
-	if !isNotFound(err) {
-		t.Fatalf("expected not found error for non-existent key, got %v", err)
+	delResp, err = storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("non-existent")})
+	if err != nil {
+		t.Fatalf("unexpected error for deletion of non-existent key: %v", err)
 	}
-	if revision != 0 {
-		t.Errorf("Expected revision 3, got %d", revision)
+	// Revision should not advance because we didn't do anything
+	if delResp.Header.Revision != 2 {
+		t.Errorf("Expected revision 2, got %d", revision)
 	}
 }
 
@@ -171,10 +169,11 @@ func TestMemoryStorage_List(t *testing.T) {
 
 	// Test list all keys
 	{
-		allKeys, err := storage.List(ctx, []byte{}, nil, 0)
+		allKeysResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte{0}, RangeEnd: []byte{0}})
 		if err != nil {
 			t.Fatalf("List all failed: %v", err)
 		}
+		allKeys := allKeysResp.Kvs
 		if len(allKeys) != 4 {
 			t.Errorf("Expected 4 keys, got %d", len(allKeys))
 		}
@@ -183,10 +182,11 @@ func TestMemoryStorage_List(t *testing.T) {
 	// Test list with prefix (using empty rangeEnd for prefix behavior)
 	{
 		prefix := []byte("prefix1/")
-		prefix1Keys, err := storage.List(ctx, prefix, rangeEndForPrefix(t, prefix), 0)
+		prefix1KeysResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: rangeEndForPrefix(t, prefix)})
 		if err != nil {
 			t.Fatalf("List with prefix failed: %v", err)
 		}
+		prefix1Keys := prefix1KeysResp.Kvs
 		if len(prefix1Keys) != 2 {
 			t.Errorf("Expected 2 keys with prefix1/, got %d", len(prefix1Keys))
 		}
@@ -203,10 +203,11 @@ func TestMemoryStorage_List(t *testing.T) {
 	// Test list with non-existent prefix
 	{
 		prefix := []byte("non-existent/")
-		emptyKeys, err := storage.List(ctx, prefix, rangeEndForPrefix(t, prefix), 0)
+		emptyKeysResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: prefix, RangeEnd: rangeEndForPrefix(t, prefix)})
 		if err != nil {
 			t.Fatalf("List with non-existent prefix failed: %v", err)
 		}
+		emptyKeys := emptyKeysResp.Kvs
 		if len(emptyKeys) != 0 {
 			t.Errorf("Expected 0 keys, got %d", len(emptyKeys))
 		}
@@ -251,19 +252,21 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 	}
 
 	// Get at revision1
-	kv, err := storage.Get(ctx, key, revision1)
+	kvResp, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: int64(revision1)})
 	if err != nil {
 		t.Fatalf("Get at revision1 failed: %v", err)
 	}
+	kv := kvResp.Kvs[0]
 	if !reflect.DeepEqual(kv.Value, value1) {
 		t.Errorf("Expected value1 at revision1, got %v", kv.Value)
 	}
 
 	// Get at revision2
-	kv, err = storage.Get(ctx, key, revision2)
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: int64(revision2)})
 	if err != nil {
 		t.Fatalf("Get at revision2 failed: %v", err)
 	}
+	kv = kvResp.Kvs[0]
 	if !reflect.DeepEqual(kv.Value, value2) {
 		t.Errorf("Expected value2 at revision2, got %v", kv.Value)
 	}
@@ -298,7 +301,7 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 	// Verify all keys exist
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("concurrent-key-%d", i))
-		_, err := storage.Get(ctx, key, 0)
+		_, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
 		if err != nil {
 			t.Errorf("Key %s not found after concurrent access", string(key))
 		}
@@ -324,14 +327,16 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	revision2 := getRevision(t, resp2)
 
 	// Delete the key
-	revision3, _ := storage.Delete(ctx, key)
+	delResp, _ := storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: key})
+	revision3 := delResp.Header.Revision
 
 	// Test historical access
 	// At revision1, should get value1
-	kv, err := storage.Get(ctx, key, revision1)
+	kvResp, err := storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: int64(revision1)})
 	if err != nil {
 		t.Fatalf("Get at revision1 failed: %v", err)
 	}
+	kv := kvResp.Kvs[0]
 	if !reflect.DeepEqual(kv.Value, value1) {
 		t.Errorf("Expected value1 at revision1, got %v", kv.Value)
 	}
@@ -340,10 +345,11 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	}
 
 	// At revision2, should get value2
-	kv, err = storage.Get(ctx, key, revision2)
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: int64(revision2)})
 	if err != nil {
 		t.Fatalf("Get at revision2 failed: %v", err)
 	}
+	kv = kvResp.Kvs[0]
 	if !reflect.DeepEqual(kv.Value, value2) {
 		t.Errorf("Expected value2 at revision2, got %v", kv.Value)
 	}
@@ -351,25 +357,22 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 		t.Errorf("Expected CreateRevision %d, got %d", revision1, kv.CreateRevision)
 	}
 
-	// At revision3, should get not-found error
-	kv, err = storage.Get(ctx, key, revision3)
-	if !isNotFound(err) {
-		t.Fatalf("expected not found error at revision3, got %v", err)
-	}
-	if kv != nil {
-		t.Errorf("Expected nil key-value pair at revision3, got %v", kv)
-	}
+	// At revision3, should be not found
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key, Revision: int64(revision3)})
+	assertNotFound(t, kvResp, err)
 
 	// At latest revision (0), should get error for deleted key
-	_, err = storage.Get(ctx, key, 0)
-	if err == nil {
-		t.Error("Expected error for deleted key at latest revision")
-	}
+	kvResp, err = storage.Get(ctx, &etcdserverpb.RangeRequest{Key: key})
+	assertNotFound(t, kvResp, err)
 }
 
-func isNotFound(err error) bool {
-	// TODO: Fix this
-	return strings.Contains(err.Error(), "key not found")
+func assertNotFound(t *testing.T, resp *etcdserverpb.RangeResponse, err error) {
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(resp.Kvs) > 0 {
+		t.Fatalf("expected no key-value pairs, got %v", resp.Kvs)
+	}
 }
 
 func TestMemoryStorage_RangeQueries(t *testing.T) {
@@ -396,10 +399,11 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 	}
 
 	// Test range query [b, d) - should return b and c
-	rangeKeys, err := storage.List(ctx, []byte("b"), []byte("d"), 0)
+	rangeResp, err := storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("b"), RangeEnd: []byte("d")})
 	if err != nil {
 		t.Fatalf("Range query failed: %v", err)
 	}
+	rangeKeys := rangeResp.Kvs
 	if len(rangeKeys) != 2 {
 		t.Errorf("Expected 2 keys in range [b, d), got %d", len(rangeKeys))
 	}
@@ -416,10 +420,11 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 	require.NotContains(t, keys, "e")
 
 	// Test range query [a, c) - should return a and b
-	rangeKeys, err = storage.List(ctx, []byte("a"), []byte("c"), 0)
+	rangeResp, err = storage.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("a"), RangeEnd: []byte("c")})
 	if err != nil {
 		t.Fatalf("Range query failed: %v", err)
 	}
+	rangeKeys = rangeResp.Kvs
 	if len(rangeKeys) != 2 {
 		t.Errorf("Expected 2 keys in range [a, c), got %d", len(rangeKeys))
 	}
@@ -478,9 +483,12 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 
 		// Delete the key
-		_, err = storage.Delete(ctx, []byte("test-key"))
+		delResp, err := storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("test-key")})
 		if err != nil {
 			t.Fatalf("DELETE failed: %v", err)
+		}
+		if delResp.Deleted != 1 {
+			t.Fatalf("Expected 1 deleted, got %d", delResp.Deleted)
 		}
 
 		// Wait for events
@@ -571,9 +579,12 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		}
 
 		// Delete key under prefix
-		_, err = storage.Delete(ctx, []byte("prefix/key1"))
+		delResp, err := storage.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("prefix/key1")})
 		if err != nil {
 			t.Fatalf("DELETE failed: %v", err)
+		}
+		if delResp.Deleted != 1 {
+			t.Fatalf("Expected 1 deleted, got %d", delResp.Deleted)
 		}
 
 		// Wait for events

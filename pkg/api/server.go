@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -122,6 +121,10 @@ func (s *Server) GracefulStop() error {
 
 // Range implements the Range RPC method
 func (s *Server) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: Range", "request", req)
+
 	if req.Key == nil {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
@@ -136,84 +139,29 @@ func (s *Server) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*et
 }
 
 func (s *Server) handleSingleKey(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	var revision storage.Revision
-	if req.Revision > 0 {
-		revision = storage.Revision(req.Revision)
+	// Query for single key
+	resp, err := s.storage.Get(ctx, req)
+	if err != nil {
+		return nil, err
 	}
-
-	var kvs []*mvccpb.KeyValue
-	var count int64
-
-	if req.CountOnly {
-		// Count-only query for single key
-		_, err := s.storage.Get(ctx, req.Key, revision)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				return &etcdserverpb.RangeResponse{
-					Header: s.createHeader(revision),
-					Count:  0,
-				}, nil
-			}
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-		count = 1
-	} else {
-		// Full query for single key
-		kv, err := s.storage.Get(ctx, req.Key, revision)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				return &etcdserverpb.RangeResponse{
-					Header: s.createHeader(revision),
-					Count:  0,
-				}, nil
-			}
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-		kvs = []*mvccpb.KeyValue{kv}
-		count = 1
-	}
-
-	return &etcdserverpb.RangeResponse{
-		Header: s.createHeader(revision),
-		Kvs:    kvs,
-		Count:  count,
-	}, nil
+	return resp, err
 }
 
 func (s *Server) handleRangeWithEnd(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	var revision storage.Revision
-	if req.Revision > 0 {
-		revision = storage.Revision(req.Revision)
-	}
-
 	// Use the storage layer's efficient range query
-	keys, err := s.storage.List(ctx, req.Key, req.RangeEnd, revision)
+	resp, err := s.storage.List(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, err
 	}
-
-	var kvs []*mvccpb.KeyValue
-	var count int64
-
-	if req.CountOnly {
-		count = int64(len(keys))
-	} else {
-		kvs = make([]*mvccpb.KeyValue, len(keys))
-		for i, kv := range keys {
-			kvs[i] = kv
-		}
-		count = int64(len(kvs))
-	}
-
-	return &etcdserverpb.RangeResponse{
-		Header: s.createHeader(revision),
-		Kvs:    kvs,
-		Count:  count,
-	}, nil
+	return resp, err
 }
 
 // Put implements the Put RPC method
 func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: Put", "request", req)
+
 	if req.Key == nil {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
@@ -227,76 +175,19 @@ func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdse
 
 // DeleteRange implements the DeleteRange RPC method
 func (s *Server) DeleteRange(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
-	if req.Key == nil {
-		return nil, status.Error(codes.InvalidArgument, "key is required")
-	}
+	log := klog.FromContext(ctx)
 
-	var deleted int64
-	var prevKvs []*mvccpb.KeyValue
+	log.Info("grpc request: DeleteRange", "request", req)
 
-	if len(req.RangeEnd) == 0 {
-		// Single key deletion
-		if req.PrevKv {
-			existing, err := s.storage.Get(ctx, req.Key, 0)
-			if err == nil {
-				prevKvs = []*mvccpb.KeyValue{existing}
-			}
-		}
-
-		// Check if key exists before deleting
-		_, err := s.storage.Get(ctx, req.Key, 0)
-		if err != nil {
-			// TODO: Handle not found?
-			return nil, fmt.Errorf("failed to get key: %w", err)
-		}
-
-		deleted = 1
-
-		// TODO: Compare and swap or similar?
-		revision, err := s.storage.Delete(ctx, req.Key)
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-
-		return &etcdserverpb.DeleteRangeResponse{
-			Header:  s.createHeader(storage.Revision(revision)),
-			Deleted: deleted,
-			PrevKvs: prevKvs,
-		}, nil
-	}
-
-	// Range deletion - use the storage layer's efficient range query
-	keys, err := s.storage.List(ctx, req.Key, req.RangeEnd, 0)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	var maxRevision storage.Revision
-	for _, kv := range keys {
-		if req.PrevKv {
-			prevKvs = append(prevKvs, kv)
-		}
-
-		// TODO: Compare and swap or similar?
-		revision, err := s.storage.Delete(ctx, kv.Key)
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-		if storage.Revision(revision) > maxRevision {
-			maxRevision = storage.Revision(revision)
-		}
-		deleted++
-	}
-
-	return &etcdserverpb.DeleteRangeResponse{
-		Header:  s.createHeader(maxRevision),
-		Deleted: deleted,
-		PrevKvs: prevKvs,
-	}, nil
+	return s.storage.Delete(ctx, req)
 }
 
 // Txn implements the Txn RPC method
 func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: Txn", "request", req)
+
 	// For now, implement a simple transaction that just executes the success operations
 	// In a full implementation, we'd need to evaluate the compare operations
 
@@ -358,6 +249,10 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 
 // Compact implements the Compact RPC method
 func (s *Server) Compact(ctx context.Context, req *etcdserverpb.CompactionRequest) (*etcdserverpb.CompactionResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: Compact", "request", req)
+
 	// For now, return success without actual compaction
 	// In a full implementation, we'd need to implement actual compaction logic
 	return &etcdserverpb.CompactionResponse{
@@ -367,7 +262,11 @@ func (s *Server) Compact(ctx context.Context, req *etcdserverpb.CompactionReques
 
 // Watch implements the Watch RPC method
 func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
-	ctx, cancel := context.WithCancel(stream.Context())
+	ctx := stream.Context()
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: Watch stream")
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	ws := &watchStream{
@@ -405,13 +304,15 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 // handleRequests processes incoming watch requests
 func (ws *watchStream) handleRequests(ctx context.Context) {
-	// log := klog.FromContext(ctx)
+	log := klog.FromContext(ctx)
 
 	for {
 		req, err := ws.stream.Recv()
 		if err != nil {
 			return
 		}
+
+		log.Info("grpc watch request", "request", req)
 
 		switch r := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
@@ -526,9 +427,12 @@ func (ws *watchStream) watchEvents(ctx context.Context, watch *activeWatch) {
 			if watch.prevKv && event.PrevKv == nil {
 				// We need to fetch the previous value if not provided
 				// This is a simplified implementation
-				prevKv, err := ws.server.storage.Get(ctx, event.Kv.Key, storage.Revision(event.Kv.CreateRevision-1))
-				if err == nil && prevKv != nil {
-					event.PrevKv = prevKv
+				prevKv, err := ws.server.storage.Get(ctx, &etcdserverpb.RangeRequest{Key: event.Kv.Key, Revision: int64(event.Kv.CreateRevision - 1)})
+				if err != nil {
+					// TODO: Handle not found?
+				}
+				if err == nil && prevKv != nil && len(prevKv.Kvs) > 0 {
+					event.PrevKv = prevKv.Kvs[0]
 				}
 			}
 
@@ -586,6 +490,10 @@ func (ws *watchStream) cleanup(closeGRPC bool) {
 
 // Grant implements the Grant RPC method
 func (s *Server) Grant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: LeaseGrant", "request", req)
+
 	// For now, return a simple lease grant
 	// In a full implementation, we'd need to implement actual lease management
 	return &etcdserverpb.LeaseGrantResponse{
@@ -606,6 +514,10 @@ func (s *Server) Revoke(ctx context.Context, req *etcdserverpb.LeaseRevokeReques
 
 // LeaseTimeToLive implements the LeaseTimeToLive RPC method
 func (s *Server) LeaseTimeToLive(ctx context.Context, req *etcdserverpb.LeaseTimeToLiveRequest) (*etcdserverpb.LeaseTimeToLiveResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: LeaseTimeToLive", "request", req)
+
 	// For now, return a simple response
 	// In a full implementation, we'd need to implement actual lease TTL tracking
 	return &etcdserverpb.LeaseTimeToLiveResponse{
@@ -618,6 +530,10 @@ func (s *Server) LeaseTimeToLive(ctx context.Context, req *etcdserverpb.LeaseTim
 
 // LeaseLeases implements the LeaseLeases RPC method
 func (s *Server) LeaseLeases(ctx context.Context, req *etcdserverpb.LeaseLeasesRequest) (*etcdserverpb.LeaseLeasesResponse, error) {
+	log := klog.FromContext(ctx)
+
+	log.Info("grpc request: LeaseLeases", "request", req)
+
 	// For now, return empty leases
 	// In a full implementation, we'd need to implement actual lease tracking
 	return &etcdserverpb.LeaseLeasesResponse{
