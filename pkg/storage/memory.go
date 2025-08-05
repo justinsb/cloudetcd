@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/bptree"
 	"justinsb.com/cloudetcd/pkg/persistence"
@@ -44,19 +45,21 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	revisions bptree.BPTree
-	watchers  map[int64]*memoryWatcher
-	watcherID int64
-	watcherMu sync.RWMutex
-	log       persistence.Log // Persistence log
+
+	log persistence.Log // Persistence log
+
+	watcherMu     sync.RWMutex
+	watchers      map[int64]*memoryWatcher
+	nextWatcherID int64
 }
 
 // NewMemoryStorage creates a new in-memory storage instance with the given log.
 // It returns an error if it cannot replay the log to restore the storage state.
 func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	ms := &MemoryStorage{
-		watchers:  make(map[int64]*memoryWatcher),
-		watcherID: 0,
-		log:       log,
+		watchers:      make(map[int64]*memoryWatcher),
+		nextWatcherID: 1,
+		log:           log,
 	}
 
 	// Replay the log to restore state
@@ -171,13 +174,20 @@ func (m *MemoryStorage) broadcastEvent(event *mvccpb.Event, revision Revision) {
 }
 
 // Put writes a key-value pair to the storage.
-func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, leaseID int64) (Revision, error) {
+func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	key := req.GetKey()
+	value := req.GetValue()
+
+	if req.GetLease() != 0 {
+		return nil, fmt.Errorf("lease is not supported")
+	}
+
 	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get current revision: %w", err)
+		return nil, fmt.Errorf("failed to get current revision: %w", err)
 	}
 
 	existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
@@ -189,13 +199,13 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 		Value:     value,
 	}
 
-	var existing *KeyValue
+	var prevKv *KeyValue
 	if hasExisting {
 		logEntry := m.log.GetLogEntry(existingRevision)
 		if logEntry == nil {
 			klog.Fatalf("log entry not found for revision %d", existingRevision)
 		}
-		existing = logEntryToKeyValue(logEntry)
+		prevKv = logEntryToKeyValue(logEntry)
 		logRecord.CreateRevision = logEntry.CreateRevision
 		logRecord.Version = logEntry.Version + 1
 	} else {
@@ -206,23 +216,10 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 	// Let's see if we can commit this transaction without conflicts
 	newLogRecord, ok, err := m.log.Append(ctx, snapshotTimestamp, logRecord)
 	if err != nil || !ok {
-		return 0, fmt.Errorf("failed to append to log: %w", err)
+		return nil, fmt.Errorf("failed to append to log: %w", err)
 	}
 
 	kv := logEntryToKeyValue(newLogRecord)
-
-	// kv := &KeyValue{
-	// 	Key:   key,
-	// 	Value: value,
-	// }
-
-	// if existing != nil {
-	// 	// Key exists, keep the original create revision
-	// 	kv.CreateRevision = existing.CreateRevision
-	// } else {
-	// 	// New key
-	// 	kv.CreateRevision = m.revision
-	// }
 
 	m.revisions.AddRevision(kv.Key, newLogRecord.Revision)
 
@@ -231,13 +228,20 @@ func (m *MemoryStorage) Put(ctx context.Context, key []byte, value []byte, lease
 		Type: mvccpb.PUT,
 		Kv:   kv,
 	}
-	if existing != nil {
-		event.PrevKv = existing
+	if prevKv != nil {
+		event.PrevKv = prevKv
 	}
 
 	m.broadcastEvent(event, newLogRecord.Revision)
 
-	return newLogRecord.Revision, nil
+	response := &etcdserverpb.PutResponse{
+		Header: createHeader(newLogRecord.Revision),
+	}
+	if req.PrevKv {
+		response.PrevKv = prevKv
+	}
+
+	return response, nil
 }
 
 // Get retrieves a key-value pair from the storage.
@@ -410,9 +414,10 @@ func (m *MemoryStorage) Watch(ctx context.Context, key []byte, rangeEnd []byte, 
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 
-	m.watcherID++
+	watcherID := m.nextWatcherID
+	m.nextWatcherID++
 	watcher := &memoryWatcher{
-		id:            m.watcherID,
+		id:            watcherID,
 		key:           key,
 		rangeEnd:      rangeEnd,
 		startRevision: startRevision,
@@ -461,6 +466,15 @@ func (m *MemoryStorage) ForceReplayLog(ctx context.Context) error {
 
 	// Replay the log
 	return m.ReplayLog(ctx)
+}
+
+func createHeader(revision Revision) *etcdserverpb.ResponseHeader {
+	return &etcdserverpb.ResponseHeader{
+		ClusterId: 1, // Simple cluster ID
+		MemberId:  1, // Simple member ID
+		Revision:  int64(revision),
+		RaftTerm:  1, // Simple term
+	}
 }
 
 // GracefulStop stops the storage gracefully.

@@ -218,25 +218,11 @@ func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdse
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
 
-	// Get current revision for the key to check if it exists
-	var prevKv *mvccpb.KeyValue
-	if req.PrevKv {
-		existing, err := s.storage.Get(ctx, req.Key, 0)
-		if err == nil {
-			prevKv = existing
-		}
-	}
-
-	// Write the key-value pair
-	revision, err := s.storage.Put(ctx, req.Key, req.Value, req.Lease)
+	response, err := s.storage.Put(ctx, req)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-
-	return &etcdserverpb.PutResponse{
-		Header: s.createHeader(storage.Revision(revision)),
-		PrevKv: prevKv,
-	}, nil
+	return response, nil
 }
 
 // DeleteRange implements the DeleteRange RPC method

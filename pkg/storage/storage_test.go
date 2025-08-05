@@ -10,9 +10,17 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
+
+func getRevision(t *testing.T, resp *etcdserverpb.PutResponse) Revision {
+	if resp.Header == nil {
+		t.Fatal("PutResponse has no header")
+	}
+	return Revision(resp.Header.Revision)
+}
 
 func TestMemoryStorage_Put(t *testing.T) {
 	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
@@ -24,22 +32,27 @@ func TestMemoryStorage_Put(t *testing.T) {
 	// Test basic put
 	key := []byte("test-key")
 	value := []byte("test-value")
-	revision, err := storage.Put(ctx, key, value, 0)
+	req := &etcdserverpb.PutRequest{
+		Key:   key,
+		Value: value,
+	}
+	resp, err := storage.Put(ctx, req)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if revision != 1 {
-		t.Errorf("Expected revision 1, got %d", revision)
+	if getRevision(t, resp) != 1 {
+		t.Errorf("Expected revision 1, got %d", getRevision(t, resp))
 	}
 
 	// Test update
 	newValue := []byte("updated-value")
-	revision, err = storage.Put(ctx, key, newValue, 0)
+	req.Value = newValue
+	resp, err = storage.Put(ctx, req)
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
-	if revision != 2 {
-		t.Errorf("Expected revision 2, got %d", revision)
+	if getRevision(t, resp) != 2 {
+		t.Errorf("Expected revision 2, got %d", getRevision(t, resp))
 	}
 }
 
@@ -53,7 +66,7 @@ func TestMemoryStorage_Get(t *testing.T) {
 	// Put a key-value pair
 	key := []byte("test-key")
 	value := []byte("test-value")
-	storage.Put(ctx, key, value, 0)
+	storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value})
 
 	// Test get existing key
 	kv, err := storage.Get(ctx, key, 0)
@@ -101,7 +114,7 @@ func TestMemoryStorage_Delete(t *testing.T) {
 	// Put a key-value pair
 	key := []byte("test-key")
 	value := []byte("test-value")
-	storage.Put(ctx, key, value, 0)
+	storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value})
 
 	// Verify it exists
 	_, err := storage.Get(ctx, key, 0)
@@ -150,7 +163,7 @@ func TestMemoryStorage_List(t *testing.T) {
 	}
 
 	for k, v := range testData {
-		_, err := storage.Put(ctx, []byte(k), []byte(v), 0)
+		_, err := storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte(k), Value: []byte(v)})
 		if err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
@@ -224,11 +237,13 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 	// Put a key
 	key := []byte("test-key")
 	value1 := []byte("value1")
-	revision1, _ := storage.Put(ctx, key, value1, 0)
+	resp1, _ := storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value1})
+	revision1 := getRevision(t, resp1)
 
 	// Update the key
 	value2 := []byte("value2")
-	revision2, _ := storage.Put(ctx, key, value2, 0)
+	resp2, _ := storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value2})
+	revision2 := getRevision(t, resp2)
 
 	// Verify revision ordering
 	if revision1 >= revision2 {
@@ -267,7 +282,7 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			key := []byte(fmt.Sprintf("concurrent-key-%d", id))
 			value := []byte(fmt.Sprintf("value-%d", id))
-			_, err := storage.Put(ctx, key, value, 0)
+			_, err := storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value})
 			if err != nil {
 				t.Errorf("Concurrent Put failed: %v", err)
 			}
@@ -300,11 +315,13 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	// Put a key
 	key := []byte("test-key")
 	value1 := []byte("value1")
-	revision1, _ := storage.Put(ctx, key, value1, 0)
+	resp1, _ := storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value1})
+	revision1 := getRevision(t, resp1)
 
 	// Update the key
 	value2 := []byte("value2")
-	revision2, _ := storage.Put(ctx, key, value2, 0)
+	resp2, _ := storage.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: value2})
+	revision2 := getRevision(t, resp2)
 
 	// Delete the key
 	revision3, _ := storage.Delete(ctx, key)
@@ -372,7 +389,7 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 	}
 
 	for k, v := range testData {
-		_, err := storage.Put(ctx, []byte(k), []byte(v), 0)
+		_, err := storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte(k), Value: []byte(v)})
 		if err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
@@ -449,13 +466,13 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 
 		// Put a key
-		_, err = storage.Put(ctx, []byte("test-key"), []byte("value1"), 0)
+		_, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("test-key"), Value: []byte("value1")})
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}
 
 		// Update the key
-		_, err = storage.Put(ctx, []byte("test-key"), []byte("value2"), 0)
+		_, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("test-key"), Value: []byte("value2")})
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}
@@ -537,18 +554,18 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 
 		// Put keys under prefix
-		_, err = storage.Put(ctx, []byte("prefix/key1"), []byte("value1"), 0)
+		_, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("prefix/key1"), Value: []byte("value1")})
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}
 
-		_, err = storage.Put(ctx, []byte("prefix/key2"), []byte("value2"), 0)
+		_, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("prefix/key2"), Value: []byte("value2")})
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}
 
 		// Put key that doesn't match prefix - should not trigger event
-		_, err = storage.Put(ctx, []byte("other"), []byte("value3"), 0)
+		_, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("other"), Value: []byte("value3")})
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}

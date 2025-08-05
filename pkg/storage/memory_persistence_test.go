@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
@@ -24,28 +25,31 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 
 	// Put some values
 	t.Log("1. Putting key-value pairs...")
-	rev1, err := store.Put(ctx, []byte("key1"), []byte("value1"), 0)
+	resp1, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1")})
 	if err != nil {
 		t.Fatalf("Failed to put key1: %v", err)
 	}
+	rev1 := getRevision(t, resp1)
 	if rev1 != 1 {
 		t.Errorf("Expected revision 1, got %d", rev1)
 	}
 	t.Logf("   Put key1=value1 at revision %d", rev1)
 
-	rev2, err := store.Put(ctx, []byte("key2"), []byte("value2"), 0)
+	resp2, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key2"), Value: []byte("value2")})
 	if err != nil {
 		t.Fatalf("Failed to put key2: %v", err)
 	}
+	rev2 := getRevision(t, resp2)
 	if rev2 != 2 {
 		t.Errorf("Expected revision 2, got %d", rev2)
 	}
 	t.Logf("   Put key2=value2 at revision %d", rev2)
 
-	rev3, err := store.Put(ctx, []byte("key1"), []byte("updated-value1"), 0)
+	resp3, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("updated-value1")})
 	if err != nil {
 		t.Fatalf("Failed to update key1: %v", err)
 	}
+	rev3 := getRevision(t, resp3)
 	if rev3 != 3 {
 		t.Errorf("Expected revision 3, got %d", rev3)
 	}

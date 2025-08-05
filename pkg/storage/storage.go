@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
@@ -38,7 +39,7 @@ type Watcher interface {
 // Storage is the interface for the underlying storage layer.
 type Storage interface {
 	// Put writes a key-value pair to the storage.
-	Put(ctx context.Context, key []byte, value []byte, leaseID int64) (Revision, error)
+	Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error)
 
 	// Get retrieves a key-value pair from the storage.
 	Get(ctx context.Context, key []byte, atRevision Revision) (*KeyValue, error)

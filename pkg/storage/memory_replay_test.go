@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -23,16 +24,16 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	ctx := context.Background()
 
 	// Put some keys
-	if _, err := storage.Put(ctx, []byte("key1"), []byte("value1"), 0); err != nil {
+	if _, err := storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1")}); err != nil {
 		t.Fatalf("Failed to put key1: %v", err)
 	}
 
-	if _, err = storage.Put(ctx, []byte("key2"), []byte("value2"), 0); err != nil {
+	if _, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key2"), Value: []byte("value2")}); err != nil {
 		t.Fatalf("Failed to put key2: %v", err)
 	}
 
 	// Update key1
-	if _, err = storage.Put(ctx, []byte("key1"), []byte("value1-updated"), 0); err != nil {
+	if _, err = storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1-updated")}); err != nil {
 		t.Fatalf("Failed to update key1: %v", err)
 	}
 
@@ -143,8 +144,8 @@ func TestMemoryStorageForceReplay(t *testing.T) {
 
 	// Add some test data
 	ctx := context.Background()
-	storage.Put(ctx, []byte("key1"), []byte("value1"), 0)
-	storage.Put(ctx, []byte("key2"), []byte("value2"), 0)
+	storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1")})
+	storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key2"), Value: []byte("value2")})
 
 	// Verify initial state
 	keys, err := storage.List(ctx, []byte(""), []byte(""), 0)
@@ -191,28 +192,28 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	// Step 3: Add some data
 	ctx := context.Background()
 
-	rev1, err := storage1.Put(ctx, []byte("app/config"), []byte("production"), 0)
+	resp1, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/config"), Value: []byte("production")})
 	if err != nil {
 		t.Fatalf("Failed to put app/config: %v", err)
 	}
-	if rev1 != 1 {
-		t.Errorf("Expected revision 1, got %d", rev1)
+	if getRevision(t, resp1) != 1 {
+		t.Errorf("Expected revision 1, got %d", getRevision(t, resp1))
 	}
 
-	rev2, err := storage1.Put(ctx, []byte("app/version"), []byte("1.0.0"), 0)
+	resp2, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/version"), Value: []byte("1.0.0")})
 	if err != nil {
 		t.Fatalf("Failed to put app/version: %v", err)
 	}
-	if rev2 != 2 {
-		t.Errorf("Expected revision 2, got %d", rev2)
+	if getRevision(t, resp2) != 2 {
+		t.Errorf("Expected revision 2, got %d", getRevision(t, resp2))
 	}
 
-	rev3, err := storage1.Put(ctx, []byte("app/config"), []byte("staging"), 0)
+	resp3, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/config"), Value: []byte("staging")})
 	if err != nil {
 		t.Fatalf("Failed to update app/config: %v", err)
 	}
-	if rev3 != 3 {
-		t.Errorf("Expected revision 3, got %d", rev3)
+	if getRevision(t, resp3) != 3 {
+		t.Errorf("Expected revision 3, got %d", getRevision(t, resp3))
 	}
 
 	rev4, err := storage1.Delete(ctx, []byte("app/version"))
@@ -276,12 +277,12 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 8: Test that we can still write to the replayed storage
-	rev5, err := storage2.Put(ctx, []byte("app/status"), []byte("running"), 0)
+	resp5, err := storage2.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/status"), Value: []byte("running")})
 	if err != nil {
 		t.Fatalf("Failed to put app/status: %v", err)
 	}
-	if rev5 != 5 {
-		t.Errorf("Expected revision 5, got %d", rev5)
+	if getRevision(t, resp5) != 5 {
+		t.Errorf("Expected revision 5, got %d", getRevision(t, resp5))
 	}
 
 	// Step 9: Verify the new data is visible in storage2 but not storage1
