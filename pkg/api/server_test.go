@@ -14,6 +14,8 @@ import (
 )
 
 func TestEtcdAPIServer(t *testing.T) {
+	ctx := context.TODO()
+
 	// Create storage and server
 	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
 	if err != nil {
@@ -21,11 +23,11 @@ func TestEtcdAPIServer(t *testing.T) {
 	}
 	server := NewServer(store)
 
-	defer server.Stop()
+	defer server.GracefulStop()
 
 	// Start server in background
 	go func() {
-		if err := server.Start(":2379"); err != nil {
+		if err := server.Start(ctx, ":2379"); err != nil {
 			t.Errorf("Failed to start server: %v", err)
 		}
 	}()
@@ -43,7 +45,7 @@ func TestEtcdAPIServer(t *testing.T) {
 	}
 	defer cli.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Test PUT
@@ -120,6 +122,8 @@ func TestEtcdAPIServer(t *testing.T) {
 }
 
 func TestWatchFunctionality(t *testing.T) {
+	ctx := context.TODO()
+
 	// Create storage and server
 	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
 	if err != nil {
@@ -127,11 +131,11 @@ func TestWatchFunctionality(t *testing.T) {
 	}
 	server := NewServer(store)
 
-	defer server.Stop()
+	defer server.GracefulStop()
 
 	// Start server in background
 	go func() {
-		if err := server.Start(":2380"); err != nil {
+		if err := server.Start(ctx, ":2380"); err != nil {
 			t.Errorf("Failed to start server: %v", err)
 		}
 	}()
@@ -149,7 +153,7 @@ func TestWatchFunctionality(t *testing.T) {
 	}
 	defer cli.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	t.Run("Single Key Watch", func(t *testing.T) {
@@ -357,6 +361,8 @@ func TestWatchFunctionality(t *testing.T) {
 }
 
 func TestServerMethods(t *testing.T) {
+	ctx := context.TODO()
+
 	// Create storage and server
 	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
 	if err != nil {
@@ -364,11 +370,11 @@ func TestServerMethods(t *testing.T) {
 	}
 	server := NewServer(store)
 
-	defer server.Stop()
+	defer server.GracefulStop()
 
 	// Start server in background
 	go func() {
-		if err := server.Start(":2381"); err != nil {
+		if err := server.Start(ctx, ":2381"); err != nil {
 			t.Errorf("Failed to start server: %v", err)
 		}
 	}()
@@ -386,7 +392,7 @@ func TestServerMethods(t *testing.T) {
 	}
 	defer cli.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Test Range method through gRPC
@@ -444,6 +450,8 @@ func TestServerMethods(t *testing.T) {
 }
 
 func TestRangeWithRangeEnd(t *testing.T) {
+	ctx := context.TODO()
+
 	// Create storage and server
 	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
 	if err != nil {
@@ -451,11 +459,11 @@ func TestRangeWithRangeEnd(t *testing.T) {
 	}
 	server := NewServer(store)
 
-	defer server.Stop()
+	defer server.GracefulStop()
 
 	// Start server in background
 	go func() {
-		if err := server.Start(":2382"); err != nil {
+		if err := server.Start(ctx, ":2382"); err != nil {
 			t.Errorf("Failed to start server: %v", err)
 		}
 	}()
@@ -473,7 +481,7 @@ func TestRangeWithRangeEnd(t *testing.T) {
 	}
 	defer cli.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Put some test data

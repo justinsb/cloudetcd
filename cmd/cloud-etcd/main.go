@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -14,13 +15,21 @@ import (
 )
 
 func main() {
+	err := run(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to run: %v", err)
+	}
+}
+
+func run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Parse command line flags
 	var (
 		addr = flag.String("addr", ":2379", "Address to listen on")
 	)
 	flag.Parse()
-
-	fmt.Println("Starting cloud-etcd server...")
 
 	// Create storage instance
 	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
@@ -38,12 +47,13 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Println("\nShutting down server...")
-		server.Stop()
+		cancel()
 	}()
 
 	// Start the server
-	fmt.Printf("Starting etcd API server on %s\n", *addr)
-	if err := server.Start(*addr); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	if err := server.Start(ctx, *addr); err != nil {
+		return fmt.Errorf("failed to start server: %w", err)
 	}
+
+	return nil
 }

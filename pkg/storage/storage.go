@@ -55,6 +55,9 @@ type Storage interface {
 	// If rangeEnd is empty, it watches a single key.
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
 	Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error)
+
+	// GracefulStop stops the storage gracefully.
+	GracefulStop()
 }
 
 type KeyValue = mvccpb.KeyValue

@@ -462,3 +462,13 @@ func (m *MemoryStorage) ForceReplayLog(ctx context.Context) error {
 	// Replay the log
 	return m.ReplayLog(ctx)
 }
+
+// GracefulStop stops the storage gracefully.
+func (m *MemoryStorage) GracefulStop() {
+	m.watcherMu.Lock()
+	defer m.watcherMu.Unlock()
+	for _, watcher := range m.watchers {
+		klog.InfoS("closing watcher", "id", watcher.id)
+		watcher.Close()
+	}
+}

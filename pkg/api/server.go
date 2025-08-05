@@ -14,17 +14,18 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"justinsb.com/cloudetcd/pkg/storage"
+	"k8s.io/klog/v2"
 )
 
 // watchStream represents a single watch stream with multiple watches
 type watchStream struct {
-	server  *Server
-	stream  etcdserverpb.Watch_WatchServer
-	watches map[int64]*activeWatch
-	watchID int64
-	mu      sync.RWMutex
-	ctx     context.Context
-	cancel  context.CancelFunc
+	server *Server
+	stream etcdserverpb.Watch_WatchServer
+	cancel context.CancelFunc
+
+	mu          sync.RWMutex
+	watches     map[int64]*activeWatch
+	nextWatchID int64
 }
 
 // activeWatch represents a single active watch
@@ -59,17 +60,25 @@ type Server struct {
 
 	storage storage.Storage
 	grpc    *grpc.Server
+
+	mu                sync.RWMutex
+	watchStreams      map[int64]*watchStream
+	nextWatchStreamID int64
 }
 
 // NewServer creates a new etcd API server
 func NewServer(store storage.Storage) *Server {
 	return &Server{
-		storage: store,
+		storage:           store,
+		watchStreams:      make(map[int64]*watchStream),
+		nextWatchStreamID: 1,
 	}
 }
 
 // Start starts the gRPC server on the given address
-func (s *Server) Start(addr string) error {
+func (s *Server) Start(ctx context.Context, addr string) error {
+	log := klog.FromContext(ctx)
+
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
@@ -80,15 +89,35 @@ func (s *Server) Start(addr string) error {
 	etcdserverpb.RegisterWatchServer(s.grpc, s)
 	etcdserverpb.RegisterLeaseServer(s.grpc, s)
 
-	fmt.Printf("Starting etcd API server on %s\n", addr)
+	log.Info("Starting etcd API server", "addr", addr)
+
+	go func() {
+		<-ctx.Done()
+		log.Info("Stopping etcd API server (gracefully)")
+		s.GracefulStop()
+	}()
 	return s.grpc.Serve(lis)
 }
 
-// Stop gracefully stops the server
-func (s *Server) Stop() {
-	if s.grpc != nil {
-		s.grpc.GracefulStop()
+// HardStop stops the gRPC server (non-gracefully)
+func (s *Server) HardStop() error {
+	s.grpc.Stop()
+	return nil
+}
+
+// GracefulStop stops the gRPC server gracefully
+func (s *Server) GracefulStop() error {
+	s.storage.GracefulStop()
+
+	s.mu.Lock()
+	for id, ws := range s.watchStreams {
+		klog.InfoS("stopping watch stream", "id", id)
+		ws.cleanup(true)
 	}
+	s.mu.Unlock()
+
+	s.grpc.GracefulStop()
+	return nil
 }
 
 // Range implements the Range RPC method
@@ -356,38 +385,51 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	defer cancel()
 
 	ws := &watchStream{
-		server:  s,
-		stream:  stream,
-		watches: make(map[int64]*activeWatch),
-		watchID: 0,
-		ctx:     ctx,
-		cancel:  cancel,
+		server:      s,
+		stream:      stream,
+		watches:     make(map[int64]*activeWatch),
+		nextWatchID: 1,
+		cancel:      cancel,
 	}
 
+	s.mu.Lock()
+	watchStreamID := s.nextWatchStreamID
+	s.nextWatchStreamID++
+	s.watchStreams[watchStreamID] = ws
+	s.mu.Unlock()
+
 	// Start goroutine to handle incoming requests
-	go ws.handleRequests()
+	go func() {
+		ws.handleRequests(ctx)
+		cancel()
+	}()
 
 	// Wait for context to be done
 	<-ctx.Done()
 
 	// Clean up all watches
-	ws.cleanup()
+	ws.cleanup(false)
+
+	s.mu.Lock()
+	delete(s.watchStreams, watchStreamID)
+	s.mu.Unlock()
 
 	return nil
 }
 
 // handleRequests processes incoming watch requests
-func (ws *watchStream) handleRequests() {
+func (ws *watchStream) handleRequests(ctx context.Context) {
+	// log := klog.FromContext(ctx)
+
 	for {
 		req, err := ws.stream.Recv()
 		if err != nil {
-			ws.cancel()
 			return
 		}
 
 		switch r := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
-			ws.handleCreateRequest(r.CreateRequest)
+			ws.handleCreateRequest(ctx, r.CreateRequest)
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			ws.handleCancelRequest(r.CancelRequest)
 		case *etcdserverpb.WatchRequest_ProgressRequest:
@@ -397,19 +439,21 @@ func (ws *watchStream) handleRequests() {
 }
 
 // handleCreateRequest handles watch creation
-func (ws *watchStream) handleCreateRequest(req *etcdserverpb.WatchCreateRequest) {
+func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverpb.WatchCreateRequest) {
+	// log := klog.FromContext(ctx)
+
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	ws.watchID++
-	watchID := ws.watchID
+	watchID := ws.nextWatchID
+	ws.nextWatchID++
 
 	// Determine if this is a range watch (when RangeEnd is specified)
 	isRangeWatch := len(req.RangeEnd) > 0
 
 	// Create storage watcher
 	startRevision := storage.Revision(req.StartRevision)
-	watcher, err := ws.server.storage.Watch(ws.ctx, req.Key, req.RangeEnd, startRevision)
+	watcher, err := ws.server.storage.Watch(ctx, req.Key, req.RangeEnd, startRevision)
 	if err != nil {
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
@@ -444,7 +488,7 @@ func (ws *watchStream) handleCreateRequest(req *etcdserverpb.WatchCreateRequest)
 	ws.stream.Send(resp)
 
 	// Start watching for events
-	go ws.watchEvents(activeWatch)
+	go ws.watchEvents(ctx, activeWatch)
 }
 
 // handleCancelRequest handles watch cancellation
@@ -477,7 +521,9 @@ func (ws *watchStream) handleProgressRequest(req *etcdserverpb.WatchProgressRequ
 }
 
 // watchEvents monitors storage events for a specific watch
-func (ws *watchStream) watchEvents(watch *activeWatch) {
+func (ws *watchStream) watchEvents(ctx context.Context, watch *activeWatch) {
+	log := klog.FromContext(ctx)
+
 	defer watch.close()
 
 	// Process watch events
@@ -494,7 +540,7 @@ func (ws *watchStream) watchEvents(watch *activeWatch) {
 			if watch.prevKv && event.PrevKv == nil {
 				// We need to fetch the previous value if not provided
 				// This is a simplified implementation
-				prevKv, err := ws.server.storage.Get(ws.ctx, event.Kv.Key, storage.Revision(event.Kv.CreateRevision-1))
+				prevKv, err := ws.server.storage.Get(ctx, event.Kv.Key, storage.Revision(event.Kv.CreateRevision-1))
 				if err == nil && prevKv != nil {
 					event.PrevKv = prevKv
 				}
@@ -516,6 +562,8 @@ func (ws *watchStream) watchEvents(watch *activeWatch) {
 			}
 		}
 	}
+
+	log.Info("watch stream closed")
 }
 
 // shouldFilterEvent checks if an event should be filtered out
@@ -536,14 +584,18 @@ func (ws *watchStream) shouldFilterEvent(event *mvccpb.Event, filters []etcdserv
 }
 
 // cleanup closes all watches
-func (ws *watchStream) cleanup() {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
+func (ws *watchStream) cleanup(closeGRPC bool) {
+
+	// TODO: Send cancellation events to all watches?
 
 	for _, watch := range ws.watches {
 		watch.close()
 	}
 	ws.watches = make(map[int64]*activeWatch)
+
+	if closeGRPC {
+		ws.cancel()
+	}
 }
 
 // Grant implements the Grant RPC method
