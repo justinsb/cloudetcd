@@ -357,10 +357,19 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			})
 
 		case *etcdserverpb.RequestOp_RequestRange:
-			rangeResp, err := txn.list(ctx, op.GetRequestRange())
-			if err != nil {
-				return nil, err
+			var rangeResp *etcdserverpb.RangeResponse
+			if op.GetRequestRange().GetRangeEnd() == nil {
+				rangeResp, err = txn.get(ctx, op.GetRequestRange())
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				rangeResp, err = txn.list(ctx, op.GetRequestRange())
+				if err != nil {
+					return nil, err
+				}
 			}
+
 			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: rangeResp},
 			})
@@ -385,8 +394,29 @@ type txn struct {
 
 // Get retrieves a key-value pair from the storage.
 func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	txn := &etcdserverpb.TxnRequest{
+		Success: []*etcdserverpb.RequestOp{
+			{Request: &etcdserverpb.RequestOp_RequestRange{RequestRange: req}},
+		},
+	}
+
+	txnResp, err := m.Txn(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+
+	rangeResp := txnResp.Responses[0].GetResponseRange()
+	if rangeResp == nil {
+		return nil, fmt.Errorf("expected range response, got %T", txnResp.Responses[0].Response)
+	}
+	// TODO: Are the headers set in the individual responses?
+	rangeResp.Header = txnResp.Header
+
+	return rangeResp, nil
+}
+
+func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+	m := t.storage
 
 	if req.Key == nil {
 		return nil, fmt.Errorf("key is required by Get")
@@ -409,6 +439,10 @@ func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest)
 
 	if req.CountOnly {
 		return nil, fmt.Errorf("count only is not supported by Get")
+	}
+
+	if req.Limit != 0 {
+		return nil, fmt.Errorf("limit is not supported by Get")
 	}
 
 	resp := &etcdserverpb.RangeResponse{
