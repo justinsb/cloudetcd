@@ -77,20 +77,17 @@ func (f *FilesystemLog) replay() error {
 }
 
 // Append adds a new record to the log and returns the revision number
-func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (*LogRecord, bool, error) {
+func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (Revision, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if conditionPosition != f.revision {
-		return nil, false, nil
-	}
-
-	if logRecord.Revision != f.revision+1 {
-		return nil, false, fmt.Errorf("log record revision does not match current revision")
+		return 0, false, nil
 	}
 
 	// Increment revision number
 	f.revision++
+	newRevision := f.revision
 
 	// Create filename with hex-encoded revision
 	filename := revisionToFilename(f.revision)
@@ -99,15 +96,15 @@ func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, 
 	// Serialize record to JSON
 	data, err := json.Marshal(logRecord)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to marshal log record: %w", err)
+		return 0, false, fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to file atomically
 	if err := os.WriteFile(filepath, data, 0644); err != nil {
-		return nil, false, fmt.Errorf("failed to write log file: %w", err)
+		return 0, false, fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	return logRecord, true, nil
+	return newRevision, true, nil
 }
 
 // GetCurrentRevision returns the current revision number
@@ -140,20 +137,20 @@ func (f *FilesystemLog) getLogEntry(revision Revision) *LogRecord {
 }
 
 // Read reads records from the log starting from the given revision
-func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, limit int) ([]*LogRecord, error) {
+func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callback func(Revision, *LogRecord) bool) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
 	if fromRevision < 0 {
-		return nil, fmt.Errorf("invalid fromRevision: %d", fromRevision)
+		return fmt.Errorf("invalid fromRevision: %d", fromRevision)
 	}
 
 	entries, err := os.ReadDir(f.dir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read log directory: %w", err)
+		return fmt.Errorf("failed to read log directory: %w", err)
 	}
 
-	var records []*LogRecord
+	var matches []Revision
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -173,33 +170,24 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, limit i
 		if revision < fromRevision {
 			continue
 		}
-
-		// Read and parse the log file
-		filepath := filepath.Join(f.dir, filename)
-		data, err := os.ReadFile(filepath)
-		if err != nil {
-			continue
-		}
-
-		var record LogRecord
-		if err := json.Unmarshal(data, &record); err != nil {
-			continue
-		}
-
-		records = append(records, &record)
+		matches = append(matches, revision)
 	}
 
-	// Sort by revision
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].Revision < records[j].Revision
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i] < matches[j]
 	})
 
-	// Apply limit
-	if limit > 0 && len(records) > limit {
-		records = records[:limit]
+	for _, revision := range matches {
+		record := f.getLogEntry(revision)
+		if record == nil {
+			return fmt.Errorf("log entry not found for revision %d", revision)
+		}
+		if !callback(revision, record) {
+			break
+		}
 	}
 
-	return records, nil
+	return nil
 }
 
 // Close closes the log and releases any resources

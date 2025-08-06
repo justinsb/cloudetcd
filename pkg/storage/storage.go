@@ -22,20 +22,15 @@ const MAX_REVISION = Revision(^uint64(0))
 // 	Deleted        bool     // Whether this is a tombstone (deleted entry)
 // }
 
-// WatchResponse represents a response from watching
-type WatchResponse struct {
-	Events   []*mvccpb.Event
-	Revision Revision
-}
-
 // Watcher represents a single watch subscription
 type Watcher interface {
-	// Chan returns the channel to receive watch events
-	Chan() <-chan *WatchResponse
 	// Close closes the watcher
 	Close()
 	// ID returns the ID of the watcher
 	ID() int64
+
+	// Run starts the watcher.
+	Run(ctx context.Context) error
 }
 
 // Storage is the interface for the underlying storage layer.
@@ -55,7 +50,7 @@ type Storage interface {
 	// Watch creates a watcher for the given key/range starting from the specified revision
 	// If rangeEnd is empty, it watches a single key.
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
-	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest) (Watcher, error)
+	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, error)
 
 	// Txn executes a transaction against the storage.
 	Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error)

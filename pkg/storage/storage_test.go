@@ -448,24 +448,30 @@ func TestMemoryStorage_Watch(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Storage Watch Interface", func(t *testing.T) {
+		var events []*mvccpb.Event
+		var mu sync.Mutex
+
+		// Callback to collect events
+		callback := func(event *etcdserverpb.WatchResponse) error {
+			mu.Lock()
+			events = append(events, event.Events...)
+			mu.Unlock()
+			return nil
+		}
 		// Create a watcher for exact key match
 		watcher, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
-			Key: []byte("test-key"),
-		})
+			WatchId: 1,
+			Key:     []byte("test-key"),
+			PrevKv:  true,
+		}, callback)
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
 		defer watcher.Close()
 
-		var events []*mvccpb.Event
-		var mu sync.Mutex
-
-		// Goroutine to collect events
 		go func() {
-			for resp := range watcher.Chan() {
-				mu.Lock()
-				events = append(events, resp.Events...)
-				mu.Unlock()
+			if err := watcher.Run(ctx); err != nil {
+				t.Errorf("watch stopped with error: %v", err)
 			}
 		}()
 
@@ -532,7 +538,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 			t.Errorf("Expected DELETE event, got %d", events[2].Type)
 		}
 		if events[2].PrevKv == nil {
-			t.Error("Expected PrevKv to be set for delete")
+			t.Fatalf("Expected PrevKv to be set for delete")
 		}
 		// The value should be the previous value
 		if string(events[2].PrevKv.Value) != "value2" {
@@ -541,25 +547,29 @@ func TestMemoryStorage_Watch(t *testing.T) {
 	})
 
 	t.Run("Storage Prefix Watch", func(t *testing.T) {
+		var events []*mvccpb.Event
+		var mu sync.Mutex
+
+		callback := func(event *etcdserverpb.WatchResponse) error {
+			mu.Lock()
+			events = append(events, event.Events...)
+			mu.Unlock()
+			return nil
+		}
 		// Create a watcher for prefix match (using empty rangeEnd for prefix behavior)
 		watcher, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
+			WatchId:  1,
 			Key:      []byte("prefix/"),
 			RangeEnd: rangeEndForPrefix(t, []byte("prefix/")),
-		})
+		}, callback)
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
 		defer watcher.Close()
 
-		var events []*mvccpb.Event
-		var mu sync.Mutex
-
-		// Goroutine to collect events
 		go func() {
-			for resp := range watcher.Chan() {
-				mu.Lock()
-				events = append(events, resp.Events...)
-				mu.Unlock()
+			if err := watcher.Run(ctx); err != nil {
+				t.Errorf("watch stopped with error: %v", err)
 			}
 		}()
 

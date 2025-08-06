@@ -52,47 +52,61 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	}
 
 	// If no log entries exist, we're done
-	if currentRevision <= 1 {
+	if currentRevision == 0 {
+		// We want the log to start at revision 1, so we'll add a dummy event
+		newRevision, ok, err := m.log.Append(ctx, 0, &persistence.LogRecord{})
+		if err != nil {
+			return fmt.Errorf("failed to append dummy event: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("failed to append dummy event")
+		}
+		if newRevision != 1 {
+			return fmt.Errorf("expected revision 1, got %d", newRevision)
+		}
 		return nil
 	}
 
 	// Read all log records starting from revision 1
-	records, err := m.log.Read(ctx, 1, 0) // 0 means no limit
-	if err != nil {
-		return fmt.Errorf("failed to read log records: %w", err)
+
+	callback := func(revision Revision, record *persistence.LogRecord) bool {
+		for _, event := range record.Events {
+			switch event.Type {
+			case mvccpb.PUT:
+				// Replay PUT operation
+				m.revisions.AddRevision(event.Kv.Key, revision)
+
+			case mvccpb.DELETE:
+				// Replay DELETE operation
+				m.revisions.AddRevision(event.Kv.Key, revision)
+
+			default:
+				// Skip unknown operations
+				klog.Fatalf("unknown operation: %s", event.Type)
+			}
+		}
+
+		return true
 	}
 
-	// Replay each record in order
-	for _, record := range records {
-		switch record.Operation {
-		case mvccpb.PUT:
-			// Replay PUT operation
-			m.revisions.AddRevision(record.Key, record.Revision)
-
-		case mvccpb.DELETE:
-			// Replay DELETE operation
-			m.revisions.AddRevision(record.Key, record.Revision)
-
-		default:
-			// Skip unknown operations
-			klog.Fatalf("unknown operation: %s", record.Operation)
-		}
+	if err := m.log.Read(ctx, 1, callback); err != nil {
+		return fmt.Errorf("failed to read log records: %w", err)
 	}
 
 	return nil
 }
 
-// convertToMVCCKeyValue converts a storage.KeyValue to mvccpb.KeyValue
-func logEntryToKeyValue(r *persistence.LogRecord) *mvccpb.KeyValue {
-	return &mvccpb.KeyValue{
-		Key:            r.Key,
-		Value:          r.Value,
-		CreateRevision: int64(r.CreateRevision),
-		ModRevision:    int64(r.Revision),
-		Version:        r.Version,
-		Lease:          0, // For now, no lease
-	}
-}
+// // convertToMVCCKeyValue converts a storage.KeyValue to mvccpb.KeyValue
+// func logEntryToKeyValue(r *persistence.LogRecord) *mvccpb.KeyValue {
+// 	return &mvccpb.KeyValue{
+// 		Key:            r.Key,
+// 		Value:          r.Value,
+// 		CreateRevision: int64(r.CreateRevision),
+// 		ModRevision:    int64(r.Revision),
+// 		Version:        r.Version,
+// 		Lease:          0, // For now, no lease
+// 	}
+// }
 
 // Put writes a key-value pair to the storage.
 func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
@@ -127,40 +141,49 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 
 	existingRevision, hasExisting := t.storage.revisions.GetLatestRevisionByKey(key, t.snapshotTimestamp)
 
-	logRecord := &persistence.LogRecord{
-		Revision:  Revision(t.snapshotTimestamp + 1),
-		Operation: mvccpb.PUT,
-		Key:       key,
-		Value:     value,
+	newRevision := Revision(t.snapshotTimestamp + 1)
+
+	newKV := &mvccpb.KeyValue{
+		Key:         key,
+		Value:       value,
+		ModRevision: int64(newRevision),
 	}
 
-	var prevKv *KeyValue
+	var prevKv *mvccpb.KeyValue
 	if hasExisting {
 		logEntry := t.storage.log.GetLogEntry(existingRevision)
 		if logEntry == nil {
 			klog.Fatalf("log entry not found for revision %d", existingRevision)
 		}
-		prevKv = logEntryToKeyValue(logEntry)
-		logRecord.CreateRevision = logEntry.CreateRevision
-		logRecord.Version = logEntry.Version + 1
-	} else {
-		logRecord.CreateRevision = logRecord.Revision
-		logRecord.Version = 1
+		prevEvent := findEvent(logEntry, key)
+		if prevEvent == nil {
+			klog.Fatalf("prevKv not found for key %s", key)
+		}
+		if prevEvent.Type == mvccpb.PUT {
+			prevKv = prevEvent.Kv
+		} else if prevEvent.Type == mvccpb.DELETE {
+			prevKv = nil
+		} else {
+			klog.Fatalf("unknown operation: %s", prevEvent.Type)
+		}
 	}
 
-	t.logRecords = append(t.logRecords, logRecord)
-
-	kv := logEntryToKeyValue(logRecord)
+	if prevKv != nil {
+		newKV.CreateRevision = prevKv.CreateRevision
+		newKV.Version = prevKv.Version + 1
+	} else {
+		newKV.CreateRevision = int64(newRevision)
+		newKV.Version = 1
+	}
 
 	// Create and broadcast watch event
 	event := &mvccpb.Event{
-		Type: mvccpb.PUT,
-		Kv:   kv,
+		Type:   mvccpb.PUT,
+		Kv:     newKV,
+		PrevKv: prevKv,
 	}
-	if prevKv != nil {
-		event.PrevKv = prevKv
-	}
-	t.events = append(t.events, event)
+
+	t.logEvents = append(t.logEvents, event)
 
 	// TODO: Do individual responses have headers?
 	response := &etcdserverpb.PutResponse{}
@@ -172,18 +195,25 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 }
 
 func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error {
+	log := klog.FromContext(ctx)
+
+	log.Info("committing transaction", "events", t.logEvents)
+
 	// Let's see if we can commit this transaction without conflicts
-	if len(t.logRecords) == 0 {
+	if len(t.logEvents) == 0 {
 		return nil
 	}
 
-	if len(t.logRecords) != 1 {
-		return fmt.Errorf("expected 1 log record, got %d", len(t.logRecords))
+	// TODO: We can probably relax this now
+	if len(t.logEvents) != 1 {
+		return fmt.Errorf("expected 1 log record, got %d", len(t.logEvents))
 	}
 
-	logRecord := t.logRecords[0]
+	logRecord := &persistence.LogRecord{
+		Events: t.logEvents,
+	}
 
-	newLogRecord, ok, err := t.storage.log.Append(ctx, t.snapshotTimestamp, logRecord)
+	newLogRevision, ok, err := t.storage.log.Append(ctx, t.snapshotTimestamp, logRecord)
 	if err != nil || !ok {
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
@@ -191,27 +221,26 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 	// TODO: Can we reuse replay?
 
 	// Replay each record in order
-	for _, record := range t.logRecords {
-		switch record.Operation {
+	for _, event := range logRecord.Events {
+		switch event.Type {
 		case mvccpb.PUT:
 			// Replay PUT operation
-			t.storage.revisions.AddRevision(record.Key, record.Revision)
+			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
 
 		case mvccpb.DELETE:
 			// Replay DELETE operation
-			t.storage.revisions.AddRevision(record.Key, record.Revision)
+			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
 
 		default:
 			// Skip unknown operations
-			klog.Fatalf("unknown operation: %s", record.Operation)
+			klog.Fatalf("unknown operation: %s", event.Type)
 		}
 	}
 
-	for _, event := range t.events {
-		t.storage.broadcastEvent(event, newLogRecord.Revision)
-	}
+	log.Info("broadcasting log position", "newLogRevision", newLogRevision)
+	t.storage.broadcastLogPosition(newLogRevision)
 
-	resp.Header.Revision = int64(newLogRecord.Revision)
+	resp.Header.Revision = int64(newLogRevision)
 	// TODO: Do individual responses have headers?
 	for _, response := range resp.Responses {
 		switch response := response.Response.(type) {
@@ -253,21 +282,26 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 		existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
 
-		var logEntry *persistence.LogRecord
+		var prevEvent *mvccpb.Event
 		if hasExisting {
-			logEntry = m.log.GetLogEntry(existingRevision)
+			logEntry := m.log.GetLogEntry(existingRevision)
 			if logEntry == nil {
 				klog.Fatalf("log entry not found for revision %d", existingRevision)
 			}
+			prevEvent := findEvent(logEntry, key)
+			if prevEvent == nil {
+				klog.Fatalf("prevKv not found for key %s", key)
+			}
+
 		}
 
 		switch cond.GetTarget() {
 		case etcdserverpb.Compare_MOD:
 			modRevision := Revision(0)
-			if logEntry == nil || logEntry.Operation == mvccpb.DELETE {
+			if prevEvent == nil || prevEvent.Type == mvccpb.DELETE {
 				modRevision = Revision(0)
 			} else {
-				modRevision = logEntry.Revision
+				modRevision = Revision(prevEvent.Kv.ModRevision)
 			}
 
 			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_ModRevision)
@@ -345,9 +379,8 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 type txn struct {
 	snapshotTimestamp Revision
-	logRecords        []*persistence.LogRecord
+	logEvents         []*mvccpb.Event
 	storage           *MemoryStorage
-	events            []*mvccpb.Event
 }
 
 // Get retrieves a key-value pair from the storage.
@@ -393,10 +426,14 @@ func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest)
 		klog.Fatalf("log entry not found for revision %d", latestRevision)
 	}
 
-	switch logEntry.Operation {
+	event := findEvent(logEntry, req.Key)
+	if event == nil {
+		klog.Fatalf("key not found in log entry for revision %d", latestRevision)
+	}
+
+	switch event.Type {
 	case mvccpb.PUT:
-		kv := logEntryToKeyValue(logEntry)
-		resp.Kvs = []*mvccpb.KeyValue{kv}
+		resp.Kvs = []*mvccpb.KeyValue{event.Kv}
 		resp.Count = 1
 		return resp, nil
 
@@ -404,8 +441,17 @@ func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest)
 		return resp, nil
 
 	default:
-		panic(fmt.Sprintf("unknown operation: %s", logEntry.Operation))
+		panic(fmt.Sprintf("unknown operation: %s", event.Type))
 	}
+}
+
+func findEvent(logEntry *persistence.LogRecord, key []byte) *mvccpb.Event {
+	for _, event := range logEntry.Events {
+		if bytes.Equal(event.Kv.Key, key) {
+			return event
+		}
+	}
+	return nil
 }
 
 // Delete removes a key from the storage.
@@ -525,20 +571,15 @@ func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) 
 		klog.Fatalf("log entry not found for revision %d", latestRevision)
 	}
 
-	// Append to the persistence log first
-	newLogRecord := &persistence.LogRecord{
-		Revision:  Revision(t.snapshotTimestamp + 1),
-		Operation: mvccpb.DELETE,
-		Key:       key,
-		Value:     nil,
+	oldEvent := findEvent(oldLogEntry, key)
+	if oldEvent == nil {
+		klog.Fatalf("old event not found for key %s", key)
 	}
-	t.logRecords = append(t.logRecords, newLogRecord)
-
-	resp := &etcdserverpb.DeleteRangeResponse{
-		Deleted: 1,
+	if oldEvent.Type != mvccpb.PUT {
+		klog.Fatalf("old event is not a PUT for key %s", key)
 	}
 
-	// Create and broadcast watch event
+	// Append to the persistence log
 
 	// A DELETE/EXPIRE event contains the deleted key with
 	// its modification revision set to the revision of deletion.
@@ -547,26 +588,19 @@ func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) 
 		Type: mvccpb.DELETE,
 		Kv: &mvccpb.KeyValue{
 			Key:         key,
-			ModRevision: int64(newLogRecord.Revision),
+			ModRevision: int64(t.snapshotTimestamp + 1),
 			Version:     0, // version is set to 0 for DELETE events
 		},
 	}
 
-	// Note: we do not set prev_kv; we only send the value if prev_kv is requested in the watch.
-	// (But to reuse the event, we just send it to all watchers.)
-	// TODO: Only send Value if prev_kv is requested in the watch.
-	includePrevKv := true
-	if includePrevKv {
-		event.PrevKv = &mvccpb.KeyValue{
-			Key:            key,
-			CreateRevision: int64(oldLogEntry.CreateRevision),
-			ModRevision:    int64(oldLogEntry.Revision),
-			Value:          oldLogEntry.Value,
-			Version:        oldLogEntry.Version,
-		}
-	}
+	// Note: we always include prev_kv in the log
+	event.PrevKv = oldEvent.Kv
 
-	t.events = append(t.events, event)
+	t.logEvents = append(t.logEvents, event)
+
+	resp := &etcdserverpb.DeleteRangeResponse{
+		Deleted: 1,
+	}
 
 	return resp, nil
 }
@@ -636,21 +670,29 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 		}
 
 		if found {
+			// TODO: Can we store whether this is a delete, so we don't need a log lookup?
+
 			logEntry := m.log.GetLogEntry(latest)
 			if logEntry == nil {
 				klog.Fatalf("log entry not found for revision %d", latest)
 			}
-			if logEntry.Operation == mvccpb.PUT {
-				resp.Count++
-				// TODO: Can we store whether this is a delete, so we don't need a log lookup?
-				if !req.CountOnly {
-					resp.Kvs = append(resp.Kvs, logEntryToKeyValue(logEntry))
+			for _, event := range logEntry.Events {
+				if event.Type == mvccpb.PUT {
+					if req.CountOnly {
+						resp.Count++
+					} else if req.KeysOnly {
+						resp.Count++
+						resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: event.Kv.Key, CreateRevision: event.Kv.CreateRevision, ModRevision: event.Kv.ModRevision, Version: event.Kv.Version, Lease: event.Kv.Lease})
+					} else {
+						resp.Count++
+						resp.Kvs = append(resp.Kvs, event.Kv)
+					}
 				}
-			}
-			if req.Limit > 0 && resp.Count >= req.Limit {
-				resp.More = true
-				// Stop iterating
-				return false
+				if req.Limit > 0 && resp.Count >= req.Limit {
+					resp.More = true
+					// Stop iterating
+					return false
+				}
 			}
 		}
 

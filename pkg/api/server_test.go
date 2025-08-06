@@ -153,22 +153,25 @@ func TestWatchFunctionality(t *testing.T) {
 	}
 	defer cli.Close()
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
 	t.Run("Single Key Watch", func(t *testing.T) {
 		var events []string
 		var mu sync.Mutex
 
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
 		// Start watching key "watch-test"
-		// TODO: Test without WithPrevKV (I think we always send prev_kv on delete)
-		watchCh := cli.Watch(ctx, "watch-test", clientv3.WithPrevKV())
+		watchCh := cli.Watch(ctx, "watch-test")
 
 		// Goroutine to collect watch events
 		go func() {
 			for watchResp := range watchCh {
 				mu.Lock()
 				for _, event := range watchResp.Events {
+					if event.PrevKv != nil {
+						t.Errorf("Expected no prev_kv, got %v", event.PrevKv)
+					}
+
 					var eventType string
 					if event.Type == mvccpb.PUT {
 						eventType = "PUT"
@@ -230,15 +233,20 @@ func TestWatchFunctionality(t *testing.T) {
 		var events []string
 		var mu sync.Mutex
 
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
 		// Start watching prefix "prefix/"
-		// TODO: Test without WithPrevKV (I think we always send prev_kv on delete)
-		watchCh := cli.Watch(ctx, "prefix/", clientv3.WithPrefix(), clientv3.WithPrevKV())
+		watchCh := cli.Watch(ctx, "prefix/", clientv3.WithPrefix())
 
 		// Goroutine to collect watch events
 		go func() {
 			for watchResp := range watchCh {
 				mu.Lock()
 				for _, event := range watchResp.Events {
+					if event.PrevKv != nil {
+						t.Errorf("Expected no prev_kv, got %v", event.PrevKv)
+					}
 					var eventType string
 					if event.Type == mvccpb.PUT {
 						eventType = "PUT"
@@ -341,6 +349,9 @@ func TestWatchFunctionality(t *testing.T) {
 		defer mu.Unlock()
 
 		if len(events) != 1 {
+			for _, event := range events {
+				t.Logf("Event: %v", event)
+			}
 			t.Fatalf("Expected 1 event, got %d", len(events))
 		}
 

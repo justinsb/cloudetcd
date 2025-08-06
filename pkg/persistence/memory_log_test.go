@@ -12,31 +12,50 @@ func TestMemoryLog_Append(t *testing.T) {
 	log := NewMemoryLog()
 	ctx := context.Background()
 
+	// Add the dummy record
+	revision0, ok, err := log.Append(ctx, 0, &LogRecord{})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	if revision0 != 1 {
+		t.Errorf("Expected revision 1, got %d", revision0)
+	}
+
 	// Test first append
-	logRecord1, ok, err := log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
-		Operation: mvccpb.PUT,
-		Key:       []byte("key1"),
-		Value:     []byte("value1"),
+	revision1, ok, err := log.Append(ctx, 1, &LogRecord{
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.PUT,
+				Kv: &mvccpb.KeyValue{
+					Key:   []byte("key1"),
+					Value: []byte("value1"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if logRecord1.Revision != 2 {
-		t.Errorf("Expected revision 2, got %d", logRecord1.Revision)
+	if revision1 != 2 {
+		t.Errorf("Expected revision 2, got %d", revision1)
 	}
 
 	// Test second append
-	logRecord2, ok, err := log.Append(ctx, 2, &LogRecord{
-		Revision:  3,
-		Operation: mvccpb.DELETE,
-		Key:       []byte("key1"),
+	revision2, ok, err := log.Append(ctx, 2, &LogRecord{
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.DELETE,
+				Kv: &mvccpb.KeyValue{
+					Key: []byte("key1"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
-	if logRecord2.Revision != 3 {
-		t.Errorf("Expected revision 3, got %d", logRecord2.Revision)
+	if revision2 != 3 {
+		t.Errorf("Expected revision 3, got %d", revision2)
 	}
 
 	// Test current revision
@@ -53,34 +72,64 @@ func TestMemoryLog_Read(t *testing.T) {
 	log := NewMemoryLog()
 	ctx := context.Background()
 
+	// Add the dummy record
+	rev, ok, err := log.Append(ctx, 0, &LogRecord{})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	if rev != 1 {
+		t.Errorf("Expected revision 1, got %d", rev)
+	}
+
 	// Add some records
-	_, ok, err := log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
-		Operation: mvccpb.PUT,
-		Key:       []byte("key1"),
-		Value:     []byte("value1"),
+	rev, ok, err = log.Append(ctx, 1, &LogRecord{
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.PUT,
+				Kv: &mvccpb.KeyValue{
+					Key:   []byte("key1"),
+					Value: []byte("value1"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	_, ok, err = log.Append(ctx, 2, &LogRecord{
-		Revision:  3,
-		Operation: mvccpb.PUT,
-		Key:       []byte("key2"),
-		Value:     []byte("value2"),
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.PUT,
+				Kv: &mvccpb.KeyValue{
+					Key:   []byte("key2"),
+					Value: []byte("value2"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	_, ok, err = log.Append(ctx, 3, &LogRecord{
-		Revision:  4,
-		Operation: mvccpb.DELETE,
-		Key:       []byte("key1"),
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.DELETE,
+				Kv: &mvccpb.KeyValue{
+					Key: []byte("key1"),
+				},
+			},
+		},
 	})
 
 	// Read all records from revision 1
-	records, err := log.Read(ctx, 1, 10)
-	if err != nil {
+	records := make(map[Revision]*LogRecord)
+	if err := log.Read(ctx, 2, func(revision Revision, record *LogRecord) bool {
+		records[revision] = record
+		return true
+	}); err != nil {
 		t.Fatalf("Failed to read records: %v", err)
 	}
 
@@ -89,30 +138,21 @@ func TestMemoryLog_Read(t *testing.T) {
 	}
 
 	// Check first record
-	if records[0].Revision != 2 {
-		t.Errorf("Expected revision 2, got %d", records[0].Revision)
+	if records[2].Events[0].Type != mvccpb.PUT {
+		t.Errorf("Expected operation PUT, got %s", records[2].Events[0].Type)
 	}
-	if records[0].Operation != mvccpb.PUT {
-		t.Errorf("Expected operation PUT, got %s", records[0].Operation)
-	}
-	if string(records[0].Key) != "key1" {
-		t.Errorf("Expected key key1, got %s", string(records[0].Key))
+	if string(records[2].Events[0].Kv.Key) != "key1" {
+		t.Errorf("Expected key key1, got %s", string(records[2].Events[0].Kv.Key))
 	}
 
 	// Check second record
-	if records[1].Revision != 3 {
-		t.Errorf("Expected revision 3, got %d", records[1].Revision)
-	}
-	if records[1].Operation != mvccpb.PUT {
-		t.Errorf("Expected operation PUT, got %s", records[1].Operation)
+	if records[3].Events[0].Type != mvccpb.PUT {
+		t.Errorf("Expected operation PUT, got %s", records[3].Events[0].Type)
 	}
 
 	// Check third record
-	if records[2].Revision != 4 {
-		t.Errorf("Expected revision 4, got %d", records[2].Revision)
-	}
-	if records[2].Operation != mvccpb.DELETE {
-		t.Errorf("Expected operation DELETE, got %s", records[2].Operation)
+	if records[4].Events[0].Type != mvccpb.DELETE {
+		t.Errorf("Expected operation DELETE, got %s", records[4].Events[0].Type)
 	}
 }
 
@@ -120,34 +160,64 @@ func TestMemoryLog_ReadWithLimit(t *testing.T) {
 	log := NewMemoryLog()
 	ctx := context.Background()
 
+	// Add the dummy record
+	revision0, ok, err := log.Append(ctx, 0, &LogRecord{})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	if revision0 != 1 {
+		t.Errorf("Expected revision 1, got %d", revision0)
+	}
+
 	// Add some records
-	_, ok, err := log.Append(ctx, 1, &LogRecord{
-		Revision:  2,
-		Operation: mvccpb.PUT,
-		Key:       []byte("key1"),
-		Value:     []byte("value1"),
+	_, ok, err = log.Append(ctx, 1, &LogRecord{
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.PUT,
+				Kv: &mvccpb.KeyValue{
+					Key:   []byte("key1"),
+					Value: []byte("value1"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	_, ok, err = log.Append(ctx, 2, &LogRecord{
-		Revision:  3,
-		Operation: mvccpb.PUT,
-		Key:       []byte("key2"),
-		Value:     []byte("value2"),
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.PUT,
+				Kv: &mvccpb.KeyValue{
+					Key:   []byte("key2"),
+					Value: []byte("value2"),
+				},
+			},
+		},
 	})
 	if err != nil || !ok {
 		t.Fatalf("Failed to append: %v", err)
 	}
 	_, ok, err = log.Append(ctx, 3, &LogRecord{
-		Revision:  4,
-		Operation: mvccpb.DELETE,
-		Key:       []byte("key1"),
+		Events: []*mvccpb.Event{
+			{
+				Type: mvccpb.DELETE,
+				Kv: &mvccpb.KeyValue{
+					Key: []byte("key1"),
+				},
+			},
+		},
 	})
 
 	// Read with limit 2
-	records, err := log.Read(ctx, 1, 2)
-	if err != nil {
+	records := make(map[Revision]*LogRecord)
+	if err := log.Read(ctx, 2, func(revision Revision, record *LogRecord) bool {
+		records[revision] = record
+		if len(records) >= 2 {
+			return false
+		}
+		return true
+	}); err != nil {
 		t.Fatalf("Failed to read records: %v", err)
 	}
 
@@ -161,9 +231,12 @@ func TestMemoryLog_ReadFromInvalidRevision(t *testing.T) {
 	ctx := context.Background()
 
 	// Try to read from invalid revision
-	records, err := log.Read(ctx, 1234567, 10)
-	if err == nil {
-		t.Error("Expected error for invalid revision, got nil")
+	records := make(map[Revision]*LogRecord)
+	if err := log.Read(ctx, 1234567, func(revision Revision, record *LogRecord) bool {
+		records[revision] = record
+		return true
+	}); err != nil {
+		t.Errorf("Expected no error for invalid revision, got error %v", err)
 	}
 	if len(records) != 0 {
 		t.Errorf("Expected 0 records, got %d", len(records))
@@ -173,6 +246,15 @@ func TestMemoryLog_ReadFromInvalidRevision(t *testing.T) {
 func TestMemoryLog_ConcurrentAppend(t *testing.T) {
 	log := NewMemoryLog()
 	ctx := context.Background()
+
+	// Add the dummy record
+	revision0, ok, err := log.Append(ctx, 0, &LogRecord{})
+	if err != nil || !ok {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	if revision0 != 1 {
+		t.Errorf("Expected revision 1, got %d", revision0)
+	}
 
 	// Test concurrent appends
 	const numGoroutines = 10
@@ -190,10 +272,15 @@ func TestMemoryLog_ConcurrentAppend(t *testing.T) {
 						t.Errorf("Failed to get current revision: %v", err)
 					}
 					_, ok, err := log.Append(ctx, revision, &LogRecord{
-						Revision:  revision + 1,
-						Operation: mvccpb.PUT,
-						Key:       []byte("key"),
-						Value:     []byte("value"),
+						Events: []*mvccpb.Event{
+							{
+								Type: mvccpb.PUT,
+								Kv: &mvccpb.KeyValue{
+									Key:   []byte("key"),
+									Value: []byte("value"),
+								},
+							},
+						},
 					})
 					if err != nil {
 						t.Errorf("Failed to append: %v", err)

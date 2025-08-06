@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
-	"go.etcd.io/etcd/api/v3/mvccpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -29,14 +28,14 @@ type watchStream struct {
 
 // activeWatch represents a single active watch
 type activeWatch struct {
-	id       int64
-	watcher  storage.Watcher
-	key      []byte
-	rangeEnd []byte // Store the range end for proper filtering
-	prefix   bool
-	prevKv   bool
-	filters  []etcdserverpb.WatchCreateRequest_FilterType
-	closed   int32 // atomic flag
+	id      int64
+	watcher storage.Watcher
+	// key      []byte
+	// rangeEnd []byte // Store the range end for proper filtering
+	// prefix   bool
+	// prevKv   bool
+	// filters  []etcdserverpb.WatchCreateRequest_FilterType
+	closed int32 // atomic flag
 }
 
 func (aw *activeWatch) isClosed() bool {
@@ -221,10 +220,11 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	defer cancel()
 
 	ws := &watchStream{
-		server:  s,
-		stream:  stream,
-		watches: make(map[int64]*activeWatch),
-		cancel:  cancel,
+		server:      s,
+		stream:      stream,
+		watches:     make(map[int64]*activeWatch),
+		cancel:      cancel,
+		nextWatchID: 1,
 	}
 
 	s.mu.Lock()
@@ -281,13 +281,10 @@ func (ws *watchStream) handleRequests(ctx context.Context) error {
 
 // handleCreateRequest handles watch creation
 func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverpb.WatchCreateRequest) error {
-	// log := klog.FromContext(ctx)
+	log := klog.FromContext(ctx)
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-
-	// Determine if this is a range watch (when RangeEnd is specified)
-	isRangeWatch := len(req.RangeEnd) > 0
 
 	watchID := req.WatchId
 	if watchID == 0 {
@@ -306,10 +303,12 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 		}
 	}
 
-	// TODO: Assign req.StartRevision to the watch?
+	callback := func(resp *etcdserverpb.WatchResponse) error {
+		return ws.stream.Send(resp)
+	}
 
 	// Create storage watcher
-	watch, err := ws.server.storage.Watch(ctx, req)
+	watch, err := ws.server.storage.Watch(ctx, req, callback)
 	if err != nil {
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
@@ -322,18 +321,6 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 		return err
 	}
 
-	// Create active watch
-	activeWatch := &activeWatch{
-		id:       watchID,
-		watcher:  watch,
-		key:      req.Key,
-		rangeEnd: req.RangeEnd, // Store the range end
-		prefix:   isRangeWatch, // Reuse the prefix field to indicate range watch
-		prevKv:   req.PrevKv,
-		filters:  req.Filters,
-	}
-	ws.watches[watchID] = activeWatch
-
 	// Send creation response
 	resp := &etcdserverpb.WatchResponse{
 		Header:  ws.server.createHeader(0),
@@ -342,8 +329,25 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 	}
 	ws.stream.Send(resp)
 
+	// Create active watch
+	activeWatch := &activeWatch{
+		id:      watchID,
+		watcher: watch,
+		// key:      req.Key,
+		// rangeEnd: req.RangeEnd, // Store the range end
+		// prefix:   isRangeWatch, // Reuse the prefix field to indicate range watch
+		// prevKv:   req.PrevKv,
+		// filters:  req.Filters,
+	}
+	ws.watches[watchID] = activeWatch
+
 	// Start watching for events
-	go ws.watchEvents(ctx, activeWatch)
+	go func() {
+		if err := watch.Run(ctx); err != nil {
+			log.Error(err, "watch stopped with error")
+			activeWatch.close()
+		}
+	}()
 
 	return nil
 }
@@ -377,77 +381,8 @@ func (ws *watchStream) handleProgressRequest(req *etcdserverpb.WatchProgressRequ
 	ws.stream.Send(resp)
 }
 
-// watchEvents monitors storage events for a specific watch
-func (ws *watchStream) watchEvents(ctx context.Context, watch *activeWatch) {
-	log := klog.FromContext(ctx)
-
-	defer watch.close()
-
-	// Process watch events
-	for watchResp := range watch.watcher.Chan() {
-		// Apply filters and convert events
-		var events []*mvccpb.Event
-		for _, event := range watchResp.Events {
-			// Apply filters
-			if ws.shouldFilterEvent(event, watch.filters) {
-				continue
-			}
-
-			// Add previous KV if requested and available
-			if watch.prevKv && event.PrevKv == nil {
-				// We need to fetch the previous value if not provided
-				// This is a simplified implementation
-				prevKv, err := ws.server.storage.Get(ctx, &etcdserverpb.RangeRequest{Key: event.Kv.Key, Revision: int64(event.Kv.CreateRevision - 1)})
-				if err != nil {
-					// TODO: Handle not found?
-				}
-				if err == nil && prevKv != nil && len(prevKv.Kvs) > 0 {
-					event.PrevKv = prevKv.Kvs[0]
-				}
-			}
-
-			events = append(events, event)
-		}
-
-		// Send response if we have events
-		if len(events) > 0 {
-			resp := &etcdserverpb.WatchResponse{
-				Header:  ws.server.createHeader(storage.Revision(watchResp.Revision)),
-				WatchId: watch.id,
-				Events:  events,
-			}
-
-			klog.Infof("sending watch response %v to watcher %v", resp, watch)
-
-			if err := ws.stream.Send(resp); err != nil {
-				return
-			}
-		}
-	}
-
-	log.Info("watch stream closed")
-}
-
-// shouldFilterEvent checks if an event should be filtered out
-func (ws *watchStream) shouldFilterEvent(event *mvccpb.Event, filters []etcdserverpb.WatchCreateRequest_FilterType) bool {
-	for _, filter := range filters {
-		switch filter {
-		case etcdserverpb.WatchCreateRequest_NOPUT:
-			if event.Type == mvccpb.PUT {
-				return true
-			}
-		case etcdserverpb.WatchCreateRequest_NODELETE:
-			if event.Type == mvccpb.DELETE {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // cleanup closes all watches
 func (ws *watchStream) cleanup(closeGRPC bool) {
-
 	// TODO: Send cancellation events to all watches?
 
 	for _, watch := range ws.watches {

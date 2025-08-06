@@ -69,8 +69,11 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 
 	// Read from the log
 	t.Log("3. Reading from persistence log...")
-	records, err := memoryLog.Read(ctx, 1, 10)
-	if err != nil {
+	records := make(map[Revision]*persistence.LogRecord)
+	if err := memoryLog.Read(ctx, 2, func(revision Revision, record *persistence.LogRecord) bool {
+		records[revision] = record
+		return true
+	}); err != nil {
 		t.Fatalf("Failed to read from log: %v", err)
 	}
 
@@ -79,12 +82,12 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 	}
 
 	t.Logf("   Found %d log records:", len(records))
-	for _, record := range records {
+	for revision, record := range records {
 		t.Logf("   - Revision %d: %s key=%s value=%s",
-			record.Revision,
-			record.Operation,
-			string(record.Key),
-			string(record.Value))
+			revision,
+			record.Events[0].Type,
+			string(record.Events[0].Kv.Key),
+			string(record.Events[0].Kv.Value))
 	}
 
 	// Verify log records
@@ -105,18 +108,18 @@ func TestMemoryStorage_WithPersistence(t *testing.T) {
 			t.Errorf("Expected record at index %d, but only have %d records", i, len(records))
 			continue
 		}
-		record := records[i]
-		if record.Revision != expected.revision {
-			t.Errorf("Record %d: expected revision %d, got %d", i, expected.revision, record.Revision)
+		record := records[expected.revision]
+		if record == nil {
+			t.Errorf("Record %d: expected revision %d", i, expected.revision)
 		}
-		if record.Operation != expected.operation {
-			t.Errorf("Record %d: expected operation %s, got %s", i, expected.operation, record.Operation)
+		if record.Events[0].Type != expected.operation {
+			t.Errorf("Record %d: expected operation %s, got %s", i, expected.operation, record.Events[0].Type)
 		}
-		if string(record.Key) != expected.key {
-			t.Errorf("Record %d: expected key %s, got %s", i, expected.key, string(record.Key))
+		if string(record.Events[0].Kv.Key) != expected.key {
+			t.Errorf("Record %d: expected key %s, got %s", i, expected.key, string(record.Events[0].Kv.Key))
 		}
-		if string(record.Value) != expected.value {
-			t.Errorf("Record %d: expected value %s, got %s", i, expected.value, string(record.Value))
+		if string(record.Events[0].Kv.Value) != expected.value {
+			t.Errorf("Record %d: expected value %s, got %s", i, expected.value, string(record.Events[0].Kv.Value))
 		}
 	}
 

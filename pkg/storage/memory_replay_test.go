@@ -197,24 +197,24 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to put app/config: %v", err)
 	}
-	if getRevision(t, resp1) != 1 {
-		t.Errorf("Expected revision 1, got %d", getRevision(t, resp1))
+	if getRevision(t, resp1) != 2 {
+		t.Errorf("Expected revision 2, got %d", getRevision(t, resp1))
 	}
 
 	resp2, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/version"), Value: []byte("1.0.0")})
 	if err != nil {
 		t.Fatalf("Failed to put app/version: %v", err)
 	}
-	if getRevision(t, resp2) != 2 {
-		t.Errorf("Expected revision 2, got %d", getRevision(t, resp2))
+	if getRevision(t, resp2) != 3 {
+		t.Errorf("Expected revision 3, got %d", getRevision(t, resp2))
 	}
 
 	resp3, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/config"), Value: []byte("staging")})
 	if err != nil {
 		t.Fatalf("Failed to update app/config: %v", err)
 	}
-	if getRevision(t, resp3) != 3 {
-		t.Errorf("Expected revision 3, got %d", getRevision(t, resp3))
+	if getRevision(t, resp3) != 4 {
+		t.Errorf("Expected revision 4, got %d", getRevision(t, resp3))
 	}
 
 	delResp, err := storage1.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte("app/version")})
@@ -222,8 +222,8 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 		t.Fatalf("Failed to delete app/version: %v", err)
 	}
 	rev4 := delResp.Header.Revision
-	if rev4 != 4 {
-		t.Errorf("Expected revision 4, got %d", rev4)
+	if rev4 != 5 {
+		t.Errorf("Expected revision 5, got %d", rev4)
 	}
 
 	// Step 4: Verify current state
@@ -285,8 +285,8 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to put app/status: %v", err)
 	}
-	if getRevision(t, resp5) != 5 {
-		t.Errorf("Expected revision 5, got %d", getRevision(t, resp5))
+	if getRevision(t, resp5) != 6 {
+		t.Errorf("Expected revision 6, got %d", getRevision(t, resp5))
 	}
 
 	// Step 9: Verify the new data is visible in storage2 but not storage1
