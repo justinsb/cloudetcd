@@ -395,6 +395,15 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: deleteResp},
 			})
 
+		case *etcdserverpb.RequestOp_RequestRange:
+			rangeResp, err := txn.list(ctx, op.GetRequestRange())
+			if err != nil {
+				return nil, err
+			}
+			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: rangeResp},
+			})
+
 		default:
 			return nil, fmt.Errorf("unsupported operation: %T", op.Request)
 		}
@@ -636,11 +645,30 @@ func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) 
 }
 
 // List returns a range of key-value pairs.
-// If rangeEnd is empty, it returns all keys with the given prefix.
-// If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
 func (m *MemoryStorage) List(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	txn := &etcdserverpb.TxnRequest{
+		Success: []*etcdserverpb.RequestOp{
+			{Request: &etcdserverpb.RequestOp_RequestRange{RequestRange: req}},
+		},
+	}
+
+	txnResp, err := m.Txn(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+
+	rangeResp := txnResp.Responses[0].GetResponseRange()
+	if rangeResp == nil {
+		return nil, fmt.Errorf("expected range response, got %T", txnResp.Responses[0].Response)
+	}
+	// TODO: Are the headers set in the individual responses?
+	rangeResp.Header = txnResp.Header
+
+	return rangeResp, nil
+}
+
+func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+	m := t.storage
 
 	if req.RangeEnd == nil {
 		return nil, fmt.Errorf("range end is required by List")

@@ -56,6 +56,7 @@ type Server struct {
 	etcdserverpb.UnimplementedKVServer
 	etcdserverpb.UnimplementedWatchServer
 	etcdserverpb.UnimplementedLeaseServer
+	etcdserverpb.UnimplementedMaintenanceServer
 
 	storage storage.Storage
 	grpc    *grpc.Server
@@ -87,6 +88,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	etcdserverpb.RegisterKVServer(s.grpc, s)
 	etcdserverpb.RegisterWatchServer(s.grpc, s)
 	etcdserverpb.RegisterLeaseServer(s.grpc, s)
+	etcdserverpb.RegisterMaintenanceServer(s.grpc, s)
 
 	log.Info("Starting etcd API server", "addr", addr)
 
@@ -188,7 +190,12 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 
 	log.Info("grpc request: Txn", "request", req)
 
-	return s.storage.Txn(ctx, req)
+	result, err := s.storage.Txn(ctx, req)
+	if err != nil {
+		log.Error(err, "failed to execute Txn request", "request", req)
+		return nil, err
+	}
+	return result, nil
 }
 
 // Compact implements the Compact RPC method

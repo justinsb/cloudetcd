@@ -48,7 +48,6 @@ type Storage interface {
 	Delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error)
 
 	// List returns a range of key-value pairs.
-	// If rangeEnd is specified, it returns keys in the range [key, rangeEnd).
 	List(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error)
 
 	// Watch creates a watcher for the given key/range starting from the specified revision
