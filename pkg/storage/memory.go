@@ -386,6 +386,15 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: putResp},
 			})
 
+		case *etcdserverpb.RequestOp_RequestDeleteRange:
+			deleteResp, err := txn.delete(ctx, op.GetRequestDeleteRange())
+			if err != nil {
+				return nil, err
+			}
+			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: deleteResp},
+			})
+
 		default:
 			return nil, fmt.Errorf("unsupported operation: %T", op.Request)
 		}
@@ -465,8 +474,29 @@ func (m *MemoryStorage) Get(ctx context.Context, req *etcdserverpb.RangeRequest)
 
 // Delete removes a key from the storage.
 func (m *MemoryStorage) Delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	txn := &etcdserverpb.TxnRequest{
+		Success: []*etcdserverpb.RequestOp{
+			{Request: &etcdserverpb.RequestOp_RequestDeleteRange{RequestDeleteRange: req}},
+		},
+	}
+
+	txnResp, err := m.Txn(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+
+	deleteResp := txnResp.Responses[0].GetResponseDeleteRange()
+	if deleteResp == nil {
+		return nil, fmt.Errorf("expected delete response, got %T", txnResp.Responses[0].Response)
+	}
+	// TODO: Are the headers set in the individual responses?
+	deleteResp.Header = txnResp.Header
+
+	return deleteResp, nil
+}
+
+func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
+	m := t.storage
 
 	if req.RangeEnd != nil {
 		return nil, fmt.Errorf("range end is not yet supported by Delete")
@@ -544,15 +574,10 @@ func (m *MemoryStorage) Delete(ctx context.Context, req *etcdserverpb.DeleteRang
 
 	key := req.Key
 
-	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current revision: %w", err)
-	}
-
-	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+	latestRevision, exists := m.revisions.GetLatestRevisionByKey(key, t.snapshotTimestamp)
 	if !exists {
 		resp := &etcdserverpb.DeleteRangeResponse{
-			Header:  createHeader(snapshotTimestamp),
+			Header:  createHeader(t.snapshotTimestamp),
 			Deleted: 0,
 		}
 
@@ -565,20 +590,15 @@ func (m *MemoryStorage) Delete(ctx context.Context, req *etcdserverpb.DeleteRang
 	}
 
 	// Append to the persistence log first
-	newLogRecord, ok, err := m.log.Append(ctx, snapshotTimestamp, &persistence.LogRecord{
-		Revision:  Revision(snapshotTimestamp + 1),
+	newLogRecord := &persistence.LogRecord{
+		Revision:  Revision(t.snapshotTimestamp + 1),
 		Operation: mvccpb.DELETE,
 		Key:       key,
 		Value:     nil,
-	})
-	if err != nil || !ok {
-		return nil, fmt.Errorf("failed to append to log: %w", err)
 	}
-
-	m.revisions.AddRevision(key, newLogRecord.Revision)
+	t.logRecords = append(t.logRecords, newLogRecord)
 
 	resp := &etcdserverpb.DeleteRangeResponse{
-		Header:  createHeader(newLogRecord.Revision),
 		Deleted: 1,
 	}
 
@@ -610,7 +630,7 @@ func (m *MemoryStorage) Delete(ctx context.Context, req *etcdserverpb.DeleteRang
 		}
 	}
 
-	m.broadcastEvent(event, newLogRecord.Revision)
+	t.events = append(t.events, event)
 
 	return resp, nil
 }
