@@ -34,6 +34,8 @@ type Watcher interface {
 	Chan() <-chan *WatchResponse
 	// Close closes the watcher
 	Close()
+	// ID returns the ID of the watcher
+	ID() int64
 }
 
 // Storage is the interface for the underlying storage layer.
@@ -53,13 +55,16 @@ type Storage interface {
 	// Watch creates a watcher for the given key/range starting from the specified revision
 	// If rangeEnd is empty, it watches a single key.
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
-	Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error)
+	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest) (Watcher, error)
 
 	// Txn executes a transaction against the storage.
 	Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error)
 
 	// GracefulStop stops the storage gracefully.
 	GracefulStop()
+
+	// Status returns the status of the storage.
+	Status(ctx context.Context) (*etcdserverpb.StatusResponse, error)
 }
 
 type KeyValue = mvccpb.KeyValue

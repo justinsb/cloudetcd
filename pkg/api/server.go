@@ -221,11 +221,10 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	defer cancel()
 
 	ws := &watchStream{
-		server:      s,
-		stream:      stream,
-		watches:     make(map[int64]*activeWatch),
-		nextWatchID: 1,
-		cancel:      cancel,
+		server:  s,
+		stream:  stream,
+		watches: make(map[int64]*activeWatch),
+		cancel:  cancel,
 	}
 
 	s.mu.Lock()
@@ -236,7 +235,9 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 	// Start goroutine to handle incoming requests
 	go func() {
-		ws.handleRequests(ctx)
+		if err := ws.handleRequests(ctx); err != nil {
+			log.Error(err, "failed to handle watch requests")
+		}
 		cancel()
 	}()
 
@@ -254,20 +255,22 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 }
 
 // handleRequests processes incoming watch requests
-func (ws *watchStream) handleRequests(ctx context.Context) {
+func (ws *watchStream) handleRequests(ctx context.Context) error {
 	log := klog.FromContext(ctx)
 
 	for {
 		req, err := ws.stream.Recv()
 		if err != nil {
-			return
+			return err
 		}
 
 		log.Info("grpc watch request", "request", req)
 
 		switch r := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
-			ws.handleCreateRequest(ctx, r.CreateRequest)
+			if err := ws.handleCreateRequest(ctx, r.CreateRequest); err != nil {
+				return err
+			}
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			ws.handleCancelRequest(r.CancelRequest)
 		case *etcdserverpb.WatchRequest_ProgressRequest:
@@ -277,44 +280,58 @@ func (ws *watchStream) handleRequests(ctx context.Context) {
 }
 
 // handleCreateRequest handles watch creation
-func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverpb.WatchCreateRequest) {
+func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverpb.WatchCreateRequest) error {
 	// log := klog.FromContext(ctx)
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	watchID := ws.nextWatchID
-	ws.nextWatchID++
-
 	// Determine if this is a range watch (when RangeEnd is specified)
 	isRangeWatch := len(req.RangeEnd) > 0
 
+	watchID := req.WatchId
+	if watchID == 0 {
+		for {
+			watchID = ws.nextWatchID
+			ws.nextWatchID++
+			if ws.watches[watchID] == nil {
+				req.WatchId = watchID
+				break
+			}
+		}
+	} else {
+		if _, exists := ws.watches[watchID]; exists {
+			// TODO: Or send error?
+			return fmt.Errorf("watch ID %d already in use", watchID)
+		}
+	}
+
+	// TODO: Assign req.StartRevision to the watch?
+
 	// Create storage watcher
-	startRevision := storage.Revision(req.StartRevision)
-	watcher, err := ws.server.storage.Watch(ctx, req.Key, req.RangeEnd, startRevision)
+	watch, err := ws.server.storage.Watch(ctx, req)
 	if err != nil {
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
-			Header:   ws.server.createHeader(0),
-			WatchId:  watchID,
+			Header: ws.server.createHeader(0),
+			// WatchId:  watch.ID(),
 			Created:  false,
 			Canceled: true,
 		}
 		ws.stream.Send(resp)
-		return
+		return err
 	}
 
 	// Create active watch
 	activeWatch := &activeWatch{
 		id:       watchID,
-		watcher:  watcher,
+		watcher:  watch,
 		key:      req.Key,
 		rangeEnd: req.RangeEnd, // Store the range end
 		prefix:   isRangeWatch, // Reuse the prefix field to indicate range watch
 		prevKv:   req.PrevKv,
 		filters:  req.Filters,
 	}
-
 	ws.watches[watchID] = activeWatch
 
 	// Send creation response
@@ -327,6 +344,8 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 
 	// Start watching for events
 	go ws.watchEvents(ctx, activeWatch)
+
+	return nil
 }
 
 // handleCancelRequest handles watch cancellation
@@ -397,6 +416,8 @@ func (ws *watchStream) watchEvents(ctx context.Context, watch *activeWatch) {
 				WatchId: watch.id,
 				Events:  events,
 			}
+
+			klog.Infof("sending watch response %v to watcher %v", resp, watch)
 
 			if err := ws.stream.Send(resp); err != nil {
 				return

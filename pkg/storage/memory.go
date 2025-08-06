@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -13,32 +12,6 @@ import (
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"k8s.io/klog/v2"
 )
-
-// memoryWatcher implements the Watcher interface
-type memoryWatcher struct {
-	id            int64
-	key           []byte
-	rangeEnd      []byte // Store the range end for proper filtering
-	startRevision Revision
-	ch            chan *WatchResponse
-	closed        int32 // atomic flag
-	closeCh       chan struct{}
-}
-
-func (w *memoryWatcher) Chan() <-chan *WatchResponse {
-	return w.ch
-}
-
-func (w *memoryWatcher) Close() {
-	if atomic.CompareAndSwapInt32(&w.closed, 0, 1) {
-		close(w.closeCh)
-		close(w.ch)
-	}
-}
-
-func (w *memoryWatcher) isClosed() bool {
-	return atomic.LoadInt32(&w.closed) == 1
-}
 
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
@@ -48,9 +21,8 @@ type MemoryStorage struct {
 
 	log persistence.Log // Persistence log
 
-	watcherMu     sync.RWMutex
-	watchers      map[int64]*memoryWatcher
-	nextWatcherID int64
+	watcherMu sync.RWMutex
+	watchers  map[int64]*memoryWatcher
 }
 
 var _ Storage = &MemoryStorage{}
@@ -59,9 +31,8 @@ var _ Storage = &MemoryStorage{}
 // It returns an error if it cannot replay the log to restore the storage state.
 func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	ms := &MemoryStorage{
-		watchers:      make(map[int64]*memoryWatcher),
-		nextWatcherID: 1,
-		log:           log,
+		watchers: make(map[int64]*memoryWatcher),
+		log:      log,
 	}
 
 	// Replay the log to restore state
@@ -120,58 +91,6 @@ func logEntryToKeyValue(r *persistence.LogRecord) *mvccpb.KeyValue {
 		ModRevision:    int64(r.Revision),
 		Version:        r.Version,
 		Lease:          0, // For now, no lease
-	}
-}
-
-// broadcastEvent sends an event to all relevant watchers
-func (m *MemoryStorage) broadcastEvent(event *mvccpb.Event, revision Revision) {
-	m.watcherMu.RLock()
-	defer m.watcherMu.RUnlock()
-
-	for _, watcher := range m.watchers {
-		if watcher.isClosed() {
-			continue
-		}
-
-		// Check if this watcher should receive this event
-		shouldNotify := false
-		if len(watcher.rangeEnd) == 0 {
-			// Empty rangeEnd means prefix watch or exact key match
-			// If the key is the same as the watcher key, it's an exact match
-			// Otherwise, it's a prefix match
-			if string(event.Kv.Key) == string(watcher.key) {
-				shouldNotify = true
-			} else if len(watcher.key) > 0 {
-				// Prefix match: check if event key starts with watcher key
-				eventKey := string(event.Kv.Key)
-				watcherKey := string(watcher.key)
-				if len(eventKey) >= len(watcherKey) && eventKey[:len(watcherKey)] == watcherKey {
-					shouldNotify = true
-				}
-			}
-		} else {
-			// Range match: check if event key is in range [key, rangeEnd)
-			eventKey := string(event.Kv.Key)
-			startKey := string(watcher.key)
-			endKey := string(watcher.rangeEnd)
-			shouldNotify = eventKey >= startKey && eventKey < endKey
-		}
-
-		if shouldNotify && revision >= watcher.startRevision {
-			response := &WatchResponse{
-				Events:   []*mvccpb.Event{event},
-				Revision: revision,
-			}
-
-			// Non-blocking send
-			select {
-			case watcher.ch <- response:
-			case <-watcher.closeCh:
-				// Watcher was closed, skip
-			default:
-				// Channel is full, skip to avoid blocking
-			}
-		}
 	}
 }
 
@@ -294,14 +213,21 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 
 	resp.Header.Revision = int64(newLogRecord.Revision)
 	// TODO: Do individual responses have headers?
-	// 	for _, response := range resp.Responses {
-	// 	switch response := response.Response.(type) {
-	// 	case *etcdserverpb.ResponseOp_ResponsePut:
-	// 		response.ResponsePut.Header.Revision = int64(newLogRecord.Revision)
-	// 	default:
-	// 		return fmt.Errorf("unsupported response type: %T", response)
-	// 	}
-	// }
+	for _, response := range resp.Responses {
+		switch response := response.Response.(type) {
+		case *etcdserverpb.ResponseOp_ResponsePut:
+			response.ResponsePut.Header = resp.Header
+
+		case *etcdserverpb.ResponseOp_ResponseDeleteRange:
+			response.ResponseDeleteRange.Header = resp.Header
+
+		case *etcdserverpb.ResponseOp_ResponseRange:
+			response.ResponseRange.Header = resp.Header
+
+		default:
+			return fmt.Errorf("unsupported response type: %T", response)
+		}
+	}
 
 	return nil
 }
@@ -352,6 +278,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			switch cond.GetResult() {
 			case etcdserverpb.Compare_EQUAL:
 				if modRevision != Revision(targetValue.ModRevision) {
+					klog.Infof("condition failed: modRevision %d != targetValue %d", modRevision, targetValue.ModRevision)
 					conditionsFailed = true
 					break
 				}
@@ -733,40 +660,6 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 	return resp, nil
 }
 
-// Watch creates a watcher for the given key/range starting from the specified revision
-// If rangeEnd is empty, it watches a single key.
-// If rangeEnd is specified, it watches the range [key, rangeEnd).
-func (m *MemoryStorage) Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error) {
-	m.watcherMu.Lock()
-	defer m.watcherMu.Unlock()
-
-	watcherID := m.nextWatcherID
-	m.nextWatcherID++
-	watcher := &memoryWatcher{
-		id:            watcherID,
-		key:           key,
-		rangeEnd:      rangeEnd,
-		startRevision: startRevision,
-		ch:            make(chan *WatchResponse, 100), // Buffered channel
-		closeCh:       make(chan struct{}),
-	}
-
-	m.watchers[watcher.id] = watcher
-
-	// Start a goroutine to clean up the watcher when the context is done
-	go func() {
-		select {
-		case <-ctx.Done():
-			watcher.Close()
-			m.removeWatcher(watcher.id)
-		case <-watcher.closeCh:
-			m.removeWatcher(watcher.id)
-		}
-	}()
-
-	return watcher, nil
-}
-
 // removeWatcher removes a watcher from the storage
 func (m *MemoryStorage) removeWatcher(id int64) {
 	m.watcherMu.Lock()
@@ -811,4 +704,17 @@ func (m *MemoryStorage) GracefulStop() {
 		klog.InfoS("closing watcher", "id", watcher.id)
 		watcher.Close()
 	}
+}
+
+func (m *MemoryStorage) Status(ctx context.Context) (*etcdserverpb.StatusResponse, error) {
+	revision, err := m.log.GetCurrentRevision(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &etcdserverpb.StatusResponse{
+		Header: createHeader(revision),
+		// Version: "3.5.0",
+		// DbSize:  0,
+	}, nil
 }

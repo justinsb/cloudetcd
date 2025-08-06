@@ -14,7 +14,8 @@ import (
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
-const maxKeys = 32
+// TODO: Reduce and support splitting
+const maxKeys = 256
 
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
@@ -257,8 +258,10 @@ func (n *node) listRevisionsByKeyRange(fromPrefixRemaining []byte, atRevision Re
 			}
 		}
 		if e.child != nil {
-			if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
-				return false
+			if bytes.HasPrefix(fromPrefixRemaining, e.prefix) {
+				if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
+					return false
+				}
 			}
 		}
 	}
