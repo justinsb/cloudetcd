@@ -56,6 +56,9 @@ type Storage interface {
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
 	Watch(ctx context.Context, key []byte, rangeEnd []byte, startRevision Revision) (Watcher, error)
 
+	// Txn executes a transaction against the storage.
+	Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error)
+
 	// GracefulStop stops the storage gracefully.
 	GracefulStop()
 }

@@ -188,63 +188,7 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 
 	log.Info("grpc request: Txn", "request", req)
 
-	// For now, implement a simple transaction that just executes the success operations
-	// In a full implementation, we'd need to evaluate the compare operations
-
-	var revision storage.Revision
-	var responses []*etcdserverpb.ResponseOp
-
-	for _, op := range req.Success {
-		switch op.Request.(type) {
-		case *etcdserverpb.RequestOp_RequestRange:
-			resp, err := s.Range(ctx, op.GetRequestRange())
-			if err != nil {
-				return nil, err
-			}
-			responses = append(responses, &etcdserverpb.ResponseOp{
-				Response: &etcdserverpb.ResponseOp_ResponseRange{
-					ResponseRange: resp,
-				},
-			})
-			if storage.Revision(resp.Header.Revision) > revision {
-				revision = storage.Revision(resp.Header.Revision)
-			}
-
-		case *etcdserverpb.RequestOp_RequestPut:
-			resp, err := s.Put(ctx, op.GetRequestPut())
-			if err != nil {
-				return nil, err
-			}
-			responses = append(responses, &etcdserverpb.ResponseOp{
-				Response: &etcdserverpb.ResponseOp_ResponsePut{
-					ResponsePut: resp,
-				},
-			})
-			if storage.Revision(resp.Header.Revision) > revision {
-				revision = storage.Revision(resp.Header.Revision)
-			}
-
-		case *etcdserverpb.RequestOp_RequestDeleteRange:
-			resp, err := s.DeleteRange(ctx, op.GetRequestDeleteRange())
-			if err != nil {
-				return nil, err
-			}
-			responses = append(responses, &etcdserverpb.ResponseOp{
-				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{
-					ResponseDeleteRange: resp,
-				},
-			})
-			if storage.Revision(resp.Header.Revision) > revision {
-				revision = storage.Revision(resp.Header.Revision)
-			}
-		}
-	}
-
-	return &etcdserverpb.TxnResponse{
-		Header:    s.createHeader(revision),
-		Succeeded: true, // For now, always succeed
-		Responses: responses,
-	}, nil
+	return s.storage.Txn(ctx, req)
 }
 
 // Compact implements the Compact RPC method
@@ -489,10 +433,12 @@ func (ws *watchStream) cleanup(closeGRPC bool) {
 }
 
 // Grant implements the Grant RPC method
-func (s *Server) Grant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
+func (s *Server) LeaseGrant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
 	log := klog.FromContext(ctx)
 
 	log.Info("grpc request: LeaseGrant", "request", req)
+
+	// TODO
 
 	// For now, return a simple lease grant
 	// In a full implementation, we'd need to implement actual lease management

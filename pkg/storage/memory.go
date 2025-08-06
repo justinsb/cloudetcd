@@ -177,9 +177,28 @@ func (m *MemoryStorage) broadcastEvent(event *mvccpb.Event, revision Revision) {
 
 // Put writes a key-value pair to the storage.
 func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	txn := &etcdserverpb.TxnRequest{
+		Success: []*etcdserverpb.RequestOp{
+			{Request: &etcdserverpb.RequestOp_RequestPut{RequestPut: req}},
+		},
+	}
 
+	txnResp, err := m.Txn(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+
+	putResp := txnResp.Responses[0].GetResponsePut()
+	if putResp == nil {
+		return nil, fmt.Errorf("expected put response, got %T", txnResp.Responses[0].Response)
+	}
+	// TODO: Are the headers set in the individual responses?
+	putResp.Header = txnResp.Header
+
+	return putResp, nil
+}
+
+func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
 	key := req.GetKey()
 	value := req.GetValue()
 
@@ -187,15 +206,10 @@ func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (
 		return nil, fmt.Errorf("lease is not supported")
 	}
 
-	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current revision: %w", err)
-	}
-
-	existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+	existingRevision, hasExisting := t.storage.revisions.GetLatestRevisionByKey(key, t.snapshotTimestamp)
 
 	logRecord := &persistence.LogRecord{
-		Revision:  Revision(snapshotTimestamp + 1),
+		Revision:  Revision(t.snapshotTimestamp + 1),
 		Operation: mvccpb.PUT,
 		Key:       key,
 		Value:     value,
@@ -203,7 +217,7 @@ func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (
 
 	var prevKv *KeyValue
 	if hasExisting {
-		logEntry := m.log.GetLogEntry(existingRevision)
+		logEntry := t.storage.log.GetLogEntry(existingRevision)
 		if logEntry == nil {
 			klog.Fatalf("log entry not found for revision %d", existingRevision)
 		}
@@ -215,15 +229,9 @@ func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (
 		logRecord.Version = 1
 	}
 
-	// Let's see if we can commit this transaction without conflicts
-	newLogRecord, ok, err := m.log.Append(ctx, snapshotTimestamp, logRecord)
-	if err != nil || !ok {
-		return nil, fmt.Errorf("failed to append to log: %w", err)
-	}
+	t.logRecords = append(t.logRecords, logRecord)
 
-	kv := logEntryToKeyValue(newLogRecord)
-
-	m.revisions.AddRevision(kv.Key, newLogRecord.Revision)
+	kv := logEntryToKeyValue(logRecord)
 
 	// Create and broadcast watch event
 	event := &mvccpb.Event{
@@ -233,17 +241,168 @@ func (m *MemoryStorage) Put(ctx context.Context, req *etcdserverpb.PutRequest) (
 	if prevKv != nil {
 		event.PrevKv = prevKv
 	}
+	t.events = append(t.events, event)
 
-	m.broadcastEvent(event, newLogRecord.Revision)
-
-	response := &etcdserverpb.PutResponse{
-		Header: createHeader(newLogRecord.Revision),
-	}
+	// TODO: Do individual responses have headers?
+	response := &etcdserverpb.PutResponse{}
 	if req.PrevKv {
 		response.PrevKv = prevKv
 	}
 
 	return response, nil
+}
+
+func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error {
+	// Let's see if we can commit this transaction without conflicts
+	if len(t.logRecords) == 0 {
+		return nil
+	}
+
+	if len(t.logRecords) != 1 {
+		return fmt.Errorf("expected 1 log record, got %d", len(t.logRecords))
+	}
+
+	logRecord := t.logRecords[0]
+
+	newLogRecord, ok, err := t.storage.log.Append(ctx, t.snapshotTimestamp, logRecord)
+	if err != nil || !ok {
+		return fmt.Errorf("failed to append to log: %w", err)
+	}
+
+	// TODO: Can we reuse replay?
+
+	// Replay each record in order
+	for _, record := range t.logRecords {
+		switch record.Operation {
+		case mvccpb.PUT:
+			// Replay PUT operation
+			t.storage.revisions.AddRevision(record.Key, record.Revision)
+
+		case mvccpb.DELETE:
+			// Replay DELETE operation
+			t.storage.revisions.AddRevision(record.Key, record.Revision)
+
+		default:
+			// Skip unknown operations
+			klog.Fatalf("unknown operation: %s", record.Operation)
+		}
+	}
+
+	for _, event := range t.events {
+		t.storage.broadcastEvent(event, newLogRecord.Revision)
+	}
+
+	resp.Header.Revision = int64(newLogRecord.Revision)
+	// TODO: Do individual responses have headers?
+	// 	for _, response := range resp.Responses {
+	// 	switch response := response.Response.(type) {
+	// 	case *etcdserverpb.ResponseOp_ResponsePut:
+	// 		response.ResponsePut.Header.Revision = int64(newLogRecord.Revision)
+	// 	default:
+	// 		return fmt.Errorf("unsupported response type: %T", response)
+	// 	}
+	// }
+
+	return nil
+}
+
+// Txn executes a transaction against the storage.
+func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current revision: %w", err)
+	}
+
+	txn := &txn{
+		snapshotTimestamp: snapshotTimestamp,
+		storage:           m,
+	}
+
+	conditionsFailed := false
+	for _, cond := range req.Compare {
+		key := cond.GetKey()
+
+		existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+
+		var logEntry *persistence.LogRecord
+		if hasExisting {
+			logEntry = m.log.GetLogEntry(existingRevision)
+			if logEntry == nil {
+				klog.Fatalf("log entry not found for revision %d", existingRevision)
+			}
+		}
+
+		switch cond.GetTarget() {
+		case etcdserverpb.Compare_MOD:
+			modRevision := Revision(0)
+			if logEntry == nil || logEntry.Operation == mvccpb.DELETE {
+				modRevision = Revision(0)
+			} else {
+				modRevision = logEntry.Revision
+			}
+
+			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_ModRevision)
+			if !ok {
+				return nil, fmt.Errorf("unsupported compare target: %T", cond.GetTargetUnion())
+			}
+
+			switch cond.GetResult() {
+			case etcdserverpb.Compare_EQUAL:
+				if modRevision != Revision(targetValue.ModRevision) {
+					conditionsFailed = true
+					break
+				}
+
+			default:
+				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+			}
+
+		default:
+			return nil, fmt.Errorf("unsupported compare target: %s", cond.GetTarget())
+		}
+	}
+
+	resp := &etcdserverpb.TxnResponse{
+		Header:    createHeader(snapshotTimestamp),
+		Succeeded: !conditionsFailed,
+	}
+
+	operations := req.Success
+	if conditionsFailed {
+		operations = req.Failure
+	}
+
+	for _, op := range operations {
+		switch op.Request.(type) {
+		case *etcdserverpb.RequestOp_RequestPut:
+			putResp, err := txn.put(ctx, op.GetRequestPut())
+			if err != nil {
+				return nil, err
+			}
+			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: putResp},
+			})
+
+		default:
+			return nil, fmt.Errorf("unsupported operation: %T", op.Request)
+		}
+	}
+
+	if err := txn.commit(ctx, resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+type txn struct {
+	snapshotTimestamp Revision
+	logRecords        []*persistence.LogRecord
+	storage           *MemoryStorage
+	events            []*mvccpb.Event
 }
 
 // Get retrieves a key-value pair from the storage.
