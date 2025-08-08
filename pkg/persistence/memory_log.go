@@ -13,6 +13,8 @@ type MemoryLog struct {
 	mu           sync.RWMutex
 	records      map[Revision]*LogRecord
 	lastRevision uint64 // Atomic counter for revision numbers
+
+	listener LogListener
 }
 
 var _ Log = &MemoryLog{}
@@ -43,6 +45,10 @@ func (m *MemoryLog) Append(ctx context.Context, conditionPosition Revision, logR
 	revision := Revision(m.lastRevision)
 
 	m.records[revision] = logRecord
+
+	if m.listener != nil {
+		m.listener.OnLogEntry(revision)
+	}
 
 	return revision, true, nil
 }
@@ -88,4 +94,11 @@ func (m *MemoryLog) GetLogEntry(revision Revision) *LogRecord {
 	}
 
 	return record
+}
+
+// SetListener sets the log listener
+func (m *MemoryLog) SetListener(listener LogListener) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listener = listener
 }

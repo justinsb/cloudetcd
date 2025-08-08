@@ -18,6 +18,7 @@ type FilesystemLog struct {
 	mu       sync.RWMutex
 	dir      string
 	revision Revision // Current revision number
+	listener LogListener
 }
 
 var _ Log = &FilesystemLog{}
@@ -102,6 +103,10 @@ func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, 
 	// Write to file atomically
 	if err := os.WriteFile(filepath, data, 0644); err != nil {
 		return 0, false, fmt.Errorf("failed to write log file: %w", err)
+	}
+
+	if f.listener != nil {
+		f.listener.OnLogEntry(newRevision)
 	}
 
 	return newRevision, true, nil
@@ -194,6 +199,13 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 func (f *FilesystemLog) Close() error {
 	// For filesystem implementation, there's nothing to clean up
 	return nil
+}
+
+// SetListener sets the log listener
+func (f *FilesystemLog) SetListener(listener LogListener) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listener = listener
 }
 
 // revisionToFilename converts a revision number to a filename

@@ -77,7 +77,7 @@ func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreate
 	// 	}
 	// }
 
-	m.watchers[watcherID] = w
+	m.watchers = append(m.watchers, w)
 
 	// // Start a goroutine to clean up the watcher when the context is done
 	// go func() {
@@ -127,19 +127,6 @@ func (w *memoryWatcher) Close() {
 	w.stateCond.Broadcast()
 }
 
-// broadcastLogPosition notifies all watchers that the log has advanced
-func (m *MemoryStorage) broadcastLogPosition(logPosition Revision) {
-	m.watcherMu.RLock()
-	defer m.watcherMu.RUnlock()
-
-	for _, w := range m.watchers {
-		w.stateMutex.Lock()
-		w.logPosition = logPosition
-		w.stateCond.Broadcast()
-		w.stateMutex.Unlock()
-	}
-}
-
 // Run is the main goroutine for the watcher.
 func (w *memoryWatcher) Run(ctx context.Context) error {
 	log := klog.FromContext(ctx)
@@ -148,10 +135,12 @@ func (w *memoryWatcher) Run(ctx context.Context) error {
 		w.stateMutex.Lock()
 		for w.logPosition <= w.watchDoneRevision {
 			if err := ctx.Err(); err != nil {
+				log.Error(err, "context error in watcher", "watcher.id", w.id)
 				w.stateMutex.Unlock()
 				return err
 			}
 			if w.closed {
+				log.Info("watcher closed", "watcher.id", w.id)
 				w.stateMutex.Unlock()
 				return nil
 			}
@@ -167,7 +156,7 @@ func (w *memoryWatcher) Run(ctx context.Context) error {
 
 			nextRevision := w.watchDoneRevision + 1
 			if err := w.send(ctx, nextRevision); err != nil {
-				log.Error(err, "failed to send event in watcher", "watchPosition", nextRevision)
+				log.Error(err, "failed to send event in watcher", "watcher.id", w.id, "watchPosition", nextRevision)
 				return err
 			}
 			w.watchDoneRevision = nextRevision
@@ -176,6 +165,8 @@ func (w *memoryWatcher) Run(ctx context.Context) error {
 }
 
 func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
+	// log := klog.FromContext(ctx)
+
 	// Check if this watcher should receive this event
 
 	events, err := w.storage.getWatchEvent(pos)
@@ -223,6 +214,7 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 		}
 
 		if !shouldSend {
+			// log.Info("key does not match", "key", string(event.Kv.Key), "rangeEnd", string(w.req.GetRangeEnd()), "rangeType", w.rangeType, "rangeStart", string(w.req.GetKey()))
 			continue
 		}
 
@@ -232,6 +224,8 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 	if len(sendEvents) == 0 {
 		return nil
 	}
+
+	// log.Info("sending events for watcher", "watcher.key", w.req.GetKey(), "watcher.rangeEnd", w.req.GetRangeEnd(), "watcher.filters", w.req.GetFilters(), "watcher.prevKv", w.req.PrevKv, "watcher.id", w.id, "events", sendEvents)
 
 	if !w.req.PrevKv {
 		sendEventsWithoutPrevKv := make([]*mvccpb.Event, 0, len(sendEvents))
@@ -252,7 +246,7 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 		Events:  sendEvents,
 	}
 
-	klog.Infof("broadcasting event %v to watcher %d", resp, w.id)
+	// klog.Infof("broadcasting event %v to watcher %d", resp, w.id)
 	if err := w.callback(resp); err != nil {
 		return err
 	}

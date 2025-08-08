@@ -22,7 +22,7 @@ type MemoryStorage struct {
 	log persistence.Log // Persistence log
 
 	watcherMu sync.RWMutex
-	watchers  map[int64]*memoryWatcher
+	watchers  []*memoryWatcher
 }
 
 var _ Storage = &MemoryStorage{}
@@ -31,9 +31,10 @@ var _ Storage = &MemoryStorage{}
 // It returns an error if it cannot replay the log to restore the storage state.
 func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	ms := &MemoryStorage{
-		watchers: make(map[int64]*memoryWatcher),
-		log:      log,
+		log: log,
 	}
+
+	log.SetListener(ms)
 
 	// Replay the log to restore state
 	if err := ms.ReplayLog(context.Background()); err != nil {
@@ -197,7 +198,7 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error {
 	log := klog.FromContext(ctx)
 
-	log.Info("committing transaction", "events", t.logEvents)
+	log.Info("committing transaction", "events", &etcdserverpb.WatchResponse{Events: t.logEvents})
 
 	// Let's see if we can commit this transaction without conflicts
 	if len(t.logEvents) == 0 {
@@ -236,9 +237,6 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 			klog.Fatalf("unknown operation: %s", event.Type)
 		}
 	}
-
-	log.Info("broadcasting log position", "newLogRevision", newLogRevision)
-	t.storage.broadcastLogPosition(newLogRevision)
 
 	resp.Header.Revision = int64(newLogRevision)
 	// TODO: Do individual responses have headers?
@@ -441,10 +439,6 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 		return nil, fmt.Errorf("count only is not supported by Get")
 	}
 
-	if req.Limit != 0 {
-		return nil, fmt.Errorf("limit is not supported by Get")
-	}
-
 	resp := &etcdserverpb.RangeResponse{
 		Header: createHeader(snapshotTimestamp),
 		Count:  0,
@@ -467,8 +461,20 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 
 	switch event.Type {
 	case mvccpb.PUT:
-		resp.Kvs = []*mvccpb.KeyValue{event.Kv}
+		if req.CountOnly {
+			resp.Count = 1
+			return resp, nil
+		}
+
+		kv := event.Kv
+		if req.KeysOnly {
+			kv = copyWithoutValue(kv)
+		}
+		resp.Kvs = []*mvccpb.KeyValue{kv}
 		resp.Count = 1
+		if req.Limit == 1 {
+			resp.More = true
+		}
 		return resp, nil
 
 	case mvccpb.DELETE:
@@ -716,7 +722,7 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 						resp.Count++
 					} else if req.KeysOnly {
 						resp.Count++
-						resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: event.Kv.Key, CreateRevision: event.Kv.CreateRevision, ModRevision: event.Kv.ModRevision, Version: event.Kv.Version, Lease: event.Kv.Lease})
+						resp.Kvs = append(resp.Kvs, copyWithoutValue(event.Kv))
 					} else {
 						resp.Count++
 						resp.Kvs = append(resp.Kvs, event.Kv)
@@ -736,12 +742,22 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 	return resp, nil
 }
 
-// removeWatcher removes a watcher from the storage
-func (m *MemoryStorage) removeWatcher(id int64) {
-	m.watcherMu.Lock()
-	defer m.watcherMu.Unlock()
-	delete(m.watchers, id)
+func copyWithoutValue(kv *mvccpb.KeyValue) *mvccpb.KeyValue {
+	return &mvccpb.KeyValue{
+		Key:            kv.Key,
+		CreateRevision: kv.CreateRevision,
+		ModRevision:    kv.ModRevision,
+		Version:        kv.Version,
+		Lease:          kv.Lease,
+	}
 }
+
+// // removeWatcher removes a watcher from the storage
+// func (m *MemoryStorage) removeWatcher(id int64) {
+// 	m.watcherMu.Lock()
+// 	defer m.watcherMu.Unlock()
+// 	delete(m.watchers, id)
+// }
 
 // // GetCurrentRevision returns the current revision number
 // func (m *MemoryStorage) GetCurrentRevision() Revision {
@@ -793,4 +809,18 @@ func (m *MemoryStorage) Status(ctx context.Context) (*etcdserverpb.StatusRespons
 		// Version: "3.5.0",
 		// DbSize:  0,
 	}, nil
+}
+
+// OnLogEntry implements LogListener interface - called when a new log entry is added
+func (m *MemoryStorage) OnLogEntry(logPosition persistence.Revision) {
+	// Notify watchers about the new log entry
+	m.watcherMu.RLock()
+	defer m.watcherMu.RUnlock()
+
+	for _, w := range m.watchers {
+		w.stateMutex.Lock()
+		w.logPosition = logPosition
+		w.stateCond.Broadcast()
+		w.stateMutex.Unlock()
+	}
 }

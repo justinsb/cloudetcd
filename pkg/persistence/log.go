@@ -39,4 +39,13 @@ type Log interface {
 
 	// GetLogEntry returns the log entry for the given key and revision
 	GetLogEntry(revision Revision) *LogRecord
+
+	// SetListener sets the log listener
+	SetListener(listener LogListener)
+}
+
+// LogListener is the interface for the persistence log
+type LogListener interface {
+	// OnLogEntry is called when a new log entry is added
+	OnLogEntry(revision Revision)
 }
