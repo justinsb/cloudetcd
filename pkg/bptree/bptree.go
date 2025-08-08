@@ -9,13 +9,14 @@ package bptree
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
 // TODO: Reduce and support splitting
-const maxKeys = 256
+const maxKeys = 25600
 
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
@@ -25,6 +26,17 @@ type BPTree struct {
 }
 
 type Revision = persistence.Revision
+
+// Dump dumps the B+ tree to the console.
+func (t *BPTree) Dump() {
+	t.root.dump()
+}
+
+func (n *node) dump() {
+	for _, e := range n.entries {
+		fmt.Printf("prefix: %s, child: %v, revisions: %v\n", e.prefix, e.child != nil, e.revisions)
+	}
+}
 
 // // GetCurrentRevision returns the current revision of the B+ tree.
 // func (t *BPTree) GetCurrentRevision() Revision {
@@ -122,7 +134,7 @@ func (n *node) addRevision(remainingKey []byte, revision Revision) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
-	pos, match := n.findNextPageHoldingLock(remainingKey)
+	pos, match := n.findEntry(remainingKey)
 	if match {
 		e := &n.entries[pos]
 		if len(e.prefix) == len(remainingKey) {
@@ -151,7 +163,7 @@ func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision Revision) 
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
-	pos, match := n.findNextPageHoldingLock(remainingKey)
+	pos, match := n.findEntry(remainingKey)
 	if !match {
 		return 0, false
 	}
@@ -180,20 +192,20 @@ func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision Revision) 
 	return 0, false
 }
 
-// findSupremumHoldingLock finds the supremum of the given prefix.
-// The supremum is the smallest entry that is greater than or equal to the given prefix.
-func (n *node) findNextPageHoldingLock(prefixRemaining []byte) (int, bool) {
+// findEntry finds the index for the matching entry, or the insertion point if not found.
+func (n *node) findEntry(prefixRemaining []byte) (int, bool) {
 	i := 0
 
 	for ; i < len(n.entries); i++ {
 		e := &n.entries[i]
 
-		prefixLen := len(e.prefix)
-		if prefixLen > len(prefixRemaining) {
-			continue
+		if e.child != nil {
+			if bytes.HasPrefix(prefixRemaining, e.prefix) {
+				return i, true
+			}
 		}
-		cmp := bytes.Compare(e.prefix, prefixRemaining[:prefixLen])
 
+		cmp := bytes.Compare(e.prefix, prefixRemaining)
 		if cmp > 0 {
 			return i, false
 		}

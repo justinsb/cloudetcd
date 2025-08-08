@@ -221,15 +221,12 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 
 	// TODO: Can we reuse replay?
 
-	// Replay each record in order
 	for _, event := range logRecord.Events {
 		switch event.Type {
 		case mvccpb.PUT:
-			// Replay PUT operation
 			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
 
 		case mvccpb.DELETE:
-			// Replay DELETE operation
 			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
 
 		default:
@@ -286,11 +283,10 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			if logEntry == nil {
 				klog.Fatalf("log entry not found for revision %d", existingRevision)
 			}
-			prevEvent := findEvent(logEntry, key)
+			prevEvent = findEvent(logEntry, key)
 			if prevEvent == nil {
 				klog.Fatalf("prevKv not found for key %s", key)
 			}
-
 		}
 
 		switch cond.GetTarget() {
@@ -310,7 +306,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			switch cond.GetResult() {
 			case etcdserverpb.Compare_EQUAL:
 				if modRevision != Revision(targetValue.ModRevision) {
-					klog.Infof("condition failed: modRevision %d != targetValue %d", modRevision, targetValue.ModRevision)
+					// klog.Infof("condition failed: modRevision %d != targetValue %d (prevEvent: %v, snapshotTimestamp: %d)", modRevision, targetValue.ModRevision, prevEvent, snapshotTimestamp)
 					conditionsFailed = true
 					break
 				}
