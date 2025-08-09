@@ -35,7 +35,8 @@ var _ persistence.Log = &GCSLog{}
 
 // NewGCSLog creates a new Google Cloud Storage-backed log
 func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) {
-	client, err := storage.NewClient(ctx)
+	// client, err := storage.NewClient(ctx)
+	client, err := storage.NewGRPCClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS client: %w", err)
 	}
