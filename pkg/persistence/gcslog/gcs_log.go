@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
@@ -96,9 +96,7 @@ func (g *GCSLog) replay(ctx context.Context) error {
 
 	// Find the highest revision and preload all entries
 	if len(revisions) > 0 {
-		sort.Slice(revisions, func(i, j int) bool {
-			return revisions[i] < revisions[j]
-		})
+		slices.Sort(revisions)
 		g.revision = revisions[len(revisions)-1]
 
 		// Preload all entries in parallel for faster startup
@@ -281,9 +279,7 @@ func (g *GCSLog) Read(ctx context.Context, fromRevision Revision, callback func(
 	}
 
 	// Sort revisions in ascending order
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i] < matches[j]
-	})
+	slices.Sort(matches)
 
 	// Start parallel preloading of all entries
 	log.Info("Preloading log entries", "count", len(matches))

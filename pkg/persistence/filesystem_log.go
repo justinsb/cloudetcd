@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -68,9 +68,7 @@ func (f *FilesystemLog) replay() error {
 
 	// Find the highest revision
 	if len(revisions) > 0 {
-		sort.Slice(revisions, func(i, j int) bool {
-			return revisions[i] < revisions[j]
-		})
+		slices.Sort(revisions)
 		f.revision = revisions[len(revisions)-1]
 	}
 
@@ -178,9 +176,7 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 		matches = append(matches, revision)
 	}
 
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i] < matches[j]
-	})
+	slices.Sort(matches)
 
 	for _, revision := range matches {
 		record, err := f.getLogEntry(revision)
