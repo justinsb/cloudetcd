@@ -255,7 +255,10 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 }
 
 func (w *MemoryStorage) getWatchEvent(pos Revision) ([]*mvccpb.Event, error) {
-	logEntry := w.log.GetLogEntry(pos)
+	logEntry, err := w.log.GetLogEntry(pos)
+	if err != nil {
+		return nil, err
+	}
 	if logEntry == nil {
 		return nil, fmt.Errorf("log entry not found for position %d", pos)
 	}

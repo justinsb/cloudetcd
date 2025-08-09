@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -152,8 +153,8 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 
 	var prevKv *mvccpb.KeyValue
 	if hasExisting {
-		logEntry := t.storage.log.GetLogEntry(existingRevision)
-		if logEntry == nil {
+		logEntry, err := t.storage.log.GetLogEntry(existingRevision)
+		if logEntry == nil || err != nil {
 			klog.Fatalf("log entry not found for revision %d", existingRevision)
 		}
 		prevEvent := findEvent(logEntry, key)
@@ -279,8 +280,8 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 		var prevEvent *mvccpb.Event
 		if hasExisting {
-			logEntry := m.log.GetLogEntry(existingRevision)
-			if logEntry == nil {
+			logEntry, err := m.log.GetLogEntry(existingRevision)
+			if logEntry == nil || err != nil {
 				klog.Fatalf("log entry not found for revision %d", existingRevision)
 			}
 			prevEvent = findEvent(logEntry, key)
@@ -445,7 +446,10 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 		return resp, nil
 	}
 
-	logEntry := m.log.GetLogEntry(latestRevision)
+	logEntry, err := m.log.GetLogEntry(latestRevision)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get log entry: %w", err)
+	}
 	if logEntry == nil {
 		klog.Fatalf("log entry not found for revision %d", latestRevision)
 	}
@@ -602,8 +606,8 @@ func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) 
 		return resp, nil
 	}
 
-	oldLogEntry := m.log.GetLogEntry(latestRevision)
-	if oldLogEntry == nil {
+	oldLogEntry, err := m.log.GetLogEntry(latestRevision)
+	if oldLogEntry == nil || err != nil {
 		klog.Fatalf("log entry not found for revision %d", latestRevision)
 	}
 
@@ -688,6 +692,7 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 
 	hasRangeEnd := req.RangeEnd != nil && !bytes.Equal(req.RangeEnd, []byte{0})
 
+	var errs []error
 	m.revisions.ListRevisionsByKeyRange(req.Key, snapshotTimestamp, func(key []byte, revisions []Revision) bool {
 		if hasRangeEnd && bytes.Compare(key, req.RangeEnd) >= 0 {
 			// Stop iterating
@@ -708,7 +713,11 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 		if found {
 			// TODO: Can we store whether this is a delete, so we don't need a log lookup?
 
-			logEntry := m.log.GetLogEntry(latest)
+			logEntry, err := m.log.GetLogEntry(latest)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("failed to get log entry: %w", err))
+				return false
+			}
 			if logEntry == nil {
 				klog.Fatalf("log entry not found for revision %d", latest)
 			}
@@ -734,6 +743,10 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 
 		return true
 	})
+
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
 
 	return resp, nil
 }

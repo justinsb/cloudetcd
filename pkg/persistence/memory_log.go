@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -81,7 +82,7 @@ func (m *MemoryLog) Close() error {
 }
 
 // GetLogEntry returns the log entry for the given revision
-func (m *MemoryLog) GetLogEntry(revision Revision) *LogRecord {
+func (m *MemoryLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -90,10 +91,10 @@ func (m *MemoryLog) GetLogEntry(revision Revision) *LogRecord {
 		klog.Infof("m.records is +%v", m.records)
 		klog.Fatalf("log entry not found for revision %d", revision)
 
-		return nil
+		return nil, fmt.Errorf("log entry not found for revision %d", revision)
 	}
 
-	return record
+	return record, nil
 }
 
 // SetListener sets the log listener

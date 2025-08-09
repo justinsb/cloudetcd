@@ -120,25 +120,25 @@ func (f *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error
 }
 
 // GetLogEntry returns the log entry for the given revision
-func (f *FilesystemLog) GetLogEntry(revision Revision) *LogRecord {
+func (f *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.getLogEntry(revision)
 }
 
-func (f *FilesystemLog) getLogEntry(revision Revision) *LogRecord {
+func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
 	filename := revisionToFilename(revision)
 	filepath := filepath.Join(f.dir, filename)
 	data, err := os.ReadFile(filepath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to read log file: %w", err)
 	}
 
-	var record LogRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		return nil
+	record := &LogRecord{}
+	if err := json.Unmarshal(data, record); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal log record from file %s: %w", filepath, err)
 	}
-	return &record
+	return record, nil
 }
 
 // Read reads records from the log starting from the given revision
@@ -183,7 +183,10 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 	})
 
 	for _, revision := range matches {
-		record := f.getLogEntry(revision)
+		record, err := f.getLogEntry(revision)
+		if err != nil {
+			return fmt.Errorf("failed to get log entry for revision %d: %w", revision, err)
+		}
 		if record == nil {
 			return fmt.Errorf("log entry not found for revision %d", revision)
 		}

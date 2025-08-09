@@ -38,7 +38,7 @@ type Log interface {
 	Close() error
 
 	// GetLogEntry returns the log entry for the given key and revision
-	GetLogEntry(revision Revision) *LogRecord
+	GetLogEntry(revision Revision) (*LogRecord, error)
 
 	// SetListener sets the log listener
 	SetListener(listener LogListener)

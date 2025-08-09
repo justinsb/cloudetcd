@@ -10,7 +10,7 @@ import (
 	"syscall"
 
 	"justinsb.com/cloudetcd/pkg/api"
-	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/logfactory"
 	"justinsb.com/cloudetcd/pkg/storage"
 )
 
@@ -25,16 +25,23 @@ func run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Parse command line flags
-	var (
-		addr = flag.String("addr", ":2379", "Address to listen on")
-	)
+	// Parse command line flag
+	addr := ":2379"
+	logURI := "memory://"
+	flag.StringVar(&addr, "addr", addr, "Address to listen on")
+	flag.StringVar(&logURI, "log", logURI, "Log URI")
 	flag.Parse()
 
-	// Create storage instance
-	store, err := storage.NewMemoryStorage(persistence.NewMemoryLog())
+	// Create log
+	log, err := logfactory.NewLog(ctx, logURI)
 	if err != nil {
-		log.Fatalf("Failed to create storage: %v", err)
+		return fmt.Errorf("failed to create log: %w", err)
+	}
+
+	// Create storage instance
+	store, err := storage.NewMemoryStorage(log)
+	if err != nil {
+		return fmt.Errorf("failed to create storage: %w", err)
 	}
 
 	// Create and start the etcd API server
@@ -51,7 +58,7 @@ func run(ctx context.Context) error {
 	}()
 
 	// Start the server
-	if err := server.Start(ctx, *addr); err != nil {
+	if err := server.Start(ctx, addr); err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
