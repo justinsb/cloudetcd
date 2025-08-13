@@ -26,7 +26,8 @@ type LogRecord struct {
 type Log interface {
 	// Append adds a new record to the log and returns the revision number
 	// The bool indicates whether the append was successful, which is false if the condition position does not match the current revision.
-	Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (Revision, bool, error)
+	// The txnMeta parameter enables batch commits by allowing serializable transactions to be grouped together.
+	Append(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error)
 
 	// GetCurrentRevision returns the current revision number
 	GetCurrentRevision(ctx context.Context) (Revision, error)

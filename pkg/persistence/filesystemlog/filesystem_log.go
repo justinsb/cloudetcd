@@ -1,4 +1,4 @@
-package persistence
+package filesystemlog
 
 import (
 	"context"
@@ -11,17 +11,28 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/batch"
+	"k8s.io/klog/v2"
 )
+
+type Revision = persistence.Revision
+type LogRecord = persistence.LogRecord
+type LogListener = persistence.LogListener
+type TxnMeta = persistence.TxnMeta
 
 // FilesystemLog is a filesystem-backed implementation of the Log interface
 type FilesystemLog struct {
-	mu       sync.RWMutex
-	dir      string
-	revision Revision // Current revision number
-	listener LogListener
+	batching *batch.Batching
+
+	mu           sync.RWMutex
+	dir          string
+	lastRevision Revision
+	listener     LogListener
 }
 
-var _ Log = &FilesystemLog{}
+var _ persistence.Log = &FilesystemLog{}
 
 // NewFilesystemLog creates a new filesystem-backed log
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
@@ -38,6 +49,8 @@ func NewFilesystemLog(dir string) (*FilesystemLog, error) {
 	if err := log.replay(); err != nil {
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
+
+	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 
 	return log, nil
 }
@@ -69,52 +82,78 @@ func (f *FilesystemLog) replay() error {
 	// Find the highest revision
 	if len(revisions) > 0 {
 		slices.Sort(revisions)
-		f.revision = revisions[len(revisions)-1]
+		f.lastRevision = revisions[len(revisions)-1]
 	}
 
 	return nil
 }
 
 // Append adds a new record to the log and returns the revision number
-func (f *FilesystemLog) Append(ctx context.Context, conditionPosition Revision, logRecord *LogRecord) (Revision, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error) {
+	return f.batching.Add(ctx, logRecord, txnMeta)
+}
 
-	if conditionPosition != f.revision {
-		return 0, false, nil
+type persistedBatch struct {
+	Records []*persistence.LogRecord
+}
+
+// commitBatch commits all transactions in the current batch
+func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
+	// Check if all transactions have the same condition position
+	if len(batch.Transactions) == 0 {
+		return fmt.Errorf("batch contains no transactions")
 	}
 
-	// Increment revision number
-	f.revision++
-	newRevision := f.revision
+	// Execute the batch under the main lock
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lastLogPosition != l.lastRevision {
+		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
+	}
+
+	// Commit all transactions in the batch
+	startRevision := l.lastRevision + 1
 
 	// Create filename with hex-encoded revision
-	filename := revisionToFilename(f.revision)
-	filepath := filepath.Join(f.dir, filename)
+	filename := revisionToFilename(startRevision)
+	filepath := filepath.Join(l.dir, filename)
 
 	// Serialize record to JSON
-	data, err := json.Marshal(logRecord)
+	// TODO: Use proto for speed
+	data := &persistedBatch{
+		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+	}
+	for i, txn := range batch.Transactions {
+		data.Records[i] = txn.LogRecord
+	}
+	b, err := json.Marshal(data)
 	if err != nil {
-		return 0, false, fmt.Errorf("failed to marshal log record: %w", err)
+		return fmt.Errorf("failed to marshal log records: %w", err)
 	}
 
 	// Write to file atomically
-	if err := os.WriteFile(filepath, data, 0644); err != nil {
-		return 0, false, fmt.Errorf("failed to write log file: %w", err)
+	if err := os.WriteFile(filepath, b, 0644); err != nil {
+		return fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	if f.listener != nil {
-		f.listener.OnLogEntry(newRevision)
+	l.lastRevision += Revision(len(batch.Transactions))
+
+	if l.listener != nil {
+		l.listener.OnLogEntry(persistence.Revision(l.lastRevision))
 	}
 
-	return newRevision, true, nil
+	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
+		len(batch.Transactions), startRevision+1, l.lastRevision)
+
+	return nil
 }
 
 // GetCurrentRevision returns the current revision number
 func (f *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.revision, nil
+	return f.lastRevision, nil
 }
 
 // GetLogEntry returns the log entry for the given revision
@@ -132,21 +171,22 @@ func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
 		return nil, fmt.Errorf("failed to read log file: %w", err)
 	}
 
-	record := &LogRecord{}
+	record := &persistedBatch{}
 	if err := json.Unmarshal(data, record); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal log record from file %s: %w", filepath, err)
 	}
-	return record, nil
+
+	pos := 0 // TODO
+	if pos >= len(record.Records) {
+		return nil, fmt.Errorf("log entry not found in batch for revision %d", revision)
+	}
+	return record.Records[pos], nil
 }
 
 // Read reads records from the log starting from the given revision
 func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callback func(Revision, *LogRecord) bool) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-
-	if fromRevision < 0 {
-		return fmt.Errorf("invalid fromRevision: %d", fromRevision)
-	}
 
 	entries, err := os.ReadDir(f.dir)
 	if err != nil {

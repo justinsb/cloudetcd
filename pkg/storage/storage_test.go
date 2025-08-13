@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
-	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
 func getRevision(t *testing.T, resp *etcdserverpb.PutResponse) Revision {
@@ -22,7 +22,7 @@ func getRevision(t *testing.T, resp *etcdserverpb.PutResponse) Revision {
 }
 
 func TestMemoryStorage_Put(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestMemoryStorage_Put(t *testing.T) {
 }
 
 func TestMemoryStorage_Get(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestMemoryStorage_Get(t *testing.T) {
 }
 
 func TestMemoryStorage_Delete(t *testing.T) {
-	storage, storageErr := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, storageErr := NewMemoryStorage(memorylog.New())
 	if storageErr != nil {
 		t.Fatalf("Failed to create storage: %v", storageErr)
 	}
@@ -146,7 +146,7 @@ func TestMemoryStorage_Delete(t *testing.T) {
 }
 
 func TestMemoryStorage_List(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -229,7 +229,8 @@ func rangeEndForPrefix(t *testing.T, prefix []byte) []byte {
 }
 
 func TestMemoryStorage_RevisionOrdering(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	log := memorylog.New()
+	storage, err := NewMemoryStorage(log)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -273,7 +274,7 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 }
 
 func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -309,7 +310,7 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 }
 
 func TestMemoryStorage_MVCCBehavior(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -376,7 +377,7 @@ func assertNotFound(t *testing.T, resp *etcdserverpb.RangeResponse, err error) {
 }
 
 func TestMemoryStorage_RangeQueries(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -441,7 +442,7 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 }
 
 func TestMemoryStorage_Watch(t *testing.T) {
-	storage, err := NewMemoryStorage(persistence.NewMemoryLog())
+	storage, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}

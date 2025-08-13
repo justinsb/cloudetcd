@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/logtests"
 )
 
 func TestGCSLog(t *testing.T) {
@@ -26,75 +26,15 @@ func TestGCSLog(t *testing.T) {
 	prefix := "test-log-"
 
 	// Create GCS log
-	log, err := NewGCSLog(ctx, bucketName, prefix)
-	require.NoError(t, err)
-	defer log.Close()
-
-	// Test initial state
-	revision, err := log.GetCurrentRevision(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, Revision(0), revision)
-
-	// Test appending a record
-	record := &persistence.LogRecord{
-		Events: []*mvccpb.Event{
-			{
-				Type: mvccpb.PUT,
-				Kv: &mvccpb.KeyValue{
-					Key:   []byte("test-key"),
-					Value: []byte("test-value"),
-				},
-			},
-		},
+	logFactory := func(t *testing.T) persistence.Log {
+		log, err := NewGCSLog(ctx, bucketName, prefix)
+		if err != nil {
+			t.Fatalf("Failed to create GCS log: %v", err)
+		}
+		return log
 	}
 
-	newRevision, success, err := log.Append(ctx, 0, record)
-	require.NoError(t, err)
-	assert.True(t, success)
-	assert.Equal(t, Revision(1), newRevision)
-
-	// Test getting current revision
-	currentRevision, err := log.GetCurrentRevision(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, Revision(1), currentRevision)
-
-	// Test getting log entry
-	retrievedRecord, err := log.GetLogEntry(1)
-	require.NoError(t, err)
-	require.NotNil(t, retrievedRecord)
-	assert.Equal(t, len(record.Events), len(retrievedRecord.Events))
-	assert.Equal(t, record.Events[0].Type, retrievedRecord.Events[0].Type)
-	assert.Equal(t, record.Events[0].Kv.Key, retrievedRecord.Events[0].Kv.Key)
-	assert.Equal(t, record.Events[0].Kv.Value, retrievedRecord.Events[0].Kv.Value)
-
-	// Test conditional append with wrong condition
-	_, success, err = log.Append(ctx, 0, record) // Wrong condition position
-	require.NoError(t, err)
-	assert.False(t, success)
-
-	// Test conditional append with correct condition
-	newRevision2, success, err := log.Append(ctx, 1, record)
-	require.NoError(t, err)
-	assert.True(t, success)
-	assert.Equal(t, Revision(2), newRevision2)
-
-	// Test reading from log
-	var readRecords []Revision
-	err = log.Read(ctx, 1, func(revision Revision, record *persistence.LogRecord) bool {
-		readRecords = append(readRecords, revision)
-		return true
-	})
-	require.NoError(t, err)
-	assert.Equal(t, []Revision{1, 2}, readRecords)
-
-	// Test reading with callback that returns false
-	readRecords = nil
-	err = log.Read(ctx, 1, func(revision Revision, record *persistence.LogRecord) bool {
-		readRecords = append(readRecords, revision)
-		return false // Stop after first record
-	})
-	require.NoError(t, err)
-	assert.Equal(t, []Revision{1}, readRecords)
+	logtests.RunAll(t, logFactory)
 }
 
 func TestGCSLogObjectNameConversion(t *testing.T) {

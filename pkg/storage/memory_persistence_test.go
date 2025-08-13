@@ -7,13 +7,14 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
 func TestMemoryStorage_WithPersistence(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a memory log
-	memoryLog := persistence.NewMemoryLog()
+	memoryLog := memorylog.New()
 
 	// Create store with the log
 	store, err := NewMemoryStorage(memoryLog)

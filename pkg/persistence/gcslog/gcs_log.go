@@ -14,6 +14,7 @@ import (
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"k8s.io/klog/v2"
 )
 
@@ -21,17 +22,27 @@ type Revision = persistence.Revision
 
 // GCSLog is a Google Cloud Storage-backed implementation of the Log interface
 type GCSLog struct {
-	mu       sync.RWMutex
-	client   *storage.Client
-	bucket   *storage.BucketHandle
-	prefix   string   // Prefix for log objects
-	revision Revision // Current revision number
-	listener persistence.LogListener
+	batching *batch.Batching
+
+	mu           sync.RWMutex
+	client       *storage.Client
+	bucket       *storage.BucketHandle
+	prefix       string   // Prefix for log objects
+	lastRevision Revision // Highest revision number
+	listener     persistence.LogListener
 
 	cache *Cache
+
+	// pendingBatch []*persistence.PendingTransaction
+	// batchTimer   *time.Timer
+	// batchTimeout time.Duration
 }
 
 var _ persistence.Log = &GCSLog{}
+
+type persistedBatch struct {
+	Records []*persistence.LogRecord
+}
 
 // NewGCSLog creates a new Google Cloud Storage-backed log
 func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) {
@@ -54,6 +65,7 @@ func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) 
 		bucket: bucket,
 		prefix: prefix,
 		cache:  NewCache(),
+		// batchTimeout: 50 * time.Millisecond, // Longer timeout for network storage
 	}
 
 	// Replay existing log entries to determine current revision
@@ -61,6 +73,8 @@ func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) 
 		client.Close()
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
+
+	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 
 	return log, nil
 }
@@ -98,41 +112,57 @@ func (g *GCSLog) replay(ctx context.Context) error {
 	// Find the highest revision and preload all entries
 	if len(revisions) > 0 {
 		slices.Sort(revisions)
-		g.revision = revisions[len(revisions)-1]
+		g.lastRevision = revisions[len(revisions)-1]
 
 		// Preload all entries in parallel for faster startup
 		klog.V(2).Infof("Preloading %d log entries for faster startup...", len(revisions))
 		g.preloadBatch(ctx, revisions)
 
-		klog.V(2).Infof("Replayed %d log entries, current revision: %d", len(revisions), g.revision)
+		klog.V(2).Infof("Replayed %d log entries, current revision: %d", len(revisions), g.lastRevision)
 	}
 
 	return nil
 }
 
 // Append adds a new record to the log and returns the revision number
-func (g *GCSLog) Append(ctx context.Context, conditionPosition Revision, logRecord *persistence.LogRecord) (Revision, bool, error) {
+func (g *GCSLog) Append(ctx context.Context, logRecord *persistence.LogRecord, txnMeta *persistence.TxnMeta) (Revision, bool, error) {
+	return g.batching.Add(ctx, logRecord, txnMeta)
+}
+
+// commitBatch commits all transactions in the current batch
+func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
 	log := klog.FromContext(ctx)
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if conditionPosition != g.revision {
-		return 0, false, nil
+	// Check if all transactions have the same condition position
+	if len(batch.Transactions) == 0 {
+		return fmt.Errorf("batch contains no transactions")
 	}
 
-	// Increment revision number
-	g.revision++
-	newRevision := g.revision
+	// Execute the batch under the main lock
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lastLogPosition != l.lastRevision {
+		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
+	}
+
+	startRevision := l.lastRevision + 1
 
 	// Create object name with hex-encoded revision
-	objectName := g.revisionToObjectName(g.revision)
-	obj := g.bucket.Object(objectName)
+	objectName := l.revisionToObjectName(startRevision)
+	obj := l.bucket.Object(objectName)
 
 	// Serialize record to JSON
-	data, err := json.Marshal(logRecord)
+	// TODO: Use proto for speed
+	data := &persistedBatch{
+		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+	}
+	for i, txn := range batch.Transactions {
+		data.Records[i] = txn.LogRecord
+	}
+	b, err := json.Marshal(data)
 	if err != nil {
-		return 0, false, fmt.Errorf("failed to marshal log record: %w", err)
+		return fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to GCS
@@ -140,33 +170,79 @@ func (g *GCSLog) Append(ctx context.Context, conditionPosition Revision, logReco
 	writer := obj.NewWriter(ctx)
 	writer.ContentType = "application/json"
 
-	// TODO: Conditional on the object not existing
-
-	// TODO: Use writer.Append
-	// writer.Append = true
-
-	if _, err := writer.Write(data); err != nil {
+	if _, err := writer.Write(b); err != nil {
 		writer.Close()
-		return 0, false, fmt.Errorf("failed to write log record to GCS: %w", err)
+		return fmt.Errorf("failed to write log record to GCS: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return 0, false, fmt.Errorf("failed to close GCS writer: %w", err)
+		return fmt.Errorf("failed to close GCS writer: %w", err)
 	}
 
-	if g.listener != nil {
-		g.listener.OnLogEntry(newRevision)
+	newRevision := l.lastRevision + Revision(len(batch.Transactions))
+
+	if l.listener != nil {
+		l.listener.OnLogEntry(newRevision)
 	}
 
-	klog.V(3).Infof("Appended log entry at revision %d to GCS object %s", newRevision, objectName)
-	return newRevision, true, nil
+	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
+		len(batch.Transactions), startRevision+1, newRevision)
+
+	return nil
 }
+
+// // appendImmediate performs immediate commit without batching
+// func (g *GCSLog) appendImmediate(ctx context.Context, conditionPosition Revision, logRecord *persistence.LogRecord) (Revision, bool, error) {
+// 	log := klog.FromContext(ctx)
+
+// 	g.mu.Lock()
+// 	defer g.mu.Unlock()
+
+// 	if conditionPosition != g.revision {
+// 		return 0, false, nil
+// 	}
+
+// 	// Increment revision number
+// 	g.lastRevision++
+// 	newRevision := g.lastRevision
+
+// 	// Create object name with hex-encoded revision
+// 	objectName := g.revisionToObjectName(g.revision)
+// 	obj := g.bucket.Object(objectName)
+
+// 	// Serialize record to JSON
+// 	data, err := json.Marshal(logRecord)
+// 	if err != nil {
+// 		return 0, false, fmt.Errorf("failed to marshal log record: %w", err)
+// 	}
+
+// 	// Write to GCS
+// 	log.Info("Writing log entry to GCS object", "objectName", objectName)
+// 	writer := obj.NewWriter(ctx)
+// 	writer.ContentType = "application/json"
+
+// 	if _, err := writer.Write(data); err != nil {
+// 		writer.Close()
+// 		return 0, false, fmt.Errorf("failed to write log record to GCS: %w", err)
+// 	}
+
+// 	if err := writer.Close(); err != nil {
+// 		return 0, false, fmt.Errorf("failed to close GCS writer: %w", err)
+// 	}
+
+// 	if g.listener != nil {
+// 		g.listener.OnLogEntry(newRevision)
+// 	}
+
+// 	klog.V(3).Infof("Appended log entry at revision %d to GCS object %s", newRevision, objectName)
+// 	return newRevision, true, nil
+// }
 
 // GetCurrentRevision returns the current revision number
 func (g *GCSLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.revision, nil
+	return g.lastRevision, nil
 }
 
 // GetLogEntry returns the log entry for the given revision
@@ -305,6 +381,21 @@ func (g *GCSLog) Read(ctx context.Context, fromRevision Revision, callback func(
 
 // Close closes the log and releases any resources
 func (g *GCSLog) Close() error {
+	if err := g.batching.Close(); err != nil {
+		return err
+	}
+
+	// // Execute any pending batch before closing
+	// g.batchMu.Lock()
+	// if len(g.pendingBatch) > 0 {
+	// 	g.executeBatch()
+	// }
+	// if g.batchTimer != nil {
+	// 	g.batchTimer.Stop()
+	// 	g.batchTimer = nil
+	// }
+	// g.batchMu.Unlock()
+
 	if g.client != nil {
 		return g.client.Close()
 	}
