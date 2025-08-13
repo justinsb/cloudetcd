@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
-	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
+	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
 func TestMemoryStorageLogReplay(t *testing.T) {
 	// Create a memory log for testing
-	log := persistence.NewMemoryLog()
+	log := memorylog.New()
 
 	// Create storage with the log
 	storage, err := NewMemoryStorage(log)
@@ -106,7 +107,7 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 	ctx := context.TODO()
 
 	// Test replay with an empty log
-	log := persistence.NewMemoryLog()
+	log := memorylog.New()
 	storage, err := NewMemoryStorage(log)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
@@ -134,7 +135,7 @@ func TestMemoryStorageLogReplayEmpty(t *testing.T) {
 
 func TestMemoryStorageForceReplay(t *testing.T) {
 	// Create a memory log for testing
-	log := persistence.NewMemoryLog()
+	log := memorylog.New()
 
 	// Create storage with the log
 	storage, err := NewMemoryStorage(log)
@@ -179,7 +180,7 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	defer os.RemoveAll(logDir) // Clean up after we're done
 
 	// Step 1: Create a filesystem log
-	fsLog, err := persistence.NewFilesystemLog(logDir)
+	fsLog, err := filesystemlog.NewFilesystemLog(logDir)
 	if err != nil {
 		t.Fatalf("Failed to create filesystem log: %v", err)
 	}

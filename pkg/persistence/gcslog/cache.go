@@ -1,6 +1,7 @@
 package gcslog
 
 import (
+	"context"
 	"sync"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
@@ -46,26 +47,48 @@ func (c *Cache) getEntry(revision Revision, create bool) *cacheEntry {
 	return entry
 }
 
-func (c *Cache) Get(revision Revision, load func() (*persistence.LogRecord, error)) (*persistence.LogRecord, error) {
+type LoadBatchFunc func(ctx context.Context, meta logFileMeta) (*persistedBatch, error)
+
+func (c *Cache) Get(ctx context.Context, revision Revision, load LoadBatchFunc, meta logFileMeta) (*persistence.LogRecord, error) {
 	entry := c.getEntry(revision, true)
 
-	return entry.getRecord(load)
+	batch, record, err := entry.loadRecord(ctx, meta, load)
+	if err != nil {
+		return nil, err
+	}
+	if batch != nil {
+		for i := 0; i < meta.count; i++ {
+			pos := meta.firstRevision + Revision(i)
+			logEntry := batch.Records[i]
+			entry := c.getEntry(pos, true)
+			entry.setRecord(logEntry)
+		}
+	}
+	return record, nil
 }
 
-func (e *cacheEntry) getRecord(load func() (*persistence.LogRecord, error)) (*persistence.LogRecord, error) {
+func (e *cacheEntry) setRecord(record *persistence.LogRecord) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.record = record
+}
+
+func (e *cacheEntry) loadRecord(ctx context.Context, meta logFileMeta, load LoadBatchFunc) (*persistedBatch, *persistence.LogRecord, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.record != nil {
-		return e.record, nil
+		return nil, e.record, nil
 	}
 
-	logEntry, err := load()
+	batch, err := load(ctx, meta)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	logEntry := batch.Records[e.revision-meta.firstRevision]
 	e.record = logEntry
-	return logEntry, nil
+	return batch, logEntry, nil
 }
 
 func (e *cacheEntry) hasValue() bool {

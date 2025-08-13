@@ -6,7 +6,9 @@ import (
 	"net/url"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/gcslog"
+	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
 func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
@@ -17,11 +19,11 @@ func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
 	switch u.Scheme {
 	case "filesystem":
 		dir := "/" + u.Host + "/" + u.Path
-		return persistence.NewFilesystemLog(dir)
+		return filesystemlog.NewFilesystemLog(dir)
 	case "gs":
 		return gcslog.NewGCSLog(ctx, u.Host, u.Path)
 	case "memory":
-		return persistence.NewMemoryLog(), nil
+		return memorylog.New(), nil
 	default:
 		return nil, fmt.Errorf("unsupported log scheme %q", u.Scheme)
 	}

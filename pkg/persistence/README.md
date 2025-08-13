@@ -47,7 +47,7 @@ Each log record contains:
 A simple in-memory implementation of the Log interface. This is useful for testing and development, but data is lost when the process terminates.
 
 ```go
-log := persistence.NewMemoryLog()
+log := memorylog.New()
 revision, err := log.Append(ctx, "PUT", []byte("key"), []byte("value"), 0)
 ```
 
@@ -77,14 +77,14 @@ The storage layer has been updated to integrate with the persistence layer. When
 
 ```go
 // Create storage with memory log
-log := persistence.NewMemoryLog()
+log := memorylog.New()
 store, err := storage.NewMemoryStorage(log)
 if err != nil {
     // Handle error
 }
 
 // Or create storage with a custom log
-customLog := persistence.NewMemoryLog()
+customLog := memorylog.New()
 store, err := storage.NewMemoryStorage(customLog)
 if err != nil {
     // Handle error

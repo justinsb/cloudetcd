@@ -2,36 +2,51 @@ package gcslog
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"k8s.io/klog/v2"
 )
 
 type Revision = persistence.Revision
 
+type logFileMeta struct {
+	firstRevision Revision
+	count         int
+}
+
 // GCSLog is a Google Cloud Storage-backed implementation of the Log interface
 type GCSLog struct {
-	mu       sync.RWMutex
-	client   *storage.Client
-	bucket   *storage.BucketHandle
-	prefix   string   // Prefix for log objects
-	revision Revision // Current revision number
-	listener persistence.LogListener
+	client *storage.Client
+	bucket *storage.BucketHandle
+	prefix string // Prefix for log objects
+
+	batching *batch.Batching
 
 	cache *Cache
+
+	mu           sync.RWMutex
+	lastRevision Revision // Highest revision number
+	listener     persistence.LogListener
+
+	// logFiles is an in-memory index of log files, sorted by firstRevision
+	logFiles []logFileMeta
 }
 
 var _ persistence.Log = &GCSLog{}
+
+type persistedBatch struct {
+	Records []*persistence.LogRecord
+}
 
 // NewGCSLog creates a new Google Cloud Storage-backed log
 func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) {
@@ -62,6 +77,8 @@ func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) 
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
 
+	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
+
 	return log, nil
 }
 
@@ -72,7 +89,7 @@ func (g *GCSLog) replay(ctx context.Context) error {
 	}
 
 	it := g.bucket.Objects(ctx, query)
-	var revisions []Revision
+	g.logFiles = nil
 
 	for {
 		attrs, err := it.Next()
@@ -85,54 +102,84 @@ func (g *GCSLog) replay(ctx context.Context) error {
 
 		// Parse revision from object name
 		objectName := attrs.Name
-		revision, err := g.objectNameToRevision(objectName)
+		firstRevision, count, err := g.objectNameToMeta(objectName)
 		if err != nil {
 			// Skip invalid object names
 			klog.V(2).Infof("Skipping invalid object name: %s", objectName)
 			continue
 		}
 
-		revisions = append(revisions, revision)
+		g.logFiles = append(g.logFiles, logFileMeta{firstRevision: firstRevision, count: count})
 	}
 
-	// Find the highest revision and preload all entries
-	if len(revisions) > 0 {
-		slices.Sort(revisions)
-		g.revision = revisions[len(revisions)-1]
+	// Sort the log files by revision
+	slices.SortFunc(g.logFiles, func(a, b logFileMeta) int {
+		if a.firstRevision < b.firstRevision {
+			return -1
+		}
+		if a.firstRevision > b.firstRevision {
+			return 1
+		}
+		return 0
+	})
 
-		// Preload all entries in parallel for faster startup
-		klog.V(2).Infof("Preloading %d log entries for faster startup...", len(revisions))
-		g.preloadBatch(ctx, revisions)
+	// Find the highest revision
+	if len(g.logFiles) > 0 {
+		lastFile := g.logFiles[len(g.logFiles)-1]
+		g.lastRevision = lastFile.firstRevision + Revision(lastFile.count) - 1
+	}
 
-		klog.V(2).Infof("Replayed %d log entries, current revision: %d", len(revisions), g.revision)
+	// Preload all entries in parallel for faster startup
+	if len(g.logFiles) > 0 {
+		klog.V(2).Infof("Preloading %d log objects for faster startup...", len(g.logFiles))
+		g.preloadBatch(ctx, g.logFiles)
+
+		klog.V(2).Infof("Replayed %d log objects, current revision: %d", len(g.logFiles), g.lastRevision)
 	}
 
 	return nil
 }
 
 // Append adds a new record to the log and returns the revision number
-func (g *GCSLog) Append(ctx context.Context, conditionPosition Revision, logRecord *persistence.LogRecord) (Revision, bool, error) {
+func (g *GCSLog) Append(ctx context.Context, logRecord *persistence.LogRecord, txnMeta *persistence.TxnMeta) (Revision, bool, error) {
+	return g.batching.Add(ctx, logRecord, txnMeta)
+}
+
+// commitBatch commits all transactions in the current batch
+func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
 	log := klog.FromContext(ctx)
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if conditionPosition != g.revision {
-		return 0, false, nil
+	// Check if all transactions have the same condition position
+	if len(batch.Transactions) == 0 {
+		return fmt.Errorf("batch contains no transactions")
 	}
 
-	// Increment revision number
-	g.revision++
-	newRevision := g.revision
+	// Execute the batch under the main lock
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lastLogPosition != l.lastRevision {
+		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
+	}
+
+	startRevision := l.lastRevision + 1
+	count := len(batch.Transactions)
 
 	// Create object name with hex-encoded revision
-	objectName := g.revisionToObjectName(g.revision)
-	obj := g.bucket.Object(objectName)
+	objectName := l.batchToObjectName(startRevision, count)
+	obj := l.bucket.Object(objectName)
 
 	// Serialize record to JSON
-	data, err := json.Marshal(logRecord)
+	// TODO: Use proto for speed
+	data := &persistedBatch{
+		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+	}
+	for i, txn := range batch.Transactions {
+		data.Records[i] = txn.LogRecord
+	}
+	b, err := json.Marshal(data)
 	if err != nil {
-		return 0, false, fmt.Errorf("failed to marshal log record: %w", err)
+		return fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to GCS
@@ -140,33 +187,34 @@ func (g *GCSLog) Append(ctx context.Context, conditionPosition Revision, logReco
 	writer := obj.NewWriter(ctx)
 	writer.ContentType = "application/json"
 
-	// TODO: Conditional on the object not existing
-
-	// TODO: Use writer.Append
-	// writer.Append = true
-
-	if _, err := writer.Write(data); err != nil {
+	if _, err := writer.Write(b); err != nil {
 		writer.Close()
-		return 0, false, fmt.Errorf("failed to write log record to GCS: %w", err)
+		return fmt.Errorf("failed to write log record to GCS: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return 0, false, fmt.Errorf("failed to close GCS writer: %w", err)
+		return fmt.Errorf("failed to close GCS writer: %w", err)
 	}
 
-	if g.listener != nil {
-		g.listener.OnLogEntry(newRevision)
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
+	newRevision := l.lastRevision + Revision(len(batch.Transactions))
+	l.lastRevision = newRevision
+
+	if l.listener != nil {
+		l.listener.OnLogEntry(newRevision)
 	}
 
-	klog.V(3).Infof("Appended log entry at revision %d to GCS object %s", newRevision, objectName)
-	return newRevision, true, nil
+	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
+		len(batch.Transactions), startRevision, newRevision)
+
+	return nil
 }
 
 // GetCurrentRevision returns the current revision number
 func (g *GCSLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.revision, nil
+	return g.lastRevision, nil
 }
 
 // GetLogEntry returns the log entry for the given revision
@@ -177,37 +225,66 @@ func (g *GCSLog) GetLogEntry(revision Revision) (*persistence.LogRecord, error) 
 	return g.getLogEntry(ctx, revision)
 }
 
-func (g *GCSLog) getLogEntry(ctx context.Context, revision Revision) (*persistence.LogRecord, error) {
+func (g *GCSLog) loadBatch(ctx context.Context, fileMeta logFileMeta) (*persistedBatch, error) {
 	log := klog.FromContext(ctx)
 
-	logEntry, err := g.cache.Get(revision, func() (*persistence.LogRecord, error) {
-		objectName := g.revisionToObjectName(revision)
-		obj := g.bucket.Object(objectName)
+	objectName := g.batchToObjectName(fileMeta.firstRevision, fileMeta.count)
+	obj := g.bucket.Object(objectName)
 
-		log.Info("Reading log entry from GCS object", "objectName", objectName)
-		reader, err := obj.NewReader(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create GCS reader for object %s: %w", objectName, err)
-		}
-		defer reader.Close()
+	log.Info("Reading log entry from GCS object", "objectName", objectName)
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCS reader for object %s: %w", objectName, err)
+	}
+	defer reader.Close()
 
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read data from GCS object %s: %w", objectName, err)
-		}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data from GCS object %s: %w", objectName, err)
+	}
 
-		record := &persistence.LogRecord{}
-		if err := json.Unmarshal(data, record); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal log record from GCS object %s: %w", objectName, err)
-		}
+	pBatch := &persistedBatch{}
+	if err := json.Unmarshal(data, pBatch); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal log record from GCS object %s: %w", objectName, err)
+	}
+	return pBatch, nil
+}
 
-		return record, nil
-	})
+func (g *GCSLog) getLogEntry(ctx context.Context, revision Revision) (*persistence.LogRecord, error) {
+	// log := klog.FromContext(ctx)
+
+	fileMeta, ok := g.findFileForRevision(revision)
+	if !ok {
+		return nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
+	}
+
+	// This is a bit inefficient, as we fetch the whole batch to get one entry.
+	// However, the cache helps, and often we will read sequentially.
+	logEntry, err := g.cache.Get(ctx, revision, g.loadBatch, fileMeta)
 	return logEntry, err
 }
 
+// findFileForRevision finds the log file containing the given revision.
+// It uses the in-memory index.
+func (f *GCSLog) findFileForRevision(revision Revision) (logFileMeta, bool) {
+	// The logFiles slice is sorted by firstRevision.
+	// A reverse loop is simple and efficient enough, especially as recent revisions are more likely to be requested.
+	for i := len(f.logFiles) - 1; i >= 0; i-- {
+		fileMeta := f.logFiles[i]
+		if fileMeta.firstRevision <= revision {
+			if revision < fileMeta.firstRevision+Revision(fileMeta.count) {
+				return fileMeta, true
+			}
+			// We've gone past our revision, and because the list is sorted,
+			// no earlier file will contain it.
+			return logFileMeta{}, false
+		}
+	}
+	return logFileMeta{}, false
+}
+
 // preloadBatch starts loading multiple log entries into the cache in parallel
-func (g *GCSLog) preloadBatch(ctx context.Context, revisions []Revision) {
+func (g *GCSLog) preloadBatch(ctx context.Context, logFiles []logFileMeta) {
 	log := klog.FromContext(ctx)
 
 	// Use a semaphore to limit concurrent downloads to avoid overwhelming GCS
@@ -216,25 +293,27 @@ func (g *GCSLog) preloadBatch(ctx context.Context, revisions []Revision) {
 
 	var wg sync.WaitGroup
 
-	for _, revision := range revisions {
-		// Skip if already cached
-		if g.cache.Has(revision) {
+	for _, fileMeta := range logFiles {
+		// We check the first revision in the batch; if it's cached we assume the whole batch is.
+		// This is not perfect, but it's a reasonable heuristic.
+		if g.cache.Has(fileMeta.firstRevision) {
 			continue
 		}
 
 		wg.Add(1)
-		go func(rev Revision) {
+		go func(meta logFileMeta) {
 			defer wg.Done()
 
 			// Acquire semaphore
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			_, err := g.getLogEntry(ctx, rev)
+			// This will fetch the batch and populate the cache
+			_, err := g.getLogEntry(ctx, meta.firstRevision)
 			if err != nil {
-				log.Error(err, "failed to preload log entry", "revision", rev)
+				log.Error(err, "failed to preload log entry", "revision", meta.firstRevision)
 			}
-		}(revision)
+		}(fileMeta)
 	}
 
 	// Wait for all preloads to complete
@@ -243,60 +322,36 @@ func (g *GCSLog) preloadBatch(ctx context.Context, revisions []Revision) {
 
 // Read reads records from the log starting from the given revision
 func (g *GCSLog) Read(ctx context.Context, fromRevision Revision, callback func(Revision, *persistence.LogRecord) bool) error {
-	log := klog.FromContext(ctx)
-
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	// fromRevision is uint64, so no need to check for < 0
-
-	query := &storage.Query{
-		Prefix: g.prefix,
-	}
-
-	it := g.bucket.Objects(ctx, query)
-	var matches []Revision
-
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to list objects: %w", err)
-		}
-
-		// Parse revision from object name
-		objectName := attrs.Name
-		revision, err := g.objectNameToRevision(objectName)
-		if err != nil {
+	for _, fileMeta := range g.logFiles {
+		fileLastRevision := fileMeta.firstRevision + Revision(fileMeta.count) - 1
+		if fileLastRevision < fromRevision {
 			continue
 		}
 
-		if revision < fromRevision {
-			continue
+		// This will use the cache if populated, or fetch from GCS
+		// We fetch the first record to trigger a load of the whole batch
+		if _, err := g.getLogEntry(ctx, fileMeta.firstRevision); err != nil {
+			return fmt.Errorf("failed to get log entry for revision %d: %w", fileMeta.firstRevision, err)
 		}
-		matches = append(matches, revision)
-	}
 
-	// Sort revisions in ascending order
-	slices.Sort(matches)
-
-	// Start parallel preloading of all entries
-	log.Info("Preloading log entries", "count", len(matches))
-	g.preloadBatch(ctx, matches)
-
-	// Now read entries sequentially (they should be cached from preloading)
-	for _, revision := range matches {
-		record, err := g.getLogEntry(ctx, revision)
-		if err != nil {
-			return fmt.Errorf("failed to get log entry for revision %d: %w", revision, err)
-		}
-		if record == nil {
-			return fmt.Errorf("log entry not found for revision %d", revision)
-		}
-		if !callback(revision, record) {
-			break
+		for i := 0; i < fileMeta.count; i++ {
+			revision := fileMeta.firstRevision + Revision(i)
+			if revision < fromRevision {
+				continue
+			}
+			record, err := g.getLogEntry(ctx, revision)
+			if err != nil {
+				return fmt.Errorf("failed to get log entry for revision %d: %w", revision, err)
+			}
+			if record == nil {
+				return fmt.Errorf("log entry not found for revision %d", revision)
+			}
+			if !callback(revision, record) {
+				return nil
+			}
 		}
 	}
 
@@ -305,6 +360,10 @@ func (g *GCSLog) Read(ctx context.Context, fromRevision Revision, callback func(
 
 // Close closes the log and releases any resources
 func (g *GCSLog) Close() error {
+	if err := g.batching.Close(); err != nil {
+		return err
+	}
+
 	if g.client != nil {
 		return g.client.Close()
 	}
@@ -318,37 +377,37 @@ func (g *GCSLog) SetListener(listener persistence.LogListener) {
 	g.listener = listener
 }
 
-// revisionToObjectName converts a revision number to a GCS object name
-func (g *GCSLog) revisionToObjectName(revision Revision) string {
-	revisionBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(revisionBytes, uint64(revision))
-	hexRevision := hex.EncodeToString(revisionBytes)
-	return fmt.Sprintf("%s%s.log", g.prefix, hexRevision)
+// batchToObjectName converts a first-revision and count to a filename
+func (g *GCSLog) batchToObjectName(firstRevision Revision, count int) string {
+	return fmt.Sprintf("%s%016x-%x.log", g.prefix, uint64(firstRevision), count)
 }
 
-// objectNameToRevision converts a GCS object name to a revision number
-func (g *GCSLog) objectNameToRevision(objectName string) (Revision, error) {
+// objectNameToMeta converts a GCS object name to a revision number
+func (g *GCSLog) objectNameToMeta(objectName string) (Revision, int, error) {
 	if !strings.HasPrefix(objectName, g.prefix) {
-		return 0, fmt.Errorf("object name does not have expected prefix: %s", objectName)
+		return 0, 0, fmt.Errorf("object name does not have expected prefix: %s", objectName)
+	}
+	trimmed := strings.TrimPrefix(objectName, g.prefix)
+
+	if !strings.HasSuffix(trimmed, ".log") {
+		return 0, 0, fmt.Errorf("object name does not have .log suffix: %s", objectName)
+	}
+	trimmed = strings.TrimSuffix(trimmed, ".log")
+
+	parts := strings.SplitN(trimmed, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid filename format (expected <revision>-<count>.log): %s", objectName)
 	}
 
-	if !strings.HasSuffix(objectName, ".log") {
-		return 0, fmt.Errorf("object name does not have .log suffix: %s", objectName)
-	}
-
-	// Extract hex revision from object name
-	hexRevision := strings.TrimPrefix(objectName, g.prefix)
-	hexRevision = strings.TrimSuffix(hexRevision, ".log")
-
-	revisionBytes, err := hex.DecodeString(hexRevision)
+	revisionVal, err := strconv.ParseUint(parts[0], 16, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to decode hex revision: %w", err)
+		return 0, 0, fmt.Errorf("parsing revision from %q: %w", objectName, err)
 	}
 
-	if len(revisionBytes) != 8 {
-		return 0, fmt.Errorf("invalid revision bytes length: %d", len(revisionBytes))
+	countVal, err := strconv.ParseUint(parts[1], 16, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing count from %q: %w", objectName, err)
 	}
 
-	revision := Revision(binary.BigEndian.Uint64(revisionBytes))
-	return revision, nil
+	return Revision(revisionVal), int(countVal), nil
 }

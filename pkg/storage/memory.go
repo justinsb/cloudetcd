@@ -56,7 +56,7 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	// If no log entries exist, we're done
 	if currentRevision == 0 {
 		// We want the log to start at revision 1, so we'll add a dummy event
-		newRevision, ok, err := m.log.Append(ctx, 0, &persistence.LogRecord{})
+		newRevision, ok, err := m.log.Append(ctx, &persistence.LogRecord{}, persistence.NewTxnMeta(0))
 		if err != nil {
 			return fmt.Errorf("failed to append dummy event: %w", err)
 		}
@@ -215,7 +215,7 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 		Events: t.logEvents,
 	}
 
-	newLogRevision, ok, err := t.storage.log.Append(ctx, t.snapshotTimestamp, logRecord)
+	newLogRevision, ok, err := t.storage.log.Append(ctx, logRecord, persistence.NewTxnMeta(t.snapshotTimestamp))
 	if err != nil || !ok {
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
