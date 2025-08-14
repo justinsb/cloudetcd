@@ -63,6 +63,33 @@ type Storage interface {
 
 	// Status returns the status of the storage.
 	Status(ctx context.Context) (*etcdserverpb.StatusResponse, error)
+
+	LeaseManager() LeaseManager
+}
+
+type LeaseManager interface {
+	// Run will run until the context is closed
+	Run(ctx context.Context)
+
+	// OnLogEvent is called by the storage when an event has been committed to the log or been replayed
+	OnLogEvent(event *mvccpb.Event)
+
+	// HasLease is called by the storage to check if a lease exists
+	HasLease(leaseID int64) bool
+
+	// LeaseGrant creates a lease which expires if the server does not receive a keepAlive
+	// within a given time to live period. All keys attached to the lease will be expired and
+	// deleted if the lease expires. Each expired key generates a delete event in the event history.
+	LeaseGrant(context.Context, *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error)
+	// LeaseRevoke revokes a lease. All keys attached to the lease will expire and be deleted.
+	LeaseRevoke(context.Context, *etcdserverpb.LeaseRevokeRequest) (*etcdserverpb.LeaseRevokeResponse, error)
+	// LeaseKeepAlive keeps the lease alive by streaming keep alive requests from the client
+	// to the server and streaming keep alive responses from the server to the client.
+	LeaseKeepAlive(context.Context, *etcdserverpb.LeaseKeepAliveRequest) (*etcdserverpb.LeaseKeepAliveResponse, error)
+	// LeaseTimeToLive retrieves lease information.
+	LeaseTimeToLive(context.Context, *etcdserverpb.LeaseTimeToLiveRequest) (*etcdserverpb.LeaseTimeToLiveResponse, error)
+	// ListLeases lists all existing leases.
+	ListLeases(context.Context, *etcdserverpb.LeaseLeasesRequest) (*etcdserverpb.LeaseLeasesResponse, error)
 }
 
 type KeyValue = mvccpb.KeyValue

@@ -786,7 +786,7 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 	t.Run("read-write conflict prevents batching", func(t *testing.T) {
 		// Transaction 1: Read existing key, write to audit
 		txn1Meta := NewTxnMeta(2)
-		txn1Meta.AddRead("existing:key", 2)
+		txn1Meta.AddRead("existing:key")
 		txn1Meta.AddWrite("audit:1")
 
 		txn1Record := &LogRecord{

@@ -1,4 +1,4 @@
-package storage
+package memorystorage
 
 import (
 	"bytes"
@@ -9,13 +9,18 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"justinsb.com/cloudetcd/pkg/bptree"
+	"justinsb.com/cloudetcd/pkg/lease"
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/storage"
 	"k8s.io/klog/v2"
 )
 
 // MemoryStorage is an in-memory implementation of the Storage interface.
 type MemoryStorage struct {
+	leaseManager *lease.LeaseManager
+
 	mu sync.RWMutex
 
 	revisions bptree.BPTree
@@ -26,7 +31,7 @@ type MemoryStorage struct {
 	watchers  []*memoryWatcher
 }
 
-var _ Storage = &MemoryStorage{}
+var _ storage.Storage = &MemoryStorage{}
 
 // NewMemoryStorage creates a new in-memory storage instance with the given log.
 // It returns an error if it cannot replay the log to restore the storage state.
@@ -37,12 +42,18 @@ func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 
 	log.SetListener(ms)
 
+	ms.leaseManager = lease.NewLeaseManager(ms)
+
 	// Replay the log to restore state
 	if err := ms.ReplayLog(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to replay log on startup: %w", err)
 	}
 
 	return ms, nil
+}
+
+func (m *MemoryStorage) LeaseManager() storage.LeaseManager {
+	return m.leaseManager
 }
 
 func (m *MemoryStorage) GetCurrentRevision(ctx context.Context) (Revision, error) {
@@ -90,6 +101,8 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 				// Skip unknown operations
 				klog.Fatalf("unknown operation: %s", event.Type)
 			}
+
+			m.leaseManager.OnLogEvent(event)
 		}
 
 		return true
@@ -142,7 +155,9 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 	value := req.GetValue()
 
 	if req.GetLease() != 0 {
-		return nil, fmt.Errorf("lease is not supported")
+		if !t.storage.leaseManager.HasLease(req.GetLease()) {
+			return nil, rpctypes.ErrGRPCLeaseNotFound
+		}
 	}
 
 	existingRevision, hasExisting := t.storage.revisions.GetLatestRevisionByKey(key, t.snapshotTimestamp)
@@ -153,6 +168,7 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 		Key:         key,
 		Value:       value,
 		ModRevision: int64(newRevision),
+		Lease:       req.GetLease(),
 	}
 
 	var prevKv *mvccpb.KeyValue
@@ -235,6 +251,8 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 			// Skip unknown operations
 			klog.Fatalf("unknown operation: %s", event.Type)
 		}
+
+		t.storage.leaseManager.OnLogEvent(event)
 	}
 
 	resp.Header.Revision = int64(newLogRevision)
@@ -305,13 +323,37 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_ModRevision)
 			if !ok {
-				return nil, fmt.Errorf("unsupported compare target: %T", cond.GetTargetUnion())
+				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
 			}
 
 			switch cond.GetResult() {
 			case etcdserverpb.Compare_EQUAL:
 				if modRevision != Revision(targetValue.ModRevision) {
 					// klog.Infof("condition failed: modRevision %d != targetValue %d (prevEvent: %v, snapshotTimestamp: %d)", modRevision, targetValue.ModRevision, prevEvent, snapshotTimestamp)
+					conditionsFailed = true
+					break
+				}
+
+			default:
+				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+			}
+
+		case etcdserverpb.Compare_LEASE:
+			lease := int64(0)
+			if prevEvent == nil || prevEvent.Type == mvccpb.DELETE {
+				lease = 0
+			} else {
+				lease = prevEvent.Kv.Lease
+			}
+
+			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_Lease)
+			if !ok {
+				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
+			}
+
+			switch cond.GetResult() {
+			case etcdserverpb.Compare_EQUAL:
+				if lease != targetValue.Lease {
 					conditionsFailed = true
 					break
 				}
@@ -338,7 +380,8 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 	for _, op := range operations {
 		switch op.Request.(type) {
 		case *etcdserverpb.RequestOp_RequestPut:
-			putResp, err := txn.put(ctx, op.GetRequestPut())
+			putRequest := op.GetRequestPut()
+			putResp, err := txn.put(ctx, putRequest)
 			if err != nil {
 				return nil, err
 			}

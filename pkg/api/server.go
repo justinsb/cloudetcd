@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -108,18 +109,63 @@ type Server struct {
 	etcdserverpb.UnimplementedLeaseServer
 	etcdserverpb.UnimplementedMaintenanceServer
 
-	storage storage.Storage
-	grpc    *grpc.Server
+	storage      storage.Storage
+	leaseManager storage.LeaseManager
+	grpc         *grpc.Server
 
 	mu                sync.RWMutex
 	watchStreams      map[int64]*watchStream
 	nextWatchStreamID int64
 }
 
+// LeaseKeepAlive keeps the lease alive by streaming keep alive requests from the client
+// to the server and streaming keep alive responses from the server to the client.
+
+func (s *Server) LeaseKeepAlive(stream etcdserverpb.Lease_LeaseKeepAliveServer) error {
+	ctx := stream.Context()
+	log := klog.FromContext(ctx)
+
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			log.Error(err, "lease keepalive recv failed")
+			return err
+		}
+
+		resp, err := s.leaseManager.LeaseKeepAlive(ctx, req)
+		if err != nil {
+			log.Error(err, "lease keepalive failed")
+			return err
+		}
+		// if lease == nil {
+		// 	// Lease not found or expired
+		// 	resp := &etcdserverpb.LeaseKeepAliveResponse{
+		// 		Header: s.createHeader(0),
+		// 		ID:     req.ID,
+		// 		TTL:    0, // Indicates lease expired
+		// 	}
+		// 	if err := stream.Send(resp); err != nil {
+		// 		log.Error(err, "lease keepalive send failed for expired lease")
+		// 		return err
+		// 	}
+		// 	continue
+		// }
+
+		if err := stream.Send(resp); err != nil {
+			log.Error(err, "lease keepalive send failed")
+			return err
+		}
+	}
+}
+
 // NewServer creates a new etcd API server
 func NewServer(store storage.Storage) *Server {
 	return &Server{
 		storage:           store,
+		leaseManager:      store.LeaseManager(),
 		watchStreams:      make(map[int64]*watchStream),
 		nextWatchStreamID: 1,
 	}
@@ -149,6 +195,10 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		<-ctx.Done()
 		log.Info("Stopping etcd API server (gracefully)")
 		s.GracefulStop()
+	}()
+
+	go func() {
+		s.leaseManager.Run(ctx)
 	}()
 	return s.grpc.Serve(lis)
 }
@@ -460,51 +510,34 @@ func (ws *watchStream) cleanup(closeGRPC bool) {
 }
 
 // Grant implements the Grant RPC method
-func (s *Server) LeaseGrant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
-	// TODO
+// LeaseGrant creates a lease which expires if the server does not receive a keepAlive
+// within a given time to live period. All keys attached to the lease will be expired and
+// deleted if the lease expires. Each expired key generates a delete event in the event history.
 
-	// For now, return a simple lease grant
-	// In a full implementation, we'd need to implement actual lease management
-	return &etcdserverpb.LeaseGrantResponse{
-		Header: s.createHeader(0),
-		ID:     req.ID,
-		TTL:    req.TTL,
-	}, nil
+func (s *Server) LeaseGrant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
+	return s.leaseManager.LeaseGrant(ctx, req)
 }
 
-// Revoke implements the Revoke RPC method
-func (s *Server) Revoke(ctx context.Context, req *etcdserverpb.LeaseRevokeRequest) (*etcdserverpb.LeaseRevokeResponse, error) {
-	// For now, return success
-	// In a full implementation, we'd need to implement actual lease revocation
-	return &etcdserverpb.LeaseRevokeResponse{
-		Header: s.createHeader(0),
-	}, nil
+// LeaseRevoke implements the Revoke RPC method
+// LeaseRevoke revokes a lease. All keys attached to the lease will expire and be deleted.
+func (s *Server) LeaseRevoke(ctx context.Context, req *etcdserverpb.LeaseRevokeRequest) (*etcdserverpb.LeaseRevokeResponse, error) {
+	return s.leaseManager.LeaseRevoke(ctx, req)
 }
 
 // LeaseTimeToLive implements the LeaseTimeToLive RPC method
+// LeaseTimeToLive retrieves lease information.
 func (s *Server) LeaseTimeToLive(ctx context.Context, req *etcdserverpb.LeaseTimeToLiveRequest) (*etcdserverpb.LeaseTimeToLiveResponse, error) {
-	// For now, return a simple response
-	// In a full implementation, we'd need to implement actual lease TTL tracking
-	return &etcdserverpb.LeaseTimeToLiveResponse{
-		Header:     s.createHeader(0),
-		ID:         req.ID,
-		TTL:        -1, // Indicates no TTL
-		GrantedTTL: -1,
-	}, nil
+	return s.leaseManager.LeaseTimeToLive(ctx, req)
 }
 
 // LeaseLeases implements the LeaseLeases RPC method
+// LeaseLeases lists all existing leases.
 func (s *Server) LeaseLeases(ctx context.Context, req *etcdserverpb.LeaseLeasesRequest) (*etcdserverpb.LeaseLeasesResponse, error) {
-	// For now, return empty leases
-	// In a full implementation, we'd need to implement actual lease tracking
-	return &etcdserverpb.LeaseLeasesResponse{
-		Header: s.createHeader(0),
-		Leases: []*etcdserverpb.LeaseStatus{},
-	}, nil
+	return s.leaseManager.ListLeases(ctx, req)
+
 }
 
 // Helper methods
-
 func (s *Server) createHeader(revision storage.Revision) *etcdserverpb.ResponseHeader {
 	return &etcdserverpb.ResponseHeader{
 		ClusterId: 1, // Simple cluster ID
