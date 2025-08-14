@@ -460,7 +460,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 			return nil
 		}
 		// Create a watcher for exact key match
-		watcher, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
+		watcher, _, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
 			WatchId: 1,
 			Key:     []byte("test-key"),
 			PrevKv:  true,
@@ -558,7 +558,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 			return nil
 		}
 		// Create a watcher for prefix match (using empty rangeEnd for prefix behavior)
-		watcher, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
+		watcher, _, err := storage.Watch(ctx, &etcdserverpb.WatchCreateRequest{
 			WatchId:  1,
 			Key:      []byte("prefix/"),
 			RangeEnd: rangeEndForPrefix(t, []byte("prefix/")),

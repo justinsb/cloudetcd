@@ -15,6 +15,57 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// loggingInterceptor is a gRPC unary interceptor that logs requests.
+func loggingInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	log := klog.FromContext(ctx)
+	log.Info("gRPC call", "method", info.FullMethod, "request", req)
+	resp, err := handler(ctx, req)
+	if err != nil {
+		log.Error(err, "gRPC call failed", "method", info.FullMethod)
+	} else {
+		log.Info("gRPC call response", "method", info.FullMethod, "response", resp)
+	}
+	return resp, err
+}
+
+// loggingStreamInterceptor is a gRPC stream interceptor that logs requests.
+func loggingStreamInterceptor(srv any, serverStream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	ctx := serverStream.Context()
+	log := klog.FromContext(ctx)
+	log.Info("gRPC stream call", "method", info.FullMethod)
+	return handler(srv, &loggingServerStream{ServerStream: serverStream, log: log})
+}
+
+type loggingServerStream struct {
+	log klog.Logger
+	grpc.ServerStream
+}
+
+func (s *loggingServerStream) RecvMsg(m any) error {
+	err := s.ServerStream.RecvMsg(m)
+	if err == nil {
+		s.log.Info("gRPC stream request", "type", TypeName(m), "request", m)
+	}
+	return err
+}
+
+func (s *loggingServerStream) SendMsg(m any) error {
+	s.log.Info("gRPC stream response", "type", TypeName(m), "response", m)
+	return s.ServerStream.SendMsg(m)
+}
+
+type DelayedTypeName struct {
+	v any
+}
+
+func TypeName(v any) DelayedTypeName {
+	return DelayedTypeName{v: v}
+}
+
+func (d DelayedTypeName) String() string {
+	return fmt.Sprintf("%T", d.v)
+}
+
 // watchStream represents a single watch stream with multiple watches
 type watchStream struct {
 	server *Server
@@ -83,7 +134,10 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
-	s.grpc = grpc.NewServer()
+	s.grpc = grpc.NewServer(
+		grpc.UnaryInterceptor(loggingInterceptor),
+		grpc.StreamInterceptor(loggingStreamInterceptor),
+	)
 	etcdserverpb.RegisterKVServer(s.grpc, s)
 	etcdserverpb.RegisterWatchServer(s.grpc, s)
 	etcdserverpb.RegisterLeaseServer(s.grpc, s)
@@ -122,10 +176,6 @@ func (s *Server) GracefulStop() error {
 
 // Range implements the Range RPC method
 func (s *Server) Range(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: Range", "request", req)
-
 	if req.Key == nil {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
@@ -159,10 +209,6 @@ func (s *Server) handleRangeWithEnd(ctx context.Context, req *etcdserverpb.Range
 
 // Put implements the Put RPC method
 func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: Put", "request", req)
-
 	if req.Key == nil {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
@@ -176,18 +222,12 @@ func (s *Server) Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdse
 
 // DeleteRange implements the DeleteRange RPC method
 func (s *Server) DeleteRange(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: DeleteRange", "request", req)
-
 	return s.storage.Delete(ctx, req)
 }
 
 // Txn implements the Txn RPC method
 func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: Txn", "request", req)
 
 	result, err := s.storage.Txn(ctx, req)
 	if err != nil {
@@ -199,10 +239,6 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 
 // Compact implements the Compact RPC method
 func (s *Server) Compact(ctx context.Context, req *etcdserverpb.CompactionRequest) (*etcdserverpb.CompactionResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: Compact", "request", req)
-
 	// For now, return success without actual compaction
 	// In a full implementation, we'd need to implement actual compaction logic
 	return &etcdserverpb.CompactionResponse{
@@ -215,7 +251,6 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	ctx := stream.Context()
 	log := klog.FromContext(ctx)
 
-	log.Info("grpc request: Watch stream")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -256,15 +291,11 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 // handleRequests processes incoming watch requests
 func (ws *watchStream) handleRequests(ctx context.Context) error {
-	log := klog.FromContext(ctx)
-
 	for {
 		req, err := ws.stream.Recv()
 		if err != nil {
 			return err
 		}
-
-		log.Info("grpc watch request", "request", req)
 
 		switch r := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
@@ -272,9 +303,14 @@ func (ws *watchStream) handleRequests(ctx context.Context) error {
 				return err
 			}
 		case *etcdserverpb.WatchRequest_CancelRequest:
-			ws.handleCancelRequest(r.CancelRequest)
+			ws.handleCancelRequest(ctx, r.CancelRequest)
 		case *etcdserverpb.WatchRequest_ProgressRequest:
-			ws.handleProgressRequest(r.ProgressRequest)
+			if err := ws.handleProgressRequest(ctx, r.ProgressRequest); err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf("unknown watch request type: %T", r)
 		}
 	}
 }
@@ -308,11 +344,11 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 	}
 
 	// Create storage watcher
-	watch, err := ws.server.storage.Watch(ctx, req, callback)
+	watch, logPosition, err := ws.server.storage.Watch(ctx, req, callback)
 	if err != nil {
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
-			Header: ws.server.createHeader(0),
+			Header: ws.server.createHeader(logPosition),
 			// WatchId:  watch.ID(),
 			Created:  false,
 			Canceled: true,
@@ -323,7 +359,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 
 	// Send creation response
 	resp := &etcdserverpb.WatchResponse{
-		Header:  ws.server.createHeader(0),
+		Header:  ws.server.createHeader(logPosition),
 		WatchId: watchID,
 		Created: true,
 	}
@@ -353,9 +389,17 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 }
 
 // handleCancelRequest handles watch cancellation
-func (ws *watchStream) handleCancelRequest(req *etcdserverpb.WatchCancelRequest) {
+func (ws *watchStream) handleCancelRequest(ctx context.Context, req *etcdserverpb.WatchCancelRequest) {
+	log := klog.FromContext(ctx)
+
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+
+	// TODO: Should we send the watch position or the log position?
+	logPosition, err := ws.server.storage.GetCurrentRevision(ctx)
+	if err != nil {
+		log.Error(err, "failed to get current revision")
+	}
 
 	watchID := req.WatchId
 	if watch, exists := ws.watches[watchID]; exists {
@@ -364,7 +408,7 @@ func (ws *watchStream) handleCancelRequest(req *etcdserverpb.WatchCancelRequest)
 
 		// Send cancellation response
 		resp := &etcdserverpb.WatchResponse{
-			Header:   ws.server.createHeader(0),
+			Header:   ws.server.createHeader(logPosition),
 			WatchId:  watchID,
 			Canceled: true,
 		}
@@ -373,12 +417,32 @@ func (ws *watchStream) handleCancelRequest(req *etcdserverpb.WatchCancelRequest)
 }
 
 // handleProgressRequest handles progress requests
-func (ws *watchStream) handleProgressRequest(req *etcdserverpb.WatchProgressRequest) {
-	// For now, just send a progress response without events
-	resp := &etcdserverpb.WatchResponse{
-		Header: ws.server.createHeader(0),
+func (ws *watchStream) handleProgressRequest(ctx context.Context, req *etcdserverpb.WatchProgressRequest) error {
+	log := klog.FromContext(ctx)
+
+	// TODO: Should we send the watch position or the log position?
+	logPosition, err := ws.server.storage.GetCurrentRevision(ctx)
+	if err != nil {
+		log := klog.FromContext(ctx)
+		log.Error(err, "failed to get current revision")
+		klog.Fatalf("failed to get revision: %v", err)
 	}
-	ws.stream.Send(resp)
+	if logPosition == 0 {
+		klog.Warningf("logPosition is zero")
+	}
+
+	// Note: we send this to the magic -1 watch id, not to our watch specifically
+	// This is sort of weird, because what position are we sending?
+	resp := &etcdserverpb.WatchResponse{
+		Header:  ws.server.createHeader(logPosition),
+		WatchId: -1, // InvalidWatchID => broadcast
+	}
+
+	if err := ws.stream.Send(resp); err != nil {
+		log.Error(err, "failed to send progress response")
+	}
+
+	return nil
 }
 
 // cleanup closes all watches
@@ -397,10 +461,6 @@ func (ws *watchStream) cleanup(closeGRPC bool) {
 
 // Grant implements the Grant RPC method
 func (s *Server) LeaseGrant(ctx context.Context, req *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: LeaseGrant", "request", req)
-
 	// TODO
 
 	// For now, return a simple lease grant
@@ -423,10 +483,6 @@ func (s *Server) Revoke(ctx context.Context, req *etcdserverpb.LeaseRevokeReques
 
 // LeaseTimeToLive implements the LeaseTimeToLive RPC method
 func (s *Server) LeaseTimeToLive(ctx context.Context, req *etcdserverpb.LeaseTimeToLiveRequest) (*etcdserverpb.LeaseTimeToLiveResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: LeaseTimeToLive", "request", req)
-
 	// For now, return a simple response
 	// In a full implementation, we'd need to implement actual lease TTL tracking
 	return &etcdserverpb.LeaseTimeToLiveResponse{
@@ -439,10 +495,6 @@ func (s *Server) LeaseTimeToLive(ctx context.Context, req *etcdserverpb.LeaseTim
 
 // LeaseLeases implements the LeaseLeases RPC method
 func (s *Server) LeaseLeases(ctx context.Context, req *etcdserverpb.LeaseLeasesRequest) (*etcdserverpb.LeaseLeasesResponse, error) {
-	log := klog.FromContext(ctx)
-
-	log.Info("grpc request: LeaseLeases", "request", req)
-
 	// For now, return empty leases
 	// In a full implementation, we'd need to implement actual lease tracking
 	return &etcdserverpb.LeaseLeasesResponse{

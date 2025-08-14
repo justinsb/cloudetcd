@@ -22,7 +22,7 @@ const (
 // Watch creates a watcher for the given key/range starting from the specified revision
 // If rangeEnd is empty, it watches a single key.
 // If rangeEnd is specified, it watches the range [key, rangeEnd).
-func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, error) {
+func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, Revision, error) {
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 
@@ -30,12 +30,12 @@ func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreate
 
 	watcherID := req.GetWatchId()
 	if watcherID == 0 {
-		return nil, fmt.Errorf("watch ID must be non-zero")
+		return nil, Revision(0), fmt.Errorf("watch ID must be non-zero")
 	}
 
 	logPosition, err := m.log.GetCurrentRevision(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get current revision: %w", err)
+		return nil, logPosition, fmt.Errorf("failed to get current revision: %w", err)
 	}
 
 	// logPosition := Revision(req.StartRevision)
@@ -90,7 +90,7 @@ func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreate
 	// 	}
 	// }()
 
-	return w, nil
+	return w, logPosition, nil
 }
 
 // memoryWatcher implements the Watcher interface

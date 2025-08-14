@@ -45,6 +45,10 @@ func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	return ms, nil
 }
 
+func (m *MemoryStorage) GetCurrentRevision(ctx context.Context) (Revision, error) {
+	return m.log.GetCurrentRevision(ctx)
+}
+
 // ReplayLog replays the persistence log to restore the storage state
 func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	// Get the current revision from the log
@@ -186,6 +190,7 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 	}
 
 	t.logEvents = append(t.logEvents, event)
+	t.meta.AddWrite(string(key))
 
 	// TODO: Do individual responses have headers?
 	response := &etcdserverpb.PutResponse{}
@@ -199,23 +204,19 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error {
 	log := klog.FromContext(ctx)
 
-	log.Info("committing transaction", "events", &etcdserverpb.WatchResponse{Events: t.logEvents})
-
-	// Let's see if we can commit this transaction without conflicts
 	if len(t.logEvents) == 0 {
 		return nil
 	}
 
-	// TODO: We can probably relax this now
-	if len(t.logEvents) != 1 {
-		return fmt.Errorf("expected 1 log record, got %d", len(t.logEvents))
-	}
+	// Let's see if we can commit this transaction without conflicts
+
+	log.Info("committing transaction", "events", &etcdserverpb.WatchResponse{Events: t.logEvents})
 
 	logRecord := &persistence.LogRecord{
 		Events: t.logEvents,
 	}
 
-	newLogRevision, ok, err := t.storage.log.Append(ctx, logRecord, persistence.NewTxnMeta(t.snapshotTimestamp))
+	newLogRevision, ok, err := t.storage.log.Append(ctx, logRecord, t.meta)
 	if err != nil || !ok {
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
@@ -271,12 +272,15 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 		snapshotTimestamp: snapshotTimestamp,
 		storage:           m,
 	}
+	txn.meta = persistence.NewTxnMeta(snapshotTimestamp)
 
 	conditionsFailed := false
 	for _, cond := range req.Compare {
 		key := cond.GetKey()
 
 		existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
+
+		txn.meta.AddRead(string(key))
 
 		var prevEvent *mvccpb.Event
 		if hasExisting {
@@ -358,11 +362,13 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				if err != nil {
 					return nil, err
 				}
+				txn.meta.AddRead(string(op.GetRequestRange().Key))
 			} else {
 				rangeResp, err = txn.list(ctx, op.GetRequestRange())
 				if err != nil {
 					return nil, err
 				}
+				txn.meta.AddList(op.GetRequestRange())
 			}
 
 			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
@@ -385,6 +391,8 @@ type txn struct {
 	snapshotTimestamp Revision
 	logEvents         []*mvccpb.Event
 	storage           *MemoryStorage
+
+	meta *persistence.TxnMeta
 }
 
 // Get retrieves a key-value pair from the storage.
@@ -637,6 +645,7 @@ func (t *txn) delete(ctx context.Context, req *etcdserverpb.DeleteRangeRequest) 
 	event.PrevKv = oldEvent.Kv
 
 	t.logEvents = append(t.logEvents, event)
+	t.meta.AddWrite(string(key))
 
 	resp := &etcdserverpb.DeleteRangeResponse{
 		Deleted: 1,
@@ -814,8 +823,8 @@ func (m *MemoryStorage) Status(ctx context.Context) (*etcdserverpb.StatusRespons
 	}
 
 	return &etcdserverpb.StatusResponse{
-		Header: createHeader(revision),
-		// Version: "3.5.0",
+		Header:  createHeader(revision),
+		Version: "3.5.21",
 		// DbSize:  0,
 	}, nil
 }

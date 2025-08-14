@@ -35,6 +35,9 @@ type Watcher interface {
 
 // Storage is the interface for the underlying storage layer.
 type Storage interface {
+	// GetCurrentRevision returns the current revision of the log.
+	GetCurrentRevision(ctx context.Context) (Revision, error)
+
 	// Put writes a key-value pair to the storage.
 	Put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error)
 
@@ -50,7 +53,7 @@ type Storage interface {
 	// Watch creates a watcher for the given key/range starting from the specified revision
 	// If rangeEnd is empty, it watches a single key.
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
-	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, error)
+	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, Revision, error)
 
 	// Txn executes a transaction against the storage.
 	Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error)

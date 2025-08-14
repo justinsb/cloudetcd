@@ -200,6 +200,8 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 	newRevision := l.lastRevision + Revision(len(batch.Transactions))
 	l.lastRevision = newRevision
 
+	l.cache.notifyBatch(l.lastRevision, data)
+
 	if l.listener != nil {
 		l.listener.OnLogEntry(newRevision)
 	}

@@ -67,6 +67,14 @@ func (c *Cache) Get(ctx context.Context, revision Revision, load LoadBatchFunc, 
 	return record, nil
 }
 
+func (c *Cache) notifyBatch(firstRevision Revision, data *persistedBatch) {
+	for i, record := range data.Records {
+		pos := firstRevision + Revision(i)
+		entry := c.getEntry(pos, true)
+		entry.setRecord(record)
+	}
+}
+
 func (e *cacheEntry) setRecord(record *persistence.LogRecord) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
