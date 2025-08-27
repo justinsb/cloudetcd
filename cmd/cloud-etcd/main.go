@@ -11,7 +11,7 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/api"
 	"justinsb.com/cloudetcd/pkg/persistence/logfactory"
-	"justinsb.com/cloudetcd/pkg/storage"
+	"justinsb.com/cloudetcd/pkg/storage/memorystorage"
 )
 
 func main() {
@@ -39,7 +39,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Create storage instance
-	store, err := storage.NewMemoryStorage(log)
+	store, err := memorystorage.NewMemoryStorage(log)
 	if err != nil {
 		return fmt.Errorf("failed to create storage: %w", err)
 	}

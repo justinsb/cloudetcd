@@ -1,4 +1,4 @@
-package storage
+package memorystorage
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"justinsb.com/cloudetcd/pkg/storage"
 	"k8s.io/klog/v2"
 )
 
@@ -19,10 +20,12 @@ const (
 	RangeTypeRangeNormal
 )
 
+type Revision = storage.Revision
+
 // Watch creates a watcher for the given key/range starting from the specified revision
 // If rangeEnd is empty, it watches a single key.
 // If rangeEnd is specified, it watches the range [key, rangeEnd).
-func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, Revision, error) {
+func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (storage.Watcher, Revision, error) {
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 
