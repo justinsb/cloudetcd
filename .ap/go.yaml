@@ -1,0 +1,4 @@
+gofmt:
+  enabled: true
+govet:
+  enabled: true
