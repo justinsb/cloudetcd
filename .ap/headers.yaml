@@ -1,0 +1,6 @@
+# Configures the `fileheaders` check (part of `ap format`/`ap lint`),
+# and the license header `ap generate` stamps onto the CI scripts it creates.
+license: apache-2.0
+copyrightHolder: Justin Santa Barbara
+skip:
+  - "**/*.yaml"

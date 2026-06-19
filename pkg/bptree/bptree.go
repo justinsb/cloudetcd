@@ -1,3 +1,17 @@
+// Copyright 2026 Justin Santa Barbara
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package bptree implements an in-memory B+ tree.
 //
 // This B+ tree is used as an index for key-based lookups. It does not store
@@ -14,9 +28,6 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
-
-// TODO: Reduce and support splitting
-const maxKeys = 25600
 
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
@@ -98,36 +109,6 @@ type nodeEntry struct {
 	prefix    []byte
 	child     *node
 	revisions []Revision
-}
-
-// split splits a full node into two.
-// When a node becomes full (i.e., it contains the maximum number of keys), it is split into two nodes.
-// The middle key is promoted to the parent node, and the remaining keys are divided between the two new nodes.
-// This process ensures that the tree remains balanced.
-func (n *node) split(parent *node, i int) {
-	panic("not implemented")
-	// newChild := &node{}
-	// mid := len(n.keys) / 2
-	// parent.keys = append(parent.keys, nil)
-	// copy(parent.keys[i+1:], parent.keys[i:])
-	// parent.keys[i] = n.keys[mid]
-
-	// newChild.keys = append(newChild.keys, n.keys[mid+1:]...)
-	// n.keys = n.keys[:mid]
-
-	// if len(n.revisions) > 0 {
-	// 	newChild.revisions = append(newChild.revisions, n.revisions[mid+1:]...)
-	// 	n.revisions = n.revisions[:mid]
-	// }
-
-	// if len(n.children) > 0 {
-	// 	newChild.children = append(newChild.children, n.children[mid+1:]...)
-	// 	n.children = n.children[:mid+1]
-	// }
-
-	// parent.children = append(parent.children, nil)
-	// copy(parent.children[i+1:], parent.children[i:])
-	// parent.children[i+1] = newChild
 }
 
 func (n *node) addRevision(remainingKey []byte, revision Revision) {

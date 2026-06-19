@@ -1,0 +1,4 @@
+# General configuration for the `ap` (autoproject) tool.
+# `latest` makes generated CI run `go run github.com/gke-labs/gke-labs-infra/ap@latest`.
+# (`!self` is reserved for development inside the gke-labs-infra repo itself.)
+version: latest

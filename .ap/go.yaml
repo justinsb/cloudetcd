@@ -1,0 +1,6 @@
+# Go tooling configuration for `ap`.
+# All checks default to enabled; these are listed explicitly for clarity.
+gofmt:
+  enabled: true
+govet:
+  enabled: true
