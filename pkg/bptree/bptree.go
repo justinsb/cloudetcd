@@ -29,9 +29,6 @@ import (
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
-// TODO: Reduce and support splitting
-const maxKeys = 25600
-
 // BPTree is a B+ tree implementation. It contains a pointer to the root node
 // and a read-write mutex for concurrent access.
 type BPTree struct {
@@ -112,36 +109,6 @@ type nodeEntry struct {
 	prefix    []byte
 	child     *node
 	revisions []Revision
-}
-
-// split splits a full node into two.
-// When a node becomes full (i.e., it contains the maximum number of keys), it is split into two nodes.
-// The middle key is promoted to the parent node, and the remaining keys are divided between the two new nodes.
-// This process ensures that the tree remains balanced.
-func (n *node) split(parent *node, i int) {
-	panic("not implemented")
-	// newChild := &node{}
-	// mid := len(n.keys) / 2
-	// parent.keys = append(parent.keys, nil)
-	// copy(parent.keys[i+1:], parent.keys[i:])
-	// parent.keys[i] = n.keys[mid]
-
-	// newChild.keys = append(newChild.keys, n.keys[mid+1:]...)
-	// n.keys = n.keys[:mid]
-
-	// if len(n.revisions) > 0 {
-	// 	newChild.revisions = append(newChild.revisions, n.revisions[mid+1:]...)
-	// 	n.revisions = n.revisions[:mid]
-	// }
-
-	// if len(n.children) > 0 {
-	// 	newChild.children = append(newChild.children, n.children[mid+1:]...)
-	// 	n.children = n.children[:mid+1]
-	// }
-
-	// parent.children = append(parent.children, nil)
-	// copy(parent.children[i+1:], parent.children[i:])
-	// parent.children[i+1] = newChild
 }
 
 func (n *node) addRevision(remainingKey []byte, revision Revision) {

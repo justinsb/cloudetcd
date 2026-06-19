@@ -104,10 +104,6 @@ type activeWatch struct {
 	closed int32 // atomic flag
 }
 
-func (aw *activeWatch) isClosed() bool {
-	return atomic.LoadInt32(&aw.closed) == 1
-}
-
 func (aw *activeWatch) close() {
 	if atomic.CompareAndSwapInt32(&aw.closed, 0, 1) {
 		if aw.watcher != nil {

@@ -129,12 +129,6 @@ func (b *TxnBatch) add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 	// })
 }
 
-func (b *TxnBatch) isFlushed() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.flushed
-}
-
 func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, error) {
 	log := klog.FromContext(ctx)
 
