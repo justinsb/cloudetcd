@@ -1,6 +1,6 @@
 module justinsb.com/cloudetcd
 
-go 1.24.5
+go 1.26.4
 
 require (
 	cloud.google.com/go/storage v1.56.0
