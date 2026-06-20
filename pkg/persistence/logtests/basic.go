@@ -766,6 +766,31 @@ func TestLog_BatchCommit(t *testing.T, log persistence.Log) {
 	// })
 }
 
+// appendResult holds the outcome of a single concurrent Append.
+type appendResult struct {
+	rev Revision
+	ok  bool
+	err error
+}
+
+// appendConcurrently launches one Append per (record, meta) pair concurrently
+// and returns the results in the same order once all have completed.
+func appendConcurrently(log persistence.Log, records []*LogRecord, metas []*persistence.TxnMeta) []appendResult {
+	ctx := context.Background()
+
+	results := make([]appendResult, len(records))
+	var wg sync.WaitGroup
+	for i := range records {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i].rev, results[i].ok, results[i].err = log.Append(ctx, records[i], metas[i])
+		}(i)
+	}
+	wg.Wait()
+	return results
+}
+
 func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 	ctx := context.Background()
 
@@ -784,11 +809,25 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 	}, NewTxnMeta(1))
 
 	t.Run("read-write conflict prevents batching", func(t *testing.T) {
-		// Transaction 1: Read existing key, write to audit
-		txn1Meta := NewTxnMeta(2)
+		// This exercises a genuine, *cyclic* read-write conflict (a write-skew
+		// anti-dependency): each transaction reads a key that the other writes.
+		//   txn1: read existing:key, write audit:1
+		//   txn2: read audit:1,      write existing:key
+		// No serial order is consistent with both reads, so the engine must reject
+		// one of them. Because the conflict is symmetric, CanBatchTogether returns
+		// false in *both* arrival orders (see pkg/persistence/batch/batch.go), so the
+		// two transactions are never placed in the same batch; the second batch to
+		// flush is then rejected by snapshot-revision validation (its snapshot no
+		// longer matches the advanced log position). The outcome is therefore
+		// deterministic regardless of goroutine scheduling: exactly one commits.
+		baseRev, err := log.GetCurrentRevision(ctx)
+		if err != nil {
+			t.Fatalf("GetCurrentRevision failed: %v", err)
+		}
+
+		txn1Meta := NewTxnMeta(baseRev)
 		txn1Meta.AddRead("existing:key")
 		txn1Meta.AddWrite("audit:1")
-
 		txn1Record := &LogRecord{
 			Events: []*mvccpb.Event{
 				{
@@ -801,10 +840,9 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 			},
 		}
 
-		// Transaction 2: Update the existing key
-		txn2Meta := NewTxnMeta(2)
+		txn2Meta := NewTxnMeta(baseRev)
+		txn2Meta.AddRead("audit:1")       // Conflicts with txn1's write
 		txn2Meta.AddWrite("existing:key") // Conflicts with txn1's read
-
 		txn2Record := &LogRecord{
 			Events: []*mvccpb.Event{
 				{
@@ -817,43 +855,110 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 			},
 		}
 
-		// // Verify they cannot be batched
-		// canBatch := txn1Meta.CanBatchWith(txn2Meta)
-		// if canBatch {
-		// 	t.Error("Expected transactions to have read-write conflict, but CanBatchWith returned true")
-		// }
+		results := appendConcurrently(log, []*LogRecord{txn1Record, txn2Record}, []*persistence.TxnMeta{txn1Meta, txn2Meta})
+		for i, r := range results {
+			if r.err != nil {
+				t.Fatalf("Transaction %d returned an unexpected error: %v", i+1, r.err)
+			}
+			if r.ok {
+				t.Logf("Transaction %d succeeded with revision %d", i+1, r.rev)
+			}
+		}
 
-		// Execute both transactions concurrently
-		var wg sync.WaitGroup
-		var rev1, rev2 Revision
-		var err1, err2 error
-		var ok1, ok2 bool
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			rev1, ok1, err1 = log.Append(ctx, txn1Record, txn1Meta)
-		}()
-		go func() {
-			defer wg.Done()
-			rev2, ok2, err2 = log.Append(ctx, txn2Record, txn2Meta)
-		}()
-
-		wg.Wait()
-
-		// One should succeed, one should fail
 		successCount := 0
-		if err1 == nil && ok1 {
-			successCount++
-			t.Logf("Transaction 1 succeeded with revision %d", rev1)
+		for _, r := range results {
+			if r.ok {
+				successCount++
+			}
 		}
-		if err2 == nil && ok2 {
-			successCount++
-			t.Logf("Transaction 2 succeeded with revision %d", rev2)
+		if successCount != 1 {
+			t.Errorf("Expected exactly 1 success for a cyclic read-write conflict, got %d", successCount)
+		}
+	})
+
+	t.Run("read-only antidependency is serializable and may batch", func(t *testing.T) {
+		// This is the asymmetric, *acyclic* antidependency that the conflict detector
+		// deliberately permits (see the "read-write - can batch" case in
+		// pkg/persistence/batch/batch_test.go):
+		//   txn1: read existing:key, write audit:2
+		//   txn2:                    write existing:key   (no reads)
+		// The single dependency txn1 -> txn2 forms no cycle, so [txn1, txn2] is a
+		// valid serialization: txn1's read of existing:key legitimately observes the
+		// value as of before txn2's write. The engine is therefore free to commit
+		// BOTH (when txn1 is ordered first in a batch) or just one (when txn2 commits
+		// first and invalidates txn1's snapshot). Both outcomes are correct, so this
+		// test asserts the serializability invariant rather than a fixed count -- the
+		// previous "exactly 1 success" assertion was too strict and flaky.
+		baseRev, err := log.GetCurrentRevision(ctx)
+		if err != nil {
+			t.Fatalf("GetCurrentRevision failed: %v", err)
 		}
 
-		if successCount != 1 {
-			t.Errorf("Expected exactly 1 success due to conflict, got %d", successCount)
+		txn1Meta := NewTxnMeta(baseRev)
+		txn1Meta.AddRead("existing:key")
+		txn1Meta.AddWrite("audit:2")
+		txn1Record := &LogRecord{
+			Events: []*mvccpb.Event{
+				{
+					Type: mvccpb.PUT,
+					Kv: &mvccpb.KeyValue{
+						Key:   []byte("audit:2"),
+						Value: []byte("read existing:key"),
+					},
+				},
+			},
+		}
+
+		txn2Meta := NewTxnMeta(baseRev)
+		txn2Meta.AddWrite("existing:key")
+		txn2Record := &LogRecord{
+			Events: []*mvccpb.Event{
+				{
+					Type: mvccpb.PUT,
+					Kv: &mvccpb.KeyValue{
+						Key:   []byte("existing:key"),
+						Value: []byte("updated-value"),
+					},
+				},
+			},
+		}
+
+		results := appendConcurrently(log, []*LogRecord{txn1Record, txn2Record}, []*persistence.TxnMeta{txn1Meta, txn2Meta})
+		for i, r := range results {
+			if r.err != nil {
+				t.Fatalf("Transaction %d returned an unexpected error: %v", i+1, r.err)
+			}
+		}
+		txn1Res, txn2Res := results[0], results[1]
+
+		successCount := 0
+		for _, r := range results {
+			if r.ok {
+				successCount++
+			}
+		}
+
+		switch successCount {
+		case 1:
+			// Liveness: the two transactions have disjoint writes, so at least one of
+			// them always commits, taking the next revision slot.
+			committedRev := txn1Res.rev
+			if !txn1Res.ok {
+				committedRev = txn2Res.rev
+			}
+			if committedRev != baseRev+1 {
+				t.Errorf("the surviving transaction committed at revision %d, want %d", committedRev, baseRev+1)
+			}
+		case 2:
+			// Serializable only as [txn1(reader), txn2(writer)]: txn1 must take the
+			// next revision and txn2 the one after it. Observing txn2 < txn1 here
+			// would mean the writer was serialized before the reader that read the
+			// pre-update value -- a real serializability violation.
+			if txn1Res.rev != baseRev+1 || txn2Res.rev != baseRev+2 {
+				t.Errorf("both committed but not serialized reader-before-writer: txn1 rev=%d, txn2 rev=%d, base=%d", txn1Res.rev, txn2Res.rev, baseRev)
+			}
+		default:
+			t.Errorf("Expected 1 or 2 successes for an acyclic antidependency, got %d", successCount)
 		}
 	})
 }
