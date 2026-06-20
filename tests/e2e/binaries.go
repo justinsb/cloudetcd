@@ -20,13 +20,16 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
-// defaultKubeVersion is the kube-apiserver release downloaded by default.
-// Override with the KUBE_APISERVER_VERSION environment variable.
+// defaultKubeVersion is the kube-apiserver release used by default. Override
+// with the KUBE_APISERVER_VERSION environment variable. On Linux this is the
+// exact dl.k8s.io release; on macOS its minor version selects the envtest build.
 const defaultKubeVersion = "v1.36.2"
 
 func kubeVersion() string {
@@ -36,13 +39,16 @@ func kubeVersion() string {
 	return defaultKubeVersion
 }
 
-// skipIfUnsupported skips the test on platforms where kube-apiserver is not
-// published. dl.k8s.io ships kube-apiserver only for linux/{amd64,arm64};
-// macOS users normally obtain it via envtest/kubebuilder instead.
+// skipIfUnsupported skips the test on platforms where we cannot obtain a
+// kube-apiserver binary. It is available for linux/{amd64,arm64} from dl.k8s.io
+// and for darwin/{amd64,arm64} from the envtest (kubebuilder-tools) distribution.
 func skipIfUnsupported(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS != "linux" {
-		t.Skipf("kube-apiserver is published only for linux on dl.k8s.io (current platform: %s/%s); run this e2e in CI or a Linux environment", runtime.GOOS, runtime.GOARCH)
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		return
+	default:
+		t.Skipf("kube-apiserver e2e supports only linux (dl.k8s.io) and darwin (envtest); current platform: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 }
 
@@ -65,9 +71,21 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-// ensureKubeAPIServer downloads (and caches under .build/) the kube-apiserver
-// binary for the current platform, returning the path to the executable.
+// ensureKubeAPIServer returns the path to a kube-apiserver binary for the
+// current platform, downloading and caching it under .build/ if necessary.
+// On Linux it fetches the official release from dl.k8s.io; on macOS, where
+// dl.k8s.io has no server builds, it uses setup-envtest (kubebuilder-tools).
 func ensureKubeAPIServer(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		return ensureKubeAPIServerFromEnvtest(ctx, t)
+	}
+	return ensureKubeAPIServerFromRelease(ctx, t)
+}
+
+// ensureKubeAPIServerFromRelease downloads the official kube-apiserver release
+// binary from dl.k8s.io (Linux).
+func ensureKubeAPIServerFromRelease(ctx context.Context, t *testing.T) string {
 	t.Helper()
 	version := kubeVersion()
 	cacheDir := filepath.Join(repoRoot(t), ".build", "e2e-bin", version)
@@ -96,6 +114,63 @@ func ensureKubeAPIServer(ctx context.Context, t *testing.T) string {
 		t.Fatalf("rename kube-apiserver into place: %v", err)
 	}
 	return binPath
+}
+
+// ensureKubeAPIServerFromEnvtest uses setup-envtest to download the
+// kubebuilder-tools bundle (which includes a darwin kube-apiserver) and returns
+// the path to its kube-apiserver. envtest publishes one build per minor version,
+// so we request the minor of kubeVersion() (e.g. "1.36.x") and let it pick the
+// latest available patch, which may differ from the dl.k8s.io patch.
+func ensureKubeAPIServerFromEnvtest(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	binDir := filepath.Join(repoRoot(t), ".build", "envtest")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", binDir, err)
+	}
+
+	selector := envtestVersionSelector(kubeVersion())
+	module := "sigs.k8s.io/controller-runtime/tools/setup-envtest@" + setupEnvtestRef()
+	t.Logf("fetching kube-apiserver via setup-envtest (version %s, %s/%s) into %s", selector, runtime.GOOS, runtime.GOARCH, binDir)
+
+	// `setup-envtest use ... -p path` downloads/caches the bundle (a no-op when
+	// already present) and prints the directory containing the binaries.
+	cmd := exec.CommandContext(ctx, "go", "run", module,
+		"use", selector,
+		"--bin-dir", binDir,
+		"--os", runtime.GOOS,
+		"--arch", runtime.GOARCH,
+		"-p", "path",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("setup-envtest failed: %v\n%s", err, stderr.String())
+	}
+
+	dir := strings.TrimSpace(string(out))
+	binPath := filepath.Join(dir, "kube-apiserver")
+	if _, err := os.Stat(binPath); err != nil {
+		t.Fatalf("kube-apiserver not found at %s after setup-envtest: %v", binPath, err)
+	}
+	return binPath
+}
+
+func setupEnvtestRef() string {
+	if v := os.Getenv("SETUP_ENVTEST_VERSION"); v != "" {
+		return v
+	}
+	return "latest"
+}
+
+// envtestVersionSelector converts a kube version like "v1.36.2" into the envtest
+// selector "1.36.x".
+func envtestVersionSelector(v string) string {
+	v = strings.TrimPrefix(v, "v")
+	if parts := strings.Split(v, "."); len(parts) >= 2 {
+		return parts[0] + "." + parts[1] + ".x"
+	}
+	return v
 }
 
 func download(ctx context.Context, url, dest string) error {
