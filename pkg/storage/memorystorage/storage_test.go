@@ -15,7 +15,6 @@
 package memorystorage
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -40,7 +39,7 @@ func TestMemoryStorage_Put(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Test basic put
 	key := []byte("test-key")
@@ -74,7 +73,7 @@ func TestMemoryStorage_Get(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put a key-value pair
 	key := []byte("test-key")
@@ -121,7 +120,7 @@ func TestMemoryStorage_Delete(t *testing.T) {
 	if storageErr != nil {
 		t.Fatalf("Failed to create storage: %v", storageErr)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put a key-value pair
 	key := []byte("test-key")
@@ -164,7 +163,7 @@ func TestMemoryStorage_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put several key-value pairs
 	testData := map[string]string{
@@ -248,7 +247,7 @@ func TestMemoryStorage_RevisionOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put a key
 	key := []byte("test-key")
@@ -292,7 +291,7 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Test concurrent puts
 	done := make(chan bool, 10)
@@ -328,7 +327,7 @@ func TestMemoryStorage_MVCCBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put a key
 	key := []byte("test-key")
@@ -395,7 +394,7 @@ func TestMemoryStorage_RangeQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put some test data
 	testData := map[string]string{
@@ -460,7 +459,7 @@ func TestMemoryStorage_Watch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("Storage Watch Interface", func(t *testing.T) {
 		var events []*mvccpb.Event

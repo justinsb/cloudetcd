@@ -15,7 +15,6 @@
 package gcslog
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -33,7 +32,7 @@ func TestGCSLog(t *testing.T) {
 		t.Skip("Skipping GCS test: TEST_GCS_BUCKET environment variable not set")
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create GCS log
 	logFactory := func(t *testing.T) persistence.Log {

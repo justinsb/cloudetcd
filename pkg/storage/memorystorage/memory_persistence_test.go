@@ -15,7 +15,6 @@
 package memorystorage
 
 import (
-	"context"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -25,7 +24,7 @@ import (
 )
 
 func TestMemoryStorage_WithPersistence(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a memory log
 	memoryLog := memorylog.New()

@@ -15,7 +15,6 @@
 package filesystemlog
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -51,7 +50,7 @@ func TestFilesystemLog_All(t *testing.T) {
 
 func TestFilesystemLog_Restart(t *testing.T) {
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	log1 := makeTestFilesystemLog(t)
 
@@ -156,7 +155,7 @@ func TestFilesystemLog_Restart(t *testing.T) {
 }
 
 func TestFilesystemLog_ExampleUsage(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	log := makeTestFilesystemLog(t)
 

@@ -65,7 +65,7 @@ func NewHarness(t *testing.T) *Harness {
 	t.Helper()
 	skipIfUnsupported(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
 	workDir := t.TempDir()
