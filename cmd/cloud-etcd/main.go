@@ -19,7 +19,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 
@@ -36,8 +35,9 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Cancel the context on SIGINT/SIGTERM for graceful shutdown.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// Parse command line flag
 	addr := ":2379"
@@ -60,16 +60,6 @@ func run(ctx context.Context) error {
 
 	// Create and start the etcd API server
 	server := api.NewServer(store)
-
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down server...")
-		cancel()
-	}()
 
 	// Start the server
 	if err := server.Start(ctx, addr); err != nil {
