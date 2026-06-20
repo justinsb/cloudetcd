@@ -26,7 +26,7 @@ import (
 )
 
 func TestLeaseFunctionality(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Create storage and server
 	store, err := memorystorage.NewMemoryStorage(memorylog.New())

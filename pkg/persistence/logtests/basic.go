@@ -77,7 +77,7 @@ func RunAll(t *testing.T, logFactory func(t *testing.T) persistence.Log) {
 }
 
 func TestLog_Append(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Add the dummy record
 	revision0, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0))
@@ -136,7 +136,7 @@ func TestLog_Append(t *testing.T, log persistence.Log) {
 }
 
 func TestLog_Read(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Add the dummy record
 	rev, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0))
@@ -224,7 +224,7 @@ func TestLog_Read(t *testing.T, log persistence.Log) {
 
 func TestLog_ReadWithLimit(t *testing.T, log persistence.Log) {
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	{ // Add the dummy record
 		revision0, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0))
@@ -286,7 +286,7 @@ func TestLog_ReadWithLimit(t *testing.T, log persistence.Log) {
 }
 
 func TestLog_ReadFromInvalidRevision(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Try to read from invalid revision
 	records := make(map[Revision]*LogRecord)
@@ -302,7 +302,7 @@ func TestLog_ReadFromInvalidRevision(t *testing.T, log persistence.Log) {
 }
 
 func TestLog_ConcurrentAppend(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Add the dummy record
 	revision0, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0))
@@ -374,7 +374,7 @@ func TestLog_ConcurrentAppend(t *testing.T, log persistence.Log) {
 
 func TestLog_ReadFromRevision(t *testing.T, log persistence.Log) {
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Add multiple records
 	for i := 0; i < 5; i++ {
@@ -421,7 +421,7 @@ func TestLog_ReadFromRevision(t *testing.T, log persistence.Log) {
 
 func TestLog_EmptyDirectory(t *testing.T, log persistence.Log) {
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Test initial revision
 	revision, err := log.GetCurrentRevision(ctx)
@@ -446,7 +446,7 @@ func TestLog_EmptyDirectory(t *testing.T, log persistence.Log) {
 }
 
 func TestLog_BasicOperations(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Test initial state
 	revision, err := log.GetCurrentRevision(ctx)
@@ -572,7 +572,7 @@ func TestLog_BasicOperations(t *testing.T, log persistence.Log) {
 }
 
 func TestLog_BatchCommit(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Initialize with dummy record
 	_, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0))
@@ -806,7 +806,7 @@ func appendConcurrently(log persistence.Log, records []*LogRecord, metas []*pers
 }
 
 func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Initialize with dummy record and some initial data
 	log.Append(ctx, &LogRecord{}, NewTxnMeta(0))

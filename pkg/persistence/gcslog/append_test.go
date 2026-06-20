@@ -15,7 +15,6 @@
 package gcslog
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -25,7 +24,7 @@ import (
 )
 
 func TestAppend(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	log := klog.FromContext(ctx)
 
