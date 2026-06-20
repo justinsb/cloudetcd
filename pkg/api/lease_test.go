@@ -102,9 +102,12 @@ func TestLeaseFunctionality(t *testing.T) {
 	_, err = cli.Revoke(ctx, lease2.ID)
 	require.NoError(t, err)
 
-	resp, err = cli.Get(ctx, "lease-key-2")
-	require.NoError(t, err)
-	require.Len(t, resp.Kvs, 0)
+	// Revocation deletes the key asynchronously via the lease manager's
+	// delete queue, so poll until the key is gone rather than checking once.
+	require.Eventually(t, func() bool {
+		resp, err := cli.Get(ctx, "lease-key-2")
+		return err == nil && len(resp.Kvs) == 0
+	}, 5*time.Second, 50*time.Millisecond)
 
 	// 8. Test KeepAlive
 	lease3, err := cli.Grant(ctx, 2)
