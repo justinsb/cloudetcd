@@ -97,9 +97,9 @@ Every `Put` and `Delete` operation is automatically appended to the log before b
 
 Planned implementations include:
 
-- **DynamoDBLog**: A DynamoDB-backed implementation for production use
+- **GCSLog**: A Google Cloud Storage (GCS)-backed implementation for production use
 - **FileLog**: A file-based implementation for local development
-- **DynamoDBSnapshotter**: A DynamoDB-backed snapshot implementation
+- **GCSSnapshotter**: A Google Cloud Storage (GCS)-backed snapshot implementation
 
 ## Usage Example
 

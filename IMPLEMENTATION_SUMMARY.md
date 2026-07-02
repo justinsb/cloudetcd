@@ -119,13 +119,13 @@ kube-apiserver \
                                   │
                     ┌─────────────▼─────────────┐
                     │    Storage Interface      │
-                    │    (Memory/DynamoDB)     │
+                    │    (Memory/GCS)          │
                     └───────────────────────────┘
 ```
 
 ## Next Steps
 
-1. **DynamoDB Implementation**: Replace memory storage with DynamoDB
+1. **GCS Implementation**: Replace memory storage with Google Cloud Storage (GCS)
 2. **Local Cache**: Implement persistent local cache (BoltDB/LevelDB)
 3. **Replicator**: Implement background replication from cloud storage
 4. **Watch API**: Implement etcd's watch functionality

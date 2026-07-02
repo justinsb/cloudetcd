@@ -1,10 +1,12 @@
 # cloud-etcd
 
-A custom implementation of the etcd API designed to be backed by cloud storage services, initially targeting AWS DynamoDB.
+A custom implementation of the etcd API designed to be backed by cloud storage services, with Google Cloud Storage (GCS) as the target.
 
 ## Overview
 
-cloud-etcd provides an etcd-compatible API endpoint that can be used as a backend for Kubernetes (specifically `kube-apiserver`), while leveraging cloud-native storage for persistence and scalability.
+cloud-etcd provides an etcd-compatible API endpoint that can be used as a backend for Kubernetes (specifically `kube-apiserver`), while leveraging cloud-native storage for persistence and durability.
+
+The goal is not raw performance — it is to be **simple and low cost**. By treating an object store like GCS as the source of truth, cloud-etcd avoids running and operating a stateful etcd cluster, and instead relies on the durability, availability, and low cost of managed object storage.
 
 The core design principle is to treat the cloud storage as a write-ahead log (or change log). A local, on-disk cache stores the materialized view of the data for fast read access. This approach avoids the need for a traditional distributed consensus protocol like Raft, as it relies on the consistency guarantees of the underlying cloud storage service.
 
@@ -90,7 +92,7 @@ cloudetcd/
 
 ## Next Steps
 
-1. **DynamoDB Implementation**: Implement the storage interface using DynamoDB
+1. **GCS Implementation**: Implement the storage interface using Google Cloud Storage (GCS)
 2. **Local Cache**: Implement persistent local cache (BoltDB/LevelDB)
 3. **Replicator**: Implement the component that keeps local cache in sync
 4. **Watch API**: Implement etcd's watch functionality
