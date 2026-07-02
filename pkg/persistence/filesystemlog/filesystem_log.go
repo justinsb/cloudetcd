@@ -54,6 +54,8 @@ type FilesystemLog struct {
 }
 
 var _ persistence.Log = &FilesystemLog{}
+var _ persistence.BatchAppender = &FilesystemLog{}
+var _ persistence.Truncater = &FilesystemLog{}
 
 // NewFilesystemLog creates a new filesystem-backed log
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
@@ -125,6 +127,35 @@ func (f *FilesystemLog) replay() error {
 // Append adds a new record to the log and returns the revision number
 func (f *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error) {
 	return f.batching.Add(ctx, logRecord, txnMeta)
+}
+
+// AppendBatch appends a contiguous range of records starting at lastRevision+1, preserving revisions.
+func (f *FilesystemLog) AppendBatch(ctx context.Context, lastRevision Revision, records []*LogRecord) (bool, error) {
+	return f.batching.AddBatch(ctx, lastRevision, records)
+}
+
+// Truncate discards records with revisions <= throughRevision.
+// It only removes whole log files, and always retains the newest file so that
+// the current revision can be recovered after a restart.
+func (f *FilesystemLog) Truncate(ctx context.Context, throughRevision Revision) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var kept []logFileMeta
+	for i, fileMeta := range f.logFiles {
+		fileLastRevision := fileMeta.firstRevision + Revision(fileMeta.count) - 1
+		if fileLastRevision <= throughRevision && i < len(f.logFiles)-1 {
+			filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
+			if err := os.Remove(filepath.Join(f.dir, filename)); err != nil {
+				f.logFiles = append(kept, f.logFiles[i:]...)
+				return fmt.Errorf("failed to remove log file %q: %w", filename, err)
+			}
+		} else {
+			kept = append(kept, fileMeta)
+		}
+	}
+	f.logFiles = kept
+	return nil
 }
 
 type persistedBatch struct {

@@ -42,6 +42,7 @@ type MemoryLog struct {
 }
 
 var _ persistence.Log = &MemoryLog{}
+var _ persistence.BatchAppender = &MemoryLog{}
 
 // New creates a new memory-backed log
 func New() *MemoryLog {
@@ -58,6 +59,11 @@ func New() *MemoryLog {
 // Append adds a new record to the log and returns the revision number
 func (l *MemoryLog) Append(ctx context.Context, logRecord *LogRecord, txnMeta *persistence.TxnMeta) (Revision, bool, error) {
 	return l.batching.Add(ctx, logRecord, txnMeta)
+}
+
+// AppendBatch appends a contiguous range of records starting at lastRevision+1, preserving revisions.
+func (l *MemoryLog) AppendBatch(ctx context.Context, lastRevision Revision, records []*LogRecord) (bool, error) {
+	return l.batching.AddBatch(ctx, lastRevision, records)
 }
 
 // commitBatch commits all transactions in the current batch

@@ -57,6 +57,7 @@ type GCSLog struct {
 }
 
 var _ persistence.Log = &GCSLog{}
+var _ persistence.BatchAppender = &GCSLog{}
 
 type persistedBatch struct {
 	Records []*persistence.LogRecord
@@ -157,6 +158,12 @@ func (g *GCSLog) replay(ctx context.Context) error {
 // Append adds a new record to the log and returns the revision number
 func (g *GCSLog) Append(ctx context.Context, logRecord *persistence.LogRecord, txnMeta *persistence.TxnMeta) (Revision, bool, error) {
 	return g.batching.Add(ctx, logRecord, txnMeta)
+}
+
+// AppendBatch appends a contiguous range of records starting at lastRevision+1,
+// preserving revisions. The whole range is written as a single GCS object.
+func (g *GCSLog) AppendBatch(ctx context.Context, lastRevision Revision, records []*persistence.LogRecord) (bool, error) {
+	return g.batching.AddBatch(ctx, lastRevision, records)
 }
 
 // commitBatch commits all transactions in the current batch
