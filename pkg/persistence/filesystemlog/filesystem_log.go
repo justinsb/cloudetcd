@@ -198,8 +198,9 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 		return fmt.Errorf("failed to marshal log records: %w", err)
 	}
 
-	// Write to file atomically
-	if err := os.WriteFile(filepath, b, 0644); err != nil {
+	// Write and fsync: this is the commit point, so the record must be
+	// durable on disk (not just in the page cache) before we acknowledge.
+	if err := writeFileSync(filepath, b, 0644); err != nil {
 		return fmt.Errorf("failed to write log file: %w", err)
 	}
 
@@ -326,6 +327,34 @@ func (f *FilesystemLog) SetListener(listener LogListener) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listener = listener
+}
+
+// writeFileSync writes data to path and fsyncs both the file and its parent
+// directory, so that the file and its directory entry survive a machine crash
+// or power loss, not just a process crash.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // batchToFilename converts a first-revision and count to a filename
