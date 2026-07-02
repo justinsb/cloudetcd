@@ -91,6 +91,39 @@ func (b *Batching) Add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 	}
 }
 
+// AddBatch appends a contiguous batch of records whose first record lands at
+// lastLogPosition+1, bypassing the batching window and conflict checks.
+// The records must already carry their final revisions in their events; unlike
+// Add, no revision stamping is performed. This is intended for bulk copies
+// between logs (e.g. tiering or replication) where revision numbers must be
+// preserved exactly.
+// It returns false (with no error) if the log has moved past lastLogPosition.
+func (b *Batching) AddBatch(ctx context.Context, lastLogPosition Revision, records []*LogRecord) (bool, error) {
+	if len(records) == 0 {
+		return true, nil
+	}
+
+	b.flushLock.Lock()
+	defer b.flushLock.Unlock()
+
+	if b.lastLogPosition != lastLogPosition {
+		return false, nil
+	}
+
+	commit := &BatchCommit{
+		Transactions: make([]*PendingTxn, len(records)),
+	}
+	for i, record := range records {
+		commit.Transactions[i] = &PendingTxn{LogRecord: record}
+	}
+
+	if err := b.flushFunc(ctx, lastLogPosition, commit); err != nil {
+		return false, err
+	}
+	b.lastLogPosition += Revision(len(records))
+	return true, nil
+}
+
 func (b *Batching) doBackgroundFlush() {
 	for {
 		b.batchLock.Lock()
