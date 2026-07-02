@@ -16,31 +16,43 @@ package persistence
 
 import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
-	"k8s.io/klog/v2"
 )
 
 // TxnMeta represents the read and write sets of a transaction
 // to enable serializability checking for batch commits
 type TxnMeta struct {
 	SnapshotRevision Revision
-	// ReadSet contains keys that were read during the transaction
-	ReadSet map[string]bool
+	// ReadSet maps each point key read during the transaction to the
+	// mod_revision observed for that key at snapshot time. A key that did
+	// not exist at snapshot time maps to revision 0. This is used for
+	// per-key (backward-validation) conflict detection at commit time: a
+	// read key is still valid iff it has not been written by a
+	// concurrently-committed transaction since it was read.
+	ReadSet map[string]Revision
 	// WriteSet contains keys that will be written during the transaction
 	WriteSet map[string]bool
+	// HasRangeRead is true if the transaction performed a range/list read.
+	// Range reads cannot be validated per-key (they are vulnerable to
+	// phantoms), so a transaction that recorded one falls back to the
+	// conservative whole-snapshot conflict check. Kubernetes never combines
+	// a range read with a write in the same etcd transaction, so this
+	// fallback is not expected to fire for the Kubernetes workload.
+	HasRangeRead bool
 }
 
 // NewTxnMeta creates a new TxnEffects instance
 func NewTxnMeta(snapshotRevision Revision) *TxnMeta {
 	return &TxnMeta{
-		ReadSet:          make(map[string]bool),
+		ReadSet:          make(map[string]Revision),
 		WriteSet:         make(map[string]bool),
 		SnapshotRevision: snapshotRevision,
 	}
 }
 
-// AddRead records a read operation on a key at a specific revision
-func (t *TxnMeta) AddRead(key string) {
-	t.ReadSet[key] = true
+// AddRead records a read of a point key, along with the mod_revision that was
+// observed for that key at snapshot time (0 if the key did not exist).
+func (t *TxnMeta) AddRead(key string, modRevision Revision) {
+	t.ReadSet[key] = modRevision
 }
 
 // AddWrite records a write operation on a key
@@ -48,7 +60,9 @@ func (t *TxnMeta) AddWrite(key string) {
 	t.WriteSet[key] = true
 }
 
-// AddList records a list-read operation
+// AddList records a list-read operation. Per-key validation cannot reason
+// about phantoms in a range, so we flag the transaction to fall back to the
+// conservative whole-snapshot conflict check at commit time.
 func (t *TxnMeta) AddList(readRange *etcdserverpb.RangeRequest) {
-	klog.Warningf("AddList is not implemented")
+	t.HasRangeRead = true
 }

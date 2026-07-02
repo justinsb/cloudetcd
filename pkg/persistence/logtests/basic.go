@@ -70,6 +70,10 @@ func RunAll(t *testing.T, logFactory func(t *testing.T) persistence.Log) {
 		log := logFactory(t)
 		TestLog_BatchCommit_ReadWriteConflicts(t, log)
 	})
+	t.Run("BatchCommit_DisjointKeysNoFalseAbort", func(t *testing.T) {
+		log := logFactory(t)
+		TestLog_BatchCommit_DisjointKeysNoFalseAbort(t, log)
+	})
 	t.Run("ReadFromRevision", func(t *testing.T) {
 		log := logFactory(t)
 		TestLog_ReadFromRevision(t, log)
@@ -476,7 +480,9 @@ func TestLog_BasicOperations(t *testing.T, log persistence.Log) {
 		},
 	}
 
-	newRevision, success, err := log.Append(ctx, record, NewTxnMeta(1))
+	meta1 := NewTxnMeta(1)
+	meta1.AddWrite("test-key")
+	newRevision, success, err := log.Append(ctx, record, meta1)
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
@@ -517,8 +523,11 @@ func TestLog_BasicOperations(t *testing.T, log persistence.Log) {
 		t.Errorf("Expected value %s, got %s", string(record.Events[0].Kv.Value), string(retrievedRecord.Events[0].Kv.Value))
 	}
 
-	// Test conditional append with wrong condition
-	_, success, err = log.Append(ctx, record, NewTxnMeta(1)) // Wrong condition position
+	// Test conditional append with wrong condition: a stale snapshot that
+	// rewrites test-key conflicts with the rev-2 write of the same key.
+	staleMeta := NewTxnMeta(1) // Wrong condition position
+	staleMeta.AddWrite("test-key")
+	_, success, err = log.Append(ctx, record, staleMeta)
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
@@ -527,7 +536,9 @@ func TestLog_BasicOperations(t *testing.T, log persistence.Log) {
 	}
 
 	// Test conditional append with correct condition
-	newRevision2, success, err := log.Append(ctx, record, NewTxnMeta(2))
+	meta2 := NewTxnMeta(2)
+	meta2.AddWrite("test-key")
+	newRevision2, success, err := log.Append(ctx, record, meta2)
 	if err != nil {
 		t.Fatalf("Failed to append record: %v", err)
 	}
@@ -840,7 +851,7 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 		}
 
 		txn1Meta := NewTxnMeta(baseRev)
-		txn1Meta.AddRead("existing:key")
+		txn1Meta.AddRead("existing:key", baseRev)
 		txn1Meta.AddWrite("audit:1")
 		txn1Record := &LogRecord{
 			Events: []*mvccpb.Event{
@@ -855,8 +866,8 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 		}
 
 		txn2Meta := NewTxnMeta(baseRev)
-		txn2Meta.AddRead("audit:1")       // Conflicts with txn1's write
-		txn2Meta.AddWrite("existing:key") // Conflicts with txn1's read
+		txn2Meta.AddRead("audit:1", baseRev) // Conflicts with txn1's write
+		txn2Meta.AddWrite("existing:key")    // Conflicts with txn1's read
 		txn2Record := &LogRecord{
 			Events: []*mvccpb.Event{
 				{
@@ -909,7 +920,7 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 		}
 
 		txn1Meta := NewTxnMeta(baseRev)
-		txn1Meta.AddRead("existing:key")
+		txn1Meta.AddRead("existing:key", baseRev)
 		txn1Meta.AddWrite("audit:2")
 		txn1Record := &LogRecord{
 			Events: []*mvccpb.Event{
@@ -975,4 +986,67 @@ func TestLog_BatchCommit_ReadWriteConflicts(t *testing.T, log persistence.Log) {
 			t.Errorf("Expected 1 or 2 successes for an acyclic antidependency, got %d", successCount)
 		}
 	})
+}
+
+// TestLog_BatchCommit_DisjointKeysNoFalseAbort is a regression test for
+// per-key conflict detection. Writers that touch entirely disjoint keys must
+// all commit, even when they are validated in *different* batches so their
+// snapshot no longer matches the (advanced) log position.
+//
+// This is the exact false-abort the previous coarse "SnapshotRevision !=
+// lastLogPosition" check suffered under concurrency: txn A writes /a and txn B
+// writes /b, both snapshot the same revision; if A commits first, B used to be
+// rejected purely because the global revision moved, despite touching nothing
+// A wrote -- forcing a needless apiserver write retry.
+func TestLog_BatchCommit_DisjointKeysNoFalseAbort(t *testing.T, log persistence.Log) {
+	ctx := t.Context()
+
+	// Initialize with a dummy record so the log starts at revision 1.
+	if _, ok, err := log.Append(ctx, &LogRecord{}, NewTxnMeta(0)); err != nil || !ok {
+		t.Fatalf("Failed to initialize log: %v", err)
+	}
+
+	baseRev, err := log.GetCurrentRevision(ctx)
+	if err != nil {
+		t.Fatalf("GetCurrentRevision failed: %v", err)
+	}
+
+	// Submit writers sequentially. Every writer snapshots the same baseRev,
+	// so once the first commits, all subsequent writers have a "stale"
+	// snapshot -- yet because their keys are disjoint they must all commit.
+	const numWriters = 8
+	for i := 0; i < numWriters; i++ {
+		key := fmt.Sprintf("/disjoint/%d", i)
+
+		meta := NewTxnMeta(baseRev)
+		// Guard the write with a compare on its own key (as Kubernetes'
+		// GuaranteedUpdate does): the key does not exist yet, so the
+		// observed read-version is 0.
+		meta.AddRead(key, 0)
+		meta.AddWrite(key)
+
+		record := &LogRecord{
+			Events: []*mvccpb.Event{
+				{
+					Type: mvccpb.PUT,
+					Kv: &mvccpb.KeyValue{
+						Key:   []byte(key),
+						Value: []byte(fmt.Sprintf("value-%d", i)),
+					},
+				},
+			},
+		}
+
+		rev, ok, err := log.Append(ctx, record, meta)
+		if err != nil {
+			t.Fatalf("writer %d returned an unexpected error: %v", i, err)
+		}
+		if !ok {
+			t.Errorf("writer %d for disjoint key %q was falsely aborted despite touching no shared key", i, key)
+			continue
+		}
+		if want := baseRev + Revision(i) + 1; rev != want {
+			t.Errorf("writer %d committed at revision %d, want %d", i, rev, want)
+		}
+	}
 }
