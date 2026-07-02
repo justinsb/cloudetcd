@@ -28,7 +28,7 @@ import (
 )
 
 func TestEtcdAPIServer(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Create storage and server
 	store, err := memorystorage.NewMemoryStorage(memorylog.New())
@@ -136,7 +136,7 @@ func TestEtcdAPIServer(t *testing.T) {
 }
 
 func TestWatchFunctionality(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Create storage and server
 	store, err := memorystorage.NewMemoryStorage(memorylog.New())
@@ -386,7 +386,7 @@ func TestWatchFunctionality(t *testing.T) {
 }
 
 func TestServerMethods(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Create storage and server
 	store, err := memorystorage.NewMemoryStorage(memorylog.New())
@@ -475,7 +475,7 @@ func TestServerMethods(t *testing.T) {
 }
 
 func TestRangeWithRangeEnd(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Create storage and server
 	store, err := memorystorage.NewMemoryStorage(memorylog.New())

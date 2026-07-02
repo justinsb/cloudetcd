@@ -15,7 +15,6 @@
 package memorystorage
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,7 +35,7 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 	}
 
 	// Add some test data
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Put some keys
 	if _, err := storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1")}); err != nil {
@@ -118,7 +117,7 @@ func TestMemoryStorageLogReplay(t *testing.T) {
 }
 
 func TestMemoryStorageLogReplayEmpty(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	// Test replay with an empty log
 	log := memorylog.New()
@@ -158,7 +157,7 @@ func TestMemoryStorageForceReplay(t *testing.T) {
 	}
 
 	// Add some test data
-	ctx := context.Background()
+	ctx := t.Context()
 	storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key1"), Value: []byte("value1")})
 	storage.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("key2"), Value: []byte("value2")})
 
@@ -206,7 +205,7 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 	}
 
 	// Step 3: Add some data
-	ctx := context.Background()
+	ctx := t.Context()
 
 	resp1, err := storage1.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("app/config"), Value: []byte("production")})
 	if err != nil {
