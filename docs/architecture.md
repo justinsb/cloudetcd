@@ -10,6 +10,18 @@ The design optimizes for **simplicity and low cost** rather than high performanc
 
 The core design principle is to treat the cloud storage as a write-ahead log (or change log). A local, on-disk cache will store the materialized view of the data for fast read access. This approach avoids the need for a traditional distributed consensus protocol like Raft, as it relies on the consistency guarantees of the underlying cloud storage service.
 
+### 1.1. Comparison with Apache Iceberg
+
+If you are familiar with [Apache Iceberg](https://iceberg.apache.org/), the design of `cloud-etcd` will feel familiar. Both projects apply the same architectural idea — the object store *is* the database — just to different workloads:
+
+- **Object storage as the source of truth.** In Iceberg, the table's canonical state is a set of data and metadata files in S3/GCS; there is no stateful database server to operate. In `cloud-etcd`, the canonical state is the change log (and snapshots) in GCS; there is no etcd cluster to operate.
+- **Optimistic concurrency instead of consensus.** Iceberg commits a new table version by atomically swapping the current metadata pointer (via a catalog, or a conditional object-store write), retrying on conflict. `cloud-etcd` commits a new revision with a conditional (generation-based) GCS write, so two writers can never claim the same revision. Neither system needs Raft or Paxos — the object store's atomic operations provide the serialization point.
+- **MVCC and time travel.** Iceberg snapshots let you query the table as of an earlier version. `cloud-etcd`'s revision history provides the same property, which maps directly onto etcd's MVCC semantics.
+- **Stateless, disposable compute.** In both systems, any node can rebuild its working state (Iceberg: metadata and scan plans; `cloud-etcd`: the local cache) purely by reading objects. Local state is a cache, never the truth, so losing a node loses nothing.
+- **Compaction.** Iceberg compacts small files and rewrites metadata to keep reads efficient; `cloud-etcd` periodically snapshots the materialized state so the log can be replayed from a recent point rather than from the beginning.
+
+The main difference is the workload. Iceberg targets analytical tables: large files, high-throughput scans, and a relatively low commit rate. `cloud-etcd` targets a key-value store serving `kube-apiserver`: small, frequent, latency-sensitive writes. That difference drives the parts of the design that diverge from Iceberg — notably the tiered log, which commits to a fast tier for low write latency and drains to GCS as the durable archive.
+
 ## 2. Components
 
 The system is composed of four main components:

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
@@ -37,7 +38,9 @@ func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
 		dir := "/" + u.Host + "/" + u.Path
 		return filesystemlog.NewFilesystemLog(dir)
 	case "gs":
-		return gcslog.NewGCSLog(ctx, u.Host, u.Path)
+		// gs://bucket/some/prefix/ => bucket "bucket", object prefix "some/prefix/"
+		// (GCS object names do not start with a slash)
+		return gcslog.NewGCSLog(ctx, u.Host, strings.TrimPrefix(u.Path, "/"))
 	case "memory":
 		return memorylog.New(), nil
 	case "tiered":

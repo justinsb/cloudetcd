@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -63,10 +64,19 @@ type persistedBatch struct {
 	Records []*persistence.LogRecord
 }
 
+// newStorageClient creates a GCS client. We prefer the gRPC client, but
+// emulators (fake-gcs-server, justinsb/objectstorage) speak the JSON API over
+// HTTP, so when STORAGE_EMULATOR_HOST is set we use the HTTP client instead.
+func newStorageClient(ctx context.Context) (*storage.Client, error) {
+	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		return storage.NewClient(ctx)
+	}
+	return storage.NewGRPCClient(ctx)
+}
+
 // NewGCSLog creates a new Google Cloud Storage-backed log
 func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) {
-	// client, err := storage.NewClient(ctx)
-	client, err := storage.NewGRPCClient(ctx)
+	client, err := newStorageClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS client: %w", err)
 	}
@@ -221,7 +231,7 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 	newRevision := l.lastRevision + Revision(len(batch.Transactions))
 	l.lastRevision = newRevision
 
-	l.cache.notifyBatch(l.lastRevision, data)
+	l.cache.notifyBatch(startRevision, data)
 
 	if l.listener != nil {
 		l.listener.OnLogEntry(newRevision)

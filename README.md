@@ -10,9 +10,15 @@ The goal is not raw performance — it is to be **simple and low cost**. By trea
 
 The core design principle is to treat the cloud storage as a write-ahead log (or change log). A local, on-disk cache stores the materialized view of the data for fast read access. This approach avoids the need for a traditional distributed consensus protocol like Raft, as it relies on the consistency guarantees of the underlying cloud storage service.
 
+If this sounds like [Apache Iceberg](https://iceberg.apache.org/), that's no coincidence: both keep the canonical state in object storage, commit new versions with atomic conditional writes instead of consensus, and treat local state as a rebuildable cache. cloud-etcd applies the same idea to a transactional key-value store rather than analytical tables — see the [architecture doc](docs/architecture.md#11-comparison-with-apache-iceberg) for a detailed comparison.
+
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+
+## Try It
+
+[docs/walkthrough](docs/walkthrough/README.md) runs the full stack on your laptop — including the object storage backend, via a local emulator — with no cloud credentials required.
 
 ## Current Status
 
