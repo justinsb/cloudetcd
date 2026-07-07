@@ -54,6 +54,8 @@ type FilesystemLog struct {
 }
 
 var _ persistence.Log = &FilesystemLog{}
+var _ persistence.BatchAppender = &FilesystemLog{}
+var _ persistence.Truncater = &FilesystemLog{}
 
 // NewFilesystemLog creates a new filesystem-backed log
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
@@ -127,6 +129,35 @@ func (f *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMet
 	return f.batching.Add(ctx, logRecord, txnMeta)
 }
 
+// AppendBatch appends a contiguous range of records starting at lastRevision+1, preserving revisions.
+func (f *FilesystemLog) AppendBatch(ctx context.Context, lastRevision Revision, records []*LogRecord) (bool, error) {
+	return f.batching.AddBatch(ctx, lastRevision, records)
+}
+
+// Truncate discards records with revisions <= throughRevision.
+// It only removes whole log files, and always retains the newest file so that
+// the current revision can be recovered after a restart.
+func (f *FilesystemLog) Truncate(ctx context.Context, throughRevision Revision) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var kept []logFileMeta
+	for i, fileMeta := range f.logFiles {
+		fileLastRevision := fileMeta.firstRevision + Revision(fileMeta.count) - 1
+		if fileLastRevision <= throughRevision && i < len(f.logFiles)-1 {
+			filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
+			if err := os.Remove(filepath.Join(f.dir, filename)); err != nil {
+				f.logFiles = append(kept, f.logFiles[i:]...)
+				return fmt.Errorf("failed to remove log file %q: %w", filename, err)
+			}
+		} else {
+			kept = append(kept, fileMeta)
+		}
+	}
+	f.logFiles = kept
+	return nil
+}
+
 type persistedBatch struct {
 	Records []*persistence.LogRecord
 }
@@ -167,8 +198,9 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 		return fmt.Errorf("failed to marshal log records: %w", err)
 	}
 
-	// Write to file atomically
-	if err := os.WriteFile(filepath, b, 0644); err != nil {
+	// Write and fsync: this is the commit point, so the record must be
+	// durable on disk (not just in the page cache) before we acknowledge.
+	if err := writeFileSync(filepath, b, 0644); err != nil {
 		return fmt.Errorf("failed to write log file: %w", err)
 	}
 
@@ -295,6 +327,34 @@ func (f *FilesystemLog) SetListener(listener LogListener) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listener = listener
+}
+
+// writeFileSync writes data to path and fsyncs both the file and its parent
+// directory, so that the file and its directory entry survive a machine crash
+// or power loss, not just a process crash.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // batchToFilename converts a first-revision and count to a filename

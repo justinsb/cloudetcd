@@ -64,3 +64,27 @@ type LogListener interface {
 	// OnLogEntry is called when a new log entry is added
 	OnLogEntry(revision Revision)
 }
+
+// BatchAppender is an optional interface for Log implementations that can
+// append a contiguous range of records in a single storage operation.
+// It is used when copying records between logs (e.g. tiering or replication):
+// revision numbers are preserved exactly, and the whole range lands in one
+// object/file rather than one per record.
+type BatchAppender interface {
+	// AppendBatch appends records so that the first record is assigned
+	// revision lastRevision+1. The records must already carry their final
+	// revisions in their events; no revision stamping is performed.
+	// It returns false (with no error) if the log's current revision is not
+	// lastRevision, analogous to the conditional-append semantics of Append.
+	AppendBatch(ctx context.Context, lastRevision Revision, records []*LogRecord) (bool, error)
+}
+
+// Truncater is an optional interface for Log implementations that can discard
+// old records, e.g. after they have been copied to an archive tier.
+type Truncater interface {
+	// Truncate discards records with revisions <= throughRevision.
+	// Implementations may retain more than requested (for example, whole-file
+	// granularity, or keeping the newest records so that the current revision
+	// can be recovered after a restart).
+	Truncate(ctx context.Context, throughRevision Revision) error
+}
