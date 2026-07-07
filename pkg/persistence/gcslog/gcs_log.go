@@ -17,8 +17,10 @@ package gcslog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -30,10 +32,13 @@ import (
 	"github.com/justinsb/identityctl/pkg/workloadidentity"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"k8s.io/klog/v2"
@@ -69,6 +74,30 @@ var _ persistence.BatchAppender = &GCSLog{}
 
 type persistedBatch struct {
 	Records []*persistence.LogRecord
+}
+
+// wrapWriteError converts a failed log-object write into an error for the
+// batching layer. A precondition failure means another writer claimed this
+// revision first; we surface that as persistence.ErrRevisionConflict so it is
+// distinguishable from transient write errors. Because our view of the log is
+// stale, subsequent appends from this instance will keep failing the same
+// way; re-reading the log (today: restarting the process) is required to make
+// progress. Crucially, the other writer's committed batch is untouched.
+func wrapWriteError(objectName string, err error) error {
+	if isPreconditionFailed(err) {
+		return fmt.Errorf("log object %s was created by another writer: %w", objectName, persistence.ErrRevisionConflict)
+	}
+	return fmt.Errorf("failed to write log object %s to GCS: %w", objectName, err)
+}
+
+// isPreconditionFailed reports whether err is a GCS precondition failure
+// (HTTP 412 from the JSON API, FailedPrecondition from the gRPC API).
+func isPreconditionFailed(err error) bool {
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return true
+	}
+	return status.Code(err) == codes.FailedPrecondition
 }
 
 // newStorageClient creates a GCS client. We prefer the gRPC client, but
@@ -261,9 +290,12 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 	startRevision := l.lastRevision + 1
 	count := len(batch.Transactions)
 
-	// Create object name with hex-encoded revision
+	// Create object name with hex-encoded revision.
+	// The DoesNotExist precondition makes object creation the commit point:
+	// if another writer has already claimed this revision, the write fails
+	// with a precondition error instead of silently overwriting their batch.
 	objectName := l.batchToObjectName(startRevision, count)
-	obj := l.bucket.Object(objectName)
+	obj := l.bucket.Object(objectName).If(storage.Conditions{DoesNotExist: true})
 
 	// Serialize record to JSON
 	// TODO: Use proto for speed
@@ -285,11 +317,11 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 
 	if _, err := writer.Write(b); err != nil {
 		writer.Close()
-		return fmt.Errorf("failed to write log record to GCS: %w", err)
+		return wrapWriteError(objectName, err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close GCS writer: %w", err)
+		return wrapWriteError(objectName, err)
 	}
 
 	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
