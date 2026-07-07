@@ -16,6 +16,10 @@ If this sounds like [Apache Iceberg](https://iceberg.apache.org/), that's no coi
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
+## Try It
+
+[docs/walkthrough](docs/walkthrough/README.md) runs the full stack on your laptop — including the object storage backend, via a local emulator — with no cloud credentials required.
+
 ## Current Status
 
 The project is in early development. Currently implemented:
