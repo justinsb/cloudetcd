@@ -30,8 +30,14 @@ The project is in early development. Currently implemented:
 - **etcd v3 API**: Full gRPC server implementing the etcd v3 API
   - Key-Value operations (PUT, GET, DELETE, RANGE)
   - Transactions
-  - Lease management (basic implementation)
+  - Watch (create/cancel, streaming events)
+  - Lease management (grant, revoke, keepalive, TTL expiry)
   - Compatible with official etcd client library
+- **Persistence Log**: Pluggable change log backends selected by URI
+  - `memory://` — in-memory log for testing
+  - `filesystem://` — local on-disk log
+  - `gs://` — Google Cloud Storage log using conditional (generation-based) writes
+  - `tiered:` — tiered log combining a fast tier with async archival to GCS
 
 ## Building and Testing
 
@@ -46,59 +52,79 @@ The project is in early development. Currently implemented:
 go test ./...
 
 # Run storage tests with verbose output
-go test ./pkg/storage -v
+go test ./pkg/storage/... -v
 
 # Run tests with race detection
-go test ./pkg/storage -race
+go test ./pkg/storage/... -race
 ```
 
 ### Running the Server
 
 ```bash
-# Start the etcd API server (default port 2379)
+# Start the etcd API server (default port 2379, in-memory log)
 go run cmd/cloud-etcd/main.go
 
 # Start on a different port
 go run cmd/cloud-etcd/main.go -addr :2380
 
-# Run the demo instead
-go run cmd/cloud-etcd/main.go -demo
+# Persist the change log to the local filesystem
+go run cmd/cloud-etcd/main.go -log filesystem:///var/lib/cloudetcd/log
+
+# Persist the change log to a GCS bucket
+go run cmd/cloud-etcd/main.go -log gs://my-bucket/logs/
+
+# Use a tiered log: fast local tier with async archival to GCS
+go run cmd/cloud-etcd/main.go -log 'tiered:?fast=filesystem:///var/lib/cloudetcd/log&archive=gs://my-bucket/logs/&flushInterval=5m'
 ```
 
 ### Testing with etcd Client
+
+The server is compatible with the official etcd v3 client and tools:
 
 ```bash
 # Start the server
 go run cmd/cloud-etcd/main.go
 
-# In another terminal, run the test client
-go run cmd/test-client/main.go
+# In another terminal, use etcdctl
+etcdctl --endpoints=localhost:2379 put foo bar
+etcdctl --endpoints=localhost:2379 get foo
 ```
+
+See [docs/start-kube.md](docs/start-kube.md) for running `kube-apiserver` against cloud-etcd.
 
 ## Project Structure
 
 ```
 cloudetcd/
 ├── cmd/
-│   ├── cloud-etcd/     # Main application entry point
-│   └── test-client/    # Test client using etcd client library
-├── docs/               # Documentation
+│   └── cloud-etcd/         # Main application entry point
+├── docs/                   # Documentation
 ├── pkg/
-│   ├── api/           # etcd API layer
-│   ├── replicator/    # Replicator component (future)
-│   └── storage/       # Storage interface and implementations
+│   ├── api/                # etcd v3 gRPC API layer (KV, Watch, Lease, Txn, Maintenance)
+│   ├── bptree/             # In-memory B+ tree index (key → revisions)
+│   ├── lease/              # Lease manager (TTL expiry, keepalive)
+│   ├── persistence/        # Change log and snapshot interfaces
+│   │   ├── batch/          # Batched commits with conflict detection
+│   │   ├── filesystemlog/  # Local filesystem log
+│   │   ├── gcslog/         # Google Cloud Storage log
+│   │   ├── logfactory/     # Constructs a log from a URI
+│   │   ├── logtests/       # Shared conformance tests for log implementations
+│   │   ├── memorylog/      # In-memory log
+│   │   └── tieredlog/      # Fast tier + async GCS archival
+│   └── storage/            # Storage interface
+│       └── memorystorage/  # In-memory MVCC storage backed by a persistence log
+├── tests/
+│   └── e2e/                # End-to-end tests
 └── README.md
 ```
 
 ## Next Steps
 
-1. **GCS Implementation**: Implement the storage interface using Google Cloud Storage (GCS)
-2. **Local Cache**: Implement persistent local cache (BoltDB/LevelDB)
-3. **Replicator**: Implement the component that keeps local cache in sync
-4. **Watch API**: Implement etcd's watch functionality
-5. **Lease Management**: Implement full TTL and lease management
-6. **Authentication**: Add authentication and authorization
-7. **TLS**: Add TLS support for secure communication
+1. **Snapshots & Compaction**: Snapshot the state so startup doesn't replay the full log
+2. **Persistent Local Cache**: Persist the materialized view locally for fast restarts
+3. **Range-read Conflict Detection**: Extend batch conflict detection to cover range reads
+4. **Authentication**: Add authentication and authorization
+5. **TLS**: Add TLS support for secure communication
 
 ## Contributing
 
@@ -106,4 +132,4 @@ This is an experimental project. Contributions are welcome!
 
 ## License
 
-[Add your license here] 
+Apache License 2.0 — see [LICENSE.md](LICENSE.md).
