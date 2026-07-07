@@ -15,6 +15,8 @@
 package memorystorage
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -481,10 +483,18 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
-		defer watcher.Close()
-
+		// Run the watcher, joining the goroutine before the subtest returns:
+		// otherwise Run can lose the teardown race between watcher.Close and
+		// the cancellation of the parent test's context, return
+		// context.Canceled, and log to t after the subtest has completed,
+		// which panics the test binary.
+		runDone := make(chan error, 1)
 		go func() {
-			if err := watcher.Run(ctx); err != nil {
+			runDone <- watcher.Run(ctx)
+		}()
+		defer func() {
+			watcher.Close()
+			if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("watch stopped with error: %v", err)
 			}
 		}()
@@ -579,10 +589,18 @@ func TestMemoryStorage_Watch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create watcher: %v", err)
 		}
-		defer watcher.Close()
-
+		// Run the watcher, joining the goroutine before the subtest returns:
+		// otherwise Run can lose the teardown race between watcher.Close and
+		// the cancellation of the parent test's context, return
+		// context.Canceled, and log to t after the subtest has completed,
+		// which panics the test binary.
+		runDone := make(chan error, 1)
 		go func() {
-			if err := watcher.Run(ctx); err != nil {
+			runDone <- watcher.Run(ctx)
+		}()
+		defer func() {
+			watcher.Close()
+			if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("watch stopped with error: %v", err)
 			}
 		}()
