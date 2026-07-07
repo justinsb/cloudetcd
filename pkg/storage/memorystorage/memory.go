@@ -312,7 +312,14 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 		existingRevision, hasExisting := m.revisions.GetLatestRevisionByKey(key, snapshotTimestamp)
 
-		txn.meta.AddRead(string(key))
+		// Record the mod_revision we observed for this key so that batch
+		// commit can validate it per-key rather than against the whole
+		// keyspace. A key that does not exist is recorded as revision 0.
+		readRevision := Revision(0)
+		if hasExisting {
+			readRevision = existingRevision
+		}
+		txn.meta.AddRead(string(key), readRevision)
 
 		var prevEvent *mvccpb.Event
 		if hasExisting {
@@ -419,7 +426,12 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				if err != nil {
 					return nil, err
 				}
-				txn.meta.AddRead(string(op.GetRequestRange().Key))
+				rangeKey := op.GetRequestRange().Key
+				readRevision := Revision(0)
+				if rev, ok := m.revisions.GetLatestRevisionByKey(rangeKey, snapshotTimestamp); ok {
+					readRevision = rev
+				}
+				txn.meta.AddRead(string(rangeKey), readRevision)
 			} else {
 				rangeResp, err = txn.list(ctx, op.GetRequestRange())
 				if err != nil {

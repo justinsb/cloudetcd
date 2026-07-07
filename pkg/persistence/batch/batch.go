@@ -39,6 +39,12 @@ type TxnBatch struct {
 
 	flushFunc func(ctx context.Context, lastLogPosition Revision, batch *BatchCommit) error
 
+	// committedWrites is shared across all batches (owned by Batching) and
+	// records, for each key, the highest revision at which it has been
+	// written. It is only accessed under the Batching flushLock, which
+	// serializes all flushes. It is used for per-key conflict validation.
+	committedWrites map[string]Revision
+
 	pendingBatch []*PendingTxn
 	// pendingBatch []*PendingTransaction
 	// batchTimer   *time.Timer
@@ -147,8 +153,8 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 	resultChannels := make([]chan BatchResult, 0, len(b.pendingBatch))
 	revision := lastLogPosition
 	for _, txn := range b.pendingBatch {
-		if txn.Meta.SnapshotRevision != lastLogPosition {
-			log.Info("Skipping transaction with unexpected snapshot revision", "snapshotTimestamp", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition)
+		if !validateTxn(txn.Meta, lastLogPosition, b.committedWrites) {
+			log.Info("Skipping transaction due to conflict", "snapshotRevision", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition, "hasRangeRead", txn.Meta.HasRangeRead)
 			txn.resultChan <- BatchResult{
 				Revision: 0,
 				Success:  false,
@@ -189,8 +195,14 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 	}
 
 	revision = lastLogPosition
-	for _, resultChannel := range resultChannels {
+	for i, resultChannel := range resultChannels {
 		revision++
+		// Record this transaction's writes at their committed revision so
+		// that subsequent transactions (in later batches) validate their
+		// reads and writes against them.
+		for key := range commit.Transactions[i].Meta.WriteSet {
+			b.committedWrites[key] = revision
+		}
 		resultChannel <- BatchResult{
 			Revision: revision,
 			Success:  true,
@@ -199,4 +211,43 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 	}
 
 	return len(commit.Transactions), nil
+}
+
+// validateTxn reports whether a transaction can still be committed given the
+// keys that have been written since its snapshot (committedWrites).
+//
+// This is textbook optimistic-concurrency backward-validation, done per key:
+//   - a point key we read must not have been written by a concurrently
+//     committed transaction since we read it; and
+//   - a key we write must not have been written by a concurrently committed
+//     transaction since our snapshot (write-write conflict).
+//
+// Disjoint transactions therefore never abort each other, unlike the previous
+// coarse "did the global revision move" check.
+//
+// A transaction that performed a range read cannot be validated per-key (it is
+// exposed to phantoms), so it falls back to the conservative whole-snapshot
+// check: it commits only if nothing at all has committed since its snapshot.
+func validateTxn(meta *TxnMeta, lastLogPosition Revision, committedWrites map[string]Revision) bool {
+	if meta.HasRangeRead {
+		return meta.SnapshotRevision == lastLogPosition
+	}
+
+	// Read validation: every point key we read must not have changed since
+	// the version we observed for it.
+	for key, readRevision := range meta.ReadSet {
+		if committedWrites[key] > readRevision {
+			return false
+		}
+	}
+
+	// Write validation: a key we write must not have been written by another
+	// transaction that committed after our snapshot.
+	for key := range meta.WriteSet {
+		if committedWrites[key] > meta.SnapshotRevision {
+			return false
+		}
+	}
+
+	return true
 }

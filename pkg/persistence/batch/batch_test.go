@@ -31,13 +31,13 @@ func TestTxnEffects_CanBatchWith(t *testing.T) {
 			name: "no conflicts - can batch",
 			txn1: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key1")
+				txn.AddRead("key1", 0)
 				txn.AddWrite("key2")
 				return txn
 			}(),
 			txn2: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key3")
+				txn.AddRead("key3", 0)
 				txn.AddWrite("key4")
 				return txn
 			}(),
@@ -61,7 +61,7 @@ func TestTxnEffects_CanBatchWith(t *testing.T) {
 			name: "read-write - can batch",
 			txn1: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key1")
+				txn.AddRead("key1", 0)
 				return txn
 			}(),
 			txn2: func() *TxnMeta {
@@ -80,7 +80,7 @@ func TestTxnEffects_CanBatchWith(t *testing.T) {
 			}(),
 			txn2: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key1")
+				txn.AddRead("key1", 0)
 				return txn
 			}(),
 			expected: false,
@@ -89,15 +89,15 @@ func TestTxnEffects_CanBatchWith(t *testing.T) {
 			name: "multiple keys - mixed conflicts",
 			txn1: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key1")
+				txn.AddRead("key1", 0)
 				txn.AddWrite("key2")
 				txn.AddWrite("key3")
 				return txn
 			}(),
 			txn2: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key3") // Conflicts with txn1's write of key3
-				txn.AddRead("key4")
+				txn.AddRead("key3", 0) // Conflicts with txn1's write of key3
+				txn.AddRead("key4", 0)
 				return txn
 			}(),
 			expected: false,
@@ -106,13 +106,13 @@ func TestTxnEffects_CanBatchWith(t *testing.T) {
 			name: "multiple keys - no conflicts",
 			txn1: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key1")
+				txn.AddRead("key1", 0)
 				txn.AddWrite("key2")
 				return txn
 			}(),
 			txn2: func() *TxnMeta {
 				txn := persistence.NewTxnMeta(1)
-				txn.AddRead("key3")
+				txn.AddRead("key3", 0)
 				txn.AddWrite("key4")
 				return txn
 			}(),

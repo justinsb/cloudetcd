@@ -35,12 +35,18 @@ type Batching struct {
 
 	flushLock       sync.Mutex
 	lastLogPosition Revision
+	// committedWrites records, for each key, the highest revision at which it
+	// has been written since batching started. It is only accessed under
+	// flushLock (held for the duration of flushBatch), so per-key conflict
+	// validation and its updates are serialized with the log commit.
+	committedWrites map[string]Revision
 }
 
 func NewBatching(lastLogPosition Revision, flushFunc FlushFunc) *Batching {
 	b := &Batching{
 		flushFunc:       flushFunc,
 		lastLogPosition: lastLogPosition,
+		committedWrites: make(map[string]Revision),
 	}
 	b.batchLockCond = sync.NewCond(&b.batchLock)
 
@@ -48,9 +54,10 @@ func NewBatching(lastLogPosition Revision, flushFunc FlushFunc) *Batching {
 	return b
 }
 
-func newTxnBatch(flushFunc FlushFunc) *TxnBatch {
+func newTxnBatch(flushFunc FlushFunc, committedWrites map[string]Revision) *TxnBatch {
 	return &TxnBatch{
-		flushFunc: flushFunc,
+		flushFunc:       flushFunc,
+		committedWrites: committedWrites,
 	}
 }
 
@@ -71,7 +78,7 @@ func (b *Batching) Add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 	}
 
 	if resultChan == nil {
-		batch := newTxnBatch(b.flushFunc)
+		batch := newTxnBatch(b.flushFunc, b.committedWrites)
 		b.openBatch = batch
 		shouldNotify = true
 
