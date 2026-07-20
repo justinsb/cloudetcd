@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # Copyright 2026 Justin Santa Barbara
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,12 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -o errexit
-set -o nounset
-set -o pipefail
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-cd "${REPO_ROOT}"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
 
-# Run build
-go run github.com/gke-labs/gke-labs-infra/ap@latest build //...
+  - package-ecosystem: "docker"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "daily"
