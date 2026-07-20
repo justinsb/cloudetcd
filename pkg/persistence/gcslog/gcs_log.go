@@ -26,9 +26,14 @@ import (
 	"sync"
 
 	"cloud.google.com/go/storage"
+	"cloud.google.com/go/storage/experimental"
 	"github.com/justinsb/identityctl/pkg/workloadidentity"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"k8s.io/klog/v2"
@@ -83,7 +88,55 @@ func newStorageClient(ctx context.Context) (*storage.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building GCP token source: %w", err)
 	}
-	return storage.NewGRPCClient(ctx, option.WithTokenSource(tokenSource))
+	opts := []option.ClientOption{option.WithTokenSource(tokenSource)}
+	metricsOpts, err := metricsClientOptions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, metricsOpts...)
+	return storage.NewGRPCClient(ctx, opts...)
+}
+
+// metricsClientOptions configures where the storage client's client-side
+// metrics go. By default the client exports them to Cloud Monitoring, which
+// requires a project ID it cannot discover from federated credentials or on
+// non-GCP nodes. So: if an OTLP endpoint is configured via the standard
+// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT
+// environment variables, metrics are exported there (an in-cluster
+// collector; unix:///path endpoints are supported for collectors listening
+// on a Unix domain socket); otherwise client-side metrics are disabled.
+func metricsClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	log := klog.FromContext(ctx)
+
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+	if endpoint == "" {
+		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if endpoint == "" {
+		return []option.ClientOption{storage.WithDisabledClientMetrics()}, nil
+	}
+
+	var otlpExporter sdkmetric.Exporter
+	if strings.HasPrefix(endpoint, "unix:") {
+		conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, fmt.Errorf("dialing OTLP collector %q: %w", endpoint, err)
+		}
+		otlpExporter, err = otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+		if err != nil {
+			return nil, fmt.Errorf("building OTLP metric exporter for %q: %w", endpoint, err)
+		}
+	} else {
+		// otlpmetricgrpc reads the standard OTEL_EXPORTER_OTLP_* environment
+		// variables itself (an http:// scheme implies an insecure connection).
+		var err error
+		otlpExporter, err = otlpmetricgrpc.New(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("building OTLP metric exporter for %q: %w", endpoint, err)
+		}
+	}
+	log.Info("exporting storage client metrics via OTLP", "endpoint", endpoint)
+	return []option.ClientOption{experimental.WithMetricExporter(&otlpExporter)}, nil
 }
 
 // NewGCSLog creates a new Google Cloud Storage-backed log
