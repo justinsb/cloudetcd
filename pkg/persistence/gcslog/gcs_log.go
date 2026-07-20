@@ -26,7 +26,9 @@ import (
 	"sync"
 
 	"cloud.google.com/go/storage"
+	"github.com/justinsb/identityctl/pkg/workloadidentity"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"k8s.io/klog/v2"
@@ -67,11 +69,21 @@ type persistedBatch struct {
 // newStorageClient creates a GCS client. We prefer the gRPC client, but
 // emulators (fake-gcs-server, justinsb/objectstorage) speak the JSON API over
 // HTTP, so when STORAGE_EMULATOR_HOST is set we use the HTTP client instead.
+//
+// Credentials come from workloadidentity: if GOOGLE_APPLICATION_CREDENTIALS
+// is set it is honored; otherwise a projected Kubernetes service account
+// token at the identityctl well-known path is exchanged via workload
+// identity federation; otherwise the normal application default credentials
+// chain applies.
 func newStorageClient(ctx context.Context) (*storage.Client, error) {
 	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
 		return storage.NewClient(ctx)
 	}
-	return storage.NewGRPCClient(ctx)
+	tokenSource, err := workloadidentity.TokenSource(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("building GCP token source: %w", err)
+	}
+	return storage.NewGRPCClient(ctx, option.WithTokenSource(tokenSource))
 }
 
 // NewGCSLog creates a new Google Cloud Storage-backed log

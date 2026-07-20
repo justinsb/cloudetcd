@@ -1,10 +1,36 @@
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloud-etcd
+  labels:
+    app: cloud-etcd
+---
+apiVersion: v1
 kind: Pod
 metadata:
   name: cloud-etcd-server
   labels:
     app: cloud-etcd
 spec:
+  serviceAccountName: cloud-etcd
+  # When backed by GCS, cloud-etcd authenticates with a projected service
+  # account token via GCP workload identity federation; no keys needed.
+  # Set up federation and grant this service account access to the bucket
+  # with identityctl (https://github.com/justinsb/identityctl):
+  #
+  #   identityctl gcp init --project <project>
+  #   identityctl gcp grant --project <project> --namespace <namespace> \
+  #     --serviceaccount cloud-etcd --bucket <bucket>
+  #
+  # The audience below identifies the workload identity provider;
+  # `identityctl gcp podspec --project <project>` prints the exact value.
+  volumes:
+  - name: gcp-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          audience: https://iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+          path: token
   containers:
   - name: cloud-etcd
     image: your-registry/cloud-etcd:latest
@@ -16,6 +42,11 @@ spec:
     command:
     - /cloud-etcd
     - -addr=:2379
+    - -log=gcs://<bucket>/cloud-etcd
+    volumeMounts:
+    - name: gcp-token
+      mountPath: /var/run/secrets/identityctl
+      readOnly: true
     resources:
       requests:
         memory: "128Mi"
