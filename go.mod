@@ -5,7 +5,7 @@ go 1.26.4
 toolchain go1.26.5
 
 require (
-	cloud.google.com/go/storage v1.63.1
+	cloud.google.com/go/storage v1.64.0
 	github.com/google/go-cmp v0.7.0
 	github.com/justinsb/identityctl v0.0.0-20260720002141-0234a215890e
 	github.com/justinsb/objectstorage v0.0.0-20260706120203-ecdc610afc00
