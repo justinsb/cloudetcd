@@ -12,251 +12,113 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package bptree implements an in-memory B+ tree.
+// Package bptree implements the in-memory key index: for each key, the list
+// of log revisions at which it was written, ordered by key so that ranges can
+// be scanned.
 //
-// This B+ tree is used as an index for key-based lookups. It does not store
-// values directly, but rather a list of 64-bit revision numbers for each key.
-//
-// The implementation is designed for in-memory use, and as such does not have
-// strictly balanced pages. It also supports multiple revision numbers for each key.
+// It is a thin layer over github.com/google/btree (the B-tree kube-apiserver's
+// own watch cache uses). The tree itself is not safe for concurrent writes;
+// callers serialize writes against reads (memorystorage does so with its
+// storage lock).
 package bptree
 
 import (
 	"bytes"
 	"fmt"
-	"sync"
+
+	"github.com/google/btree"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
-// BPTree is a B+ tree implementation. It contains a pointer to the root node
-// and a read-write mutex for concurrent access.
-type BPTree struct {
-	// revision atomic.Uint64
-	root node
-}
-
 type Revision = persistence.Revision
 
-// Dump dumps the B+ tree to the console.
-func (t *BPTree) Dump() {
-	t.root.dump()
+// btreeDegree is the B-tree's branching factor: nodes hold up to 2*degree-1
+// entries, so keys stay in a handful of contiguous slices and lookups are a
+// few cache lines per level.
+const btreeDegree = 64
+
+// BPTree indexes keys to the revisions at which they were written. The zero
+// value is an empty index.
+type BPTree struct {
+	tree *btree.BTreeG[*entry]
 }
 
-func (n *node) dump() {
-	for _, e := range n.entries {
-		fmt.Printf("prefix: %s, child: %v, revisions: %v\n", e.prefix, e.child != nil, e.revisions)
-	}
-}
-
-// // GetCurrentRevision returns the current revision of the B+ tree.
-// func (t *BPTree) GetCurrentRevision() Revision {
-// 	v := t.revision.Load()
-// 	return Revision(v)
-// }
-
-// AddRevision adds a new revision to a key. If the key does not exist, it is created.
-//
-// The algorithm is as follows:
-//  1. Traverse the tree to find the leaf node where the key should be inserted.
-//  2. If the key already exists, append the new revision to the existing list of revisions.
-//  3. If the key does not exist, insert the key and the new revision into the leaf node.
-//  4. If the leaf node is full, split it into two nodes and promote the middle key to the parent node.
-//     This splitting process may propagate up to the root of the tree.
-func (t *BPTree) AddRevision(key []byte, revision Revision) {
-	t.root.addRevision(key, revision)
-
-	// for {
-	// 	oldRevision := t.revision.Load()
-	// 	if revision <= Revision(oldRevision) {
-	// 		break
-	// 	}
-	// 	if t.revision.CompareAndSwap(oldRevision, uint64(revision)) {
-	// 		break
-	// 	}
-	// }
-}
-
-// GetLatestRevisionByKey returns the latest revision for a key that is less than or equal to the given timestamp.
-//
-// The algorithm is as follows:
-// 1. Traverse the tree to find the leaf node containing the key.
-// 2. If the key is found, iterate through its revisions and return the latest revision that is less than or equal to the given timestamp.
-// 3. If the key is not found, return 0 and false.
-func (t *BPTree) GetLatestRevisionByKey(key []byte, atRevision Revision) (Revision, bool) {
-	return t.root.getLatestRevisionByKey(key, atRevision)
-}
-
-// listRevisionsByKeyRange calls the callback for each key in the given range with its revisions.
-//
-// The algorithm is as follows:
-// 1. Traverse the tree to find the leaf node where the startKey is located.
-// 2. Iterate through the leaf nodes until the endKey is reached.
-// 3. For each key in the range, find all revisions that are less than or equal to the given timestamp and call the callback with the key and revisions.
-func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) {
-	t.root.listRevisionsByKeyRange(startKey, atRevision, callback)
-}
-
-// node represents a node in the B+ tree. It contains a slice of keys, a slice
-// of values (which are slices of 64-bit integers), and a slice of child nodes.
-type node struct {
-	mutex sync.RWMutex
-
-	entries []nodeEntry
-}
-
-type nodeEntry struct {
-	prefix    []byte
-	child     *node
+// entry is one key and every revision at which it was written, ascending.
+type entry struct {
+	key       []byte
 	revisions []Revision
 }
 
-func (n *node) addRevision(remainingKey []byte, revision Revision) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	pos, match := n.findEntry(remainingKey)
-	if match {
-		e := &n.entries[pos]
-		if len(e.prefix) == len(remainingKey) {
-			e.revisions = append(e.revisions, revision)
-		} else {
-			if e.child == nil {
-				e.child = &node{}
-			}
-			e.child.addRevision(remainingKey[len(e.prefix):], revision)
-		}
-		return
-	}
-
-	// We need to insert a new entry
-
-	// TODO: Split if we feel there are "too many" entries
-
-	newEntries := make([]nodeEntry, len(n.entries)+1)
-	copy(newEntries, n.entries[:pos])
-	newEntries[pos] = nodeEntry{prefix: remainingKey, revisions: []Revision{revision}}
-	copy(newEntries[pos+1:], n.entries[pos:])
-	n.entries = newEntries
+func lessEntry(a, b *entry) bool {
+	return bytes.Compare(a.key, b.key) < 0
 }
 
-func (n *node) getLatestRevisionByKey(remainingKey []byte, atRevision Revision) (Revision, bool) {
-	n.mutex.RLock()
-	defer n.mutex.RUnlock()
+func (t *BPTree) init() {
+	if t.tree == nil {
+		t.tree = btree.NewG(btreeDegree, lessEntry)
+	}
+}
 
-	pos, match := n.findEntry(remainingKey)
-	if !match {
+// Dump prints the index, for debugging.
+func (t *BPTree) Dump() {
+	if t.tree == nil {
+		return
+	}
+	t.tree.Ascend(func(e *entry) bool {
+		fmt.Printf("key: %s, revisions: %v\n", e.key, e.revisions)
+		return true
+	})
+}
+
+// Len returns the number of keys in the index.
+func (t *BPTree) Len() int {
+	if t.tree == nil {
+		return 0
+	}
+	return t.tree.Len()
+}
+
+// AddRevision records that key was written at revision. Revisions for a key
+// are expected to be added in increasing order.
+func (t *BPTree) AddRevision(key []byte, revision Revision) {
+	t.init()
+	if e, ok := t.tree.Get(&entry{key: key}); ok {
+		e.revisions = append(e.revisions, revision)
+		return
+	}
+	// Copy the key: callers pass buffers owned by request messages.
+	t.tree.ReplaceOrInsert(&entry{key: bytes.Clone(key), revisions: []Revision{revision}})
+}
+
+// GetLatestRevisionByKey returns the latest revision at which key was
+// written that is <= atRevision, and whether there is one.
+func (t *BPTree) GetLatestRevisionByKey(key []byte, atRevision Revision) (Revision, bool) {
+	if t.tree == nil {
 		return 0, false
 	}
-
-	e := &n.entries[pos]
-
-	revisions := e.revisions
-	if len(revisions) > 0 && bytes.Equal(e.prefix, remainingKey) {
-		latest := Revision(0)
-		found := false
-		for _, r := range revisions {
-			if r <= atRevision {
-				if r > latest {
-					latest = r
-				}
-				found = true
-			}
+	e, ok := t.tree.Get(&entry{key: key})
+	if !ok {
+		return 0, false
+	}
+	// Revisions are ascending, so scan back from the newest.
+	for i := len(e.revisions) - 1; i >= 0; i-- {
+		if e.revisions[i] <= atRevision {
+			return e.revisions[i], true
 		}
-		return latest, found
 	}
-
-	if e.child != nil {
-		return e.child.getLatestRevisionByKey(remainingKey, atRevision)
-	}
-
 	return 0, false
 }
 
-// findEntry finds the index for the matching entry, or the insertion point if not found.
-func (n *node) findEntry(prefixRemaining []byte) (int, bool) {
-	i := 0
-
-	for ; i < len(n.entries); i++ {
-		e := &n.entries[i]
-
-		if e.child != nil {
-			if bytes.HasPrefix(prefixRemaining, e.prefix) {
-				return i, true
-			}
-		}
-
-		cmp := bytes.Compare(e.prefix, prefixRemaining)
-		if cmp > 0 {
-			return i, false
-		}
-
-		if cmp == 0 {
-			return i, true
-		}
+// ListRevisionsByKeyRange calls callback for every key >= startKey, in key
+// order, with all revisions at which the key was written (the caller filters
+// by revision), until callback returns false. atRevision is accepted for
+// interface compatibility; callers filter revisions themselves.
+func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) {
+	if t.tree == nil {
+		return
 	}
-
-	return i, false
-}
-
-func (n *node) listRevisionsByKeyRange(fromPrefixRemaining []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) bool {
-	n.mutex.RLock()
-	defer n.mutex.RUnlock()
-
-	// pos, match := n.findSupremumHoldingLock(fromPrefixRemaining)
-	// i := pos
-	// if !match && i > 0 {
-	// 	i--
-	// }
-
-	isMatch := false
-	i := 0
-	for ; i < len(n.entries); i++ {
-		e := &n.entries[i]
-
-		minLen := min(len(e.prefix), len(fromPrefixRemaining))
-
-		cmp := bytes.Compare(e.prefix[:minLen], fromPrefixRemaining[:minLen])
-		if cmp > 0 {
-			break
-		}
-
-		if cmp == 0 {
-			isMatch = true
-			break
-		}
-	}
-
-	if isMatch {
-		e := &n.entries[i]
-		if len(e.revisions) > 0 && bytes.Compare(e.prefix, fromPrefixRemaining) >= 0 {
-			if !callback(e.prefix, e.revisions) {
-				return false
-			}
-		}
-
-		if e.child != nil {
-			if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
-				return false
-			}
-		}
-		i++
-	}
-
-	for ; i < len(n.entries); i++ {
-		e := &n.entries[i]
-		if len(e.revisions) > 0 {
-			if !callback(e.prefix, e.revisions) {
-				return false
-			}
-		}
-		if e.child != nil {
-			if bytes.HasPrefix(fromPrefixRemaining, e.prefix) {
-				if !e.child.listRevisionsByKeyRange(fromPrefixRemaining[len(e.prefix):], atRevision, callback) {
-					return false
-				}
-			}
-		}
-	}
-	return true
+	t.tree.AscendGreaterOrEqual(&entry{key: startKey}, func(e *entry) bool {
+		return callback(e.key, e.revisions)
+	})
 }

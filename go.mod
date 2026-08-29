@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	cloud.google.com/go/storage v1.65.0
+	github.com/google/btree v1.1.3
 	github.com/google/go-cmp v0.7.0
 	github.com/justinsb/identityctl v0.0.0-20260720002141-0234a215890e
 	github.com/justinsb/objectstorage v0.0.0-20260706120203-ecdc610afc00
@@ -14,6 +15,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
 	google.golang.org/api v0.293.0
 	google.golang.org/grpc v1.83.1
+	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.36.4
 	k8s.io/apimachinery v0.36.4
 	k8s.io/client-go v0.36.4
@@ -102,7 +104,6 @@ require (
 	google.golang.org/genproto v0.0.0-20260519071638-aa98bba5eb94 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
