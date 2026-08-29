@@ -105,6 +105,38 @@ func TestDecodeRecord(t *testing.T) {
 	}
 }
 
+func TestOffsets(t *testing.T) {
+	in := batch(50)
+	data, err := Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans, err := Offsets(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spans) != len(in) {
+		t.Fatalf("%d spans, want %d", len(spans), len(in))
+	}
+	for i, sp := range spans {
+		got, err := DecodeMessage(data[sp.Offset : sp.Offset+sp.Length])
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if len(got.Events) != len(in[i].Events) {
+			t.Fatalf("record %d: %d events, want %d", i, len(got.Events), len(in[i].Events))
+		}
+		for j := range in[i].Events {
+			if !proto.Equal(got.Events[j], in[i].Events[j]) {
+				t.Fatalf("record %d event %d differs", i, j)
+			}
+		}
+	}
+	if _, err := Offsets(data[:len(data)-5]); err == nil {
+		t.Error("offsets of a truncated batch succeeded")
+	}
+}
+
 func BenchmarkDecodeRecord(b *testing.B) {
 	data, _ := Encode(batch(500))
 	for i := 0; i < b.N; i++ {

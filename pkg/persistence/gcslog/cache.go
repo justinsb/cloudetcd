@@ -16,105 +16,71 @@ package gcslog
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/recordcache"
 )
 
+// Cache is the log's in-memory working set: a byte-budgeted LRU of decoded
+// records (see recordcache), filled as batches are written and as they are
+// fetched from GCS. Concurrent fetches of the same batch are coalesced.
 type Cache struct {
-	mu    sync.Mutex
-	cache map[Revision]*cacheEntry
+	records *recordcache.Cache
+
+	mu      sync.Mutex
+	loading map[Revision]*sync.Mutex // per batch (by first revision)
 }
 
-type cacheEntry struct {
-	mu       sync.Mutex
-	revision Revision
-	record   *persistence.LogRecord
+// NewCache creates a cache holding at most budgetBytes of records (<= 0:
+// unbounded).
+func NewCache(budgetBytes int64) *Cache {
+	return &Cache{records: recordcache.New(budgetBytes), loading: map[Revision]*sync.Mutex{}}
 }
 
-func NewCache() *Cache {
-	c := &Cache{
-		cache: make(map[Revision]*cacheEntry),
-	}
-	return c
-}
-
+// Has reports whether revision is cached.
 func (c *Cache) Has(revision Revision) bool {
-	entry := c.getEntry(revision, false)
-	if entry == nil {
-		return false
-	}
-	return entry.hasValue()
-}
-
-// getEntry returns the cache entry for the given revision
-func (c *Cache) getEntry(revision Revision, create bool) *cacheEntry {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.cache[revision]
-	if !ok && create {
-		entry = &cacheEntry{
-			revision: revision,
-		}
-		c.cache[revision] = entry
-	}
-	return entry
+	return c.records.Has(revision)
 }
 
 type LoadBatchFunc func(ctx context.Context, meta logFileMeta) (*persistedBatch, error)
 
+// Get returns the record for revision, fetching and caching its whole batch
+// with load if it is not cached.
 func (c *Cache) Get(ctx context.Context, revision Revision, load LoadBatchFunc, meta logFileMeta) (*persistence.LogRecord, error) {
-	entry := c.getEntry(revision, true)
+	if record, ok := c.records.Get(revision); ok {
+		return record, nil
+	}
 
-	batch, record, err := entry.loadRecord(ctx, meta, load)
+	c.mu.Lock()
+	batchMu := c.loading[meta.firstRevision]
+	if batchMu == nil {
+		batchMu = &sync.Mutex{}
+		c.loading[meta.firstRevision] = batchMu
+	}
+	c.mu.Unlock()
+
+	batchMu.Lock()
+	defer batchMu.Unlock()
+	if record, ok := c.records.Get(revision); ok {
+		return record, nil
+	}
+	batch, err := load(ctx, meta)
 	if err != nil {
 		return nil, err
 	}
-	if batch != nil {
-		for i := 0; i < meta.count; i++ {
-			pos := meta.firstRevision + Revision(i)
-			logEntry := batch.Records[i]
-			entry := c.getEntry(pos, true)
-			entry.setRecord(logEntry)
-		}
+	pos := int(revision - meta.firstRevision)
+	if pos < 0 || pos >= len(batch.Records) {
+		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, len(batch.Records))
 	}
-	return record, nil
+	c.notifyBatch(meta.firstRevision, batch)
+	return batch.Records[pos], nil
 }
 
+// notifyBatch caches every record of a batch.
 func (c *Cache) notifyBatch(firstRevision Revision, data *persistedBatch) {
 	for i, record := range data.Records {
-		pos := firstRevision + Revision(i)
-		entry := c.getEntry(pos, true)
-		entry.setRecord(record)
+		c.records.Put(firstRevision+Revision(i), record)
 	}
-}
-
-func (e *cacheEntry) setRecord(record *persistence.LogRecord) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.record = record
-}
-
-func (e *cacheEntry) loadRecord(ctx context.Context, meta logFileMeta, load LoadBatchFunc) (*persistedBatch, *persistence.LogRecord, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.record != nil {
-		return nil, e.record, nil
-	}
-
-	batch, err := load(ctx, meta)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	logEntry := batch.Records[e.revision-meta.firstRevision]
-	e.record = logEntry
-	return batch, logEntry, nil
-}
-
-func (e *cacheEntry) hasValue() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.record != nil
 }

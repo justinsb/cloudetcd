@@ -27,6 +27,7 @@ import (
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"justinsb.com/cloudetcd/pkg/persistence/logcodec"
+	"justinsb.com/cloudetcd/pkg/persistence/recordcache"
 	"k8s.io/klog/v2"
 )
 
@@ -40,7 +41,22 @@ type logFileMeta struct {
 	count         int
 }
 
-// FilesystemLog is a filesystem-backed implementation of the Log interface
+// Options configures a FilesystemLog.
+type Options struct {
+	// CacheBytes bounds the in-memory cache of decoded records; records not
+	// in it are read from disk on demand. <= 0 means unbounded.
+	CacheBytes int64
+}
+
+// DefaultCacheBytes is the record cache budget when Options.CacheBytes is 0.
+const DefaultCacheBytes = 256 << 20
+
+// FilesystemLog is a filesystem-backed implementation of the Log interface.
+//
+// Values live on disk: the log keeps in memory only its file index, the byte
+// offset of each record within its file, and a bounded cache of recently
+// written or read records. Reading a record that is not cached is a single
+// positioned read of that record's bytes.
 type FilesystemLog struct {
 	batching *batch.Batching
 
@@ -51,21 +67,41 @@ type FilesystemLog struct {
 
 	// logFiles is an in-memory index of log files, sorted by firstRevision
 	logFiles []logFileMeta
+
+	// spans locates each record within its file, keyed by the file's first
+	// revision. Filled at commit time; rebuilt on first use for files that
+	// existed at startup. Guarded by spansMu.
+	spansMu sync.Mutex
+	spans   map[Revision][]logcodec.Span
+
+	// cache holds recently written and read records.
+	cache *recordcache.Cache
 }
 
 var _ persistence.Log = &FilesystemLog{}
 var _ persistence.BatchAppender = &FilesystemLog{}
 var _ persistence.Truncater = &FilesystemLog{}
 
-// NewFilesystemLog creates a new filesystem-backed log
+// NewFilesystemLog creates a new filesystem-backed log with default Options.
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
+	return NewFilesystemLogWithOptions(dir, Options{})
+}
+
+// NewFilesystemLogWithOptions creates a new filesystem-backed log.
+func NewFilesystemLogWithOptions(dir string, opts Options) (*FilesystemLog, error) {
 	// Ensure the directory exists
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
+	cacheBytes := opts.CacheBytes
+	if cacheBytes == 0 {
+		cacheBytes = DefaultCacheBytes
+	}
 
 	log := &FilesystemLog{
-		dir: dir,
+		dir:   dir,
+		spans: map[Revision][]logcodec.Span{},
+		cache: recordcache.New(cacheBytes),
 	}
 
 	// Replay existing log entries to determine current revision
@@ -163,6 +199,12 @@ func (f *FilesystemLog) Truncate(ctx context.Context, throughRevision Revision) 
 				f.logFiles = append(kept, f.logFiles[i:]...)
 				return fmt.Errorf("failed to remove log file %q: %w", filename, err)
 			}
+			f.spansMu.Lock()
+			delete(f.spans, fileMeta.firstRevision)
+			f.spansMu.Unlock()
+			for r := fileMeta.firstRevision; r <= fileLastRevision; r++ {
+				f.cache.Remove(r)
+			}
 		} else {
 			kept = append(kept, fileMeta)
 		}
@@ -206,7 +248,11 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 		return nil, fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	return &fileCommit{log: l, path: filepath, lastLogPosition: lastLogPosition, count: count}, nil
+	spans, err := logcodec.Offsets(b)
+	if err != nil {
+		return nil, fmt.Errorf("indexing log file %s: %w", filepath, err)
+	}
+	return &fileCommit{log: l, path: filepath, lastLogPosition: lastLogPosition, records: records, spans: spans}, nil
 }
 
 // fileCommit is a written, unpublished log file.
@@ -214,7 +260,8 @@ type fileCommit struct {
 	log             *FilesystemLog
 	path            string
 	lastLogPosition Revision
-	count           int
+	records         []*persistence.LogRecord
+	spans           []logcodec.Span
 }
 
 func (c *fileCommit) Publish() {
@@ -226,13 +273,22 @@ func (c *fileCommit) Publish() {
 		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
 	}
 	startRevision := l.lastRevision + 1
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
-	l.lastRevision += Revision(c.count)
+	count := len(c.records)
+	l.spansMu.Lock()
+	l.spans[startRevision] = c.spans
+	l.spansMu.Unlock()
+	// Just-published records are the hottest: the transactions that wrote
+	// them, the index apply and the watchers all read them next.
+	for i, r := range c.records {
+		l.cache.Put(startRevision+Revision(i), r)
+	}
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
+	l.lastRevision += Revision(count)
 	if l.listener != nil {
 		l.listener.OnLogEntry(l.lastRevision)
 	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		c.count, startRevision, l.lastRevision)
+		count, startRevision, l.lastRevision)
 }
 
 // GetCurrentRevision returns the current revision number
@@ -250,28 +306,69 @@ func (f *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 }
 
 func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
+	if record, ok := f.cache.Get(revision); ok {
+		return record, nil
+	}
+
 	fileMeta, ok := f.findFileForRevision(revision)
 	if !ok {
 		return nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
 	}
-
-	filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
-	filepath := filepath.Join(f.dir, filename)
-	data, err := os.ReadFile(filepath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read log file %q: %w", filepath, err)
-	}
-
-	// Decode just the record we want; the rest of the batch is skipped over.
 	pos := int(revision - fileMeta.firstRevision)
 	if pos < 0 || pos >= fileMeta.count {
 		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, fileMeta.count)
 	}
-	record, err := logcodec.DecodeRecord(data, pos)
+
+	filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
+	filepath := filepath.Join(f.dir, filename)
+	spans, err := f.fileSpans(fileMeta, filepath)
+	if err != nil {
+		return nil, err
+	}
+	if pos >= len(spans) {
+		return nil, fmt.Errorf("log file %s has %d records, expected %d", filepath, len(spans), fileMeta.count)
+	}
+
+	// One positioned read of exactly this record's bytes.
+	span := spans[pos]
+	file, err := os.Open(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file %q: %w", filepath, err)
+	}
+	defer file.Close()
+	buf := make([]byte, span.Length)
+	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record %d from log file %q: %w", revision, filepath, err)
+	}
+	record, err := logcodec.DecodeMessage(buf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, filepath, err)
 	}
+	f.cache.Put(revision, record)
 	return record, nil
+}
+
+// fileSpans returns the record spans of a log file, scanning the file's
+// length prefixes on first use for files that predate this process.
+func (f *FilesystemLog) fileSpans(fileMeta logFileMeta, filepath string) ([]logcodec.Span, error) {
+	f.spansMu.Lock()
+	spans, ok := f.spans[fileMeta.firstRevision]
+	f.spansMu.Unlock()
+	if ok {
+		return spans, nil
+	}
+	data, err := os.ReadFile(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read log file %q: %w", filepath, err)
+	}
+	spans, err = logcodec.Offsets(data)
+	if err != nil {
+		return nil, fmt.Errorf("indexing log file %s: %w", filepath, err)
+	}
+	f.spansMu.Lock()
+	f.spans[fileMeta.firstRevision] = spans
+	f.spansMu.Unlock()
+	return spans, nil
 }
 
 // findFileForRevision finds the log file containing the given revision.

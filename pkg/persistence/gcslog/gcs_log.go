@@ -169,7 +169,28 @@ func metricsClientOptions(ctx context.Context) ([]option.ClientOption, error) {
 }
 
 // NewGCSLog creates a new Google Cloud Storage-backed log
+// Options configures a GCSLog.
+type Options struct {
+	// CacheBytes bounds the in-memory cache of decoded records; records not
+	// in it are fetched from GCS (a whole batch at a time) on demand.
+	// <= 0 means unbounded.
+	CacheBytes int64
+}
+
+// DefaultCacheBytes is the record cache budget when Options.CacheBytes is 0.
+const DefaultCacheBytes = 256 << 20
+
+// NewGCSLog creates a new Google Cloud Storage-backed log with default Options.
 func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) {
+	return NewGCSLogWithOptions(ctx, bucketName, prefix, Options{})
+}
+
+// NewGCSLogWithOptions creates a new Google Cloud Storage-backed log.
+func NewGCSLogWithOptions(ctx context.Context, bucketName, prefix string, opts Options) (*GCSLog, error) {
+	cacheBytes := opts.CacheBytes
+	if cacheBytes == 0 {
+		cacheBytes = DefaultCacheBytes
+	}
 	client, err := newStorageClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS client: %w", err)
@@ -187,7 +208,7 @@ func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) 
 		client: client,
 		bucket: bucket,
 		prefix: prefix,
-		cache:  NewCache(),
+		cache:  NewCache(cacheBytes),
 	}
 
 	// Replay existing log entries to determine current revision

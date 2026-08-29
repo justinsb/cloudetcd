@@ -15,6 +15,7 @@
 package filesystemlog
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -292,5 +293,55 @@ func TestFilesystemLog_ExampleUsage(t *testing.T) {
 	// Verify the new record
 	if records[4] == nil || records[4].Events[0].Type != mvccpb.PUT || string(records[4].Events[0].Kv.Key) != "user:3" || string(records[4].Events[0].Kv.Value) != "Charlie" {
 		t.Errorf("Fourth record mismatch: %+v", records[4])
+	}
+}
+
+// TestFilesystemLog_TinyCache runs the whole log suite with a record cache
+// too small to hold anything, so every GetLogEntry is a positioned read of
+// one record from disk.
+func TestFilesystemLog_TinyCache(t *testing.T) {
+	logtests.RunAll(t, func(t *testing.T) persistence.Log {
+		log, err := NewFilesystemLogWithOptions(t.TempDir(), Options{CacheBytes: 1})
+		if err != nil {
+			t.Fatalf("Failed to create filesystem log: %v", err)
+		}
+		return log
+	})
+}
+
+// TestFilesystemLog_ReadsAfterRestart checks that a log reopened on an
+// existing directory reads individual records from files it did not write
+// (rebuilding their record offsets on first use), with the cache disabled.
+func TestFilesystemLog_ReadsAfterRestart(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	log1, err := NewFilesystemLogWithOptions(dir, Options{CacheBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 40
+	for i := 0; i < n; i++ {
+		rec := &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte(fmt.Sprintf("k%03d", i)), Value: make([]byte, 100+i)}}}}
+		if _, ok, err := log1.Append(ctx, rec, persistence.NewTxnMeta(0)); err != nil || !ok {
+			t.Fatalf("append %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if err := log1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	log2, err := NewFilesystemLogWithOptions(dir, Options{CacheBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log2.Close()
+	for r := persistence.Revision(1); r <= n; r++ {
+		rec, err := log2.GetLogEntry(r)
+		if err != nil {
+			t.Fatalf("GetLogEntry(%d): %v", r, err)
+		}
+		if want := fmt.Sprintf("k%03d", r-1); string(rec.Events[0].Kv.Key) != want || len(rec.Events[0].Kv.Value) != 100+int(r-1) {
+			t.Fatalf("GetLogEntry(%d) = %s (%d bytes), want %s (%d bytes)", r, rec.Events[0].Kv.Key, len(rec.Events[0].Kv.Value), want, 100+int(r-1))
+		}
 	}
 }

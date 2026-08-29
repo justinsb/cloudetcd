@@ -53,6 +53,10 @@ type Options struct {
 	// FlushInterval is how often the fast tier is drained to the archive
 	// tier. Defaults to DefaultFlushInterval.
 	FlushInterval time.Duration
+	// RetainFastTier keeps archived records in the fast tier instead of
+	// pruning them, so that every read is served locally and the archive is
+	// only read to recover. The fast tier then grows until it is compacted.
+	RetainFastTier bool
 }
 
 // TieredLog is a Log that commits to a fast tier and asynchronously drains to
@@ -61,7 +65,8 @@ type TieredLog struct {
 	fast    persistence.Log
 	archive persistence.Log
 
-	flushInterval time.Duration
+	flushInterval  time.Duration
+	retainFastTier bool
 
 	// mu guards the drain/prune cycle against concurrent reads: pruning the
 	// fast tier must not race with a merged read that has finished the archive
@@ -91,11 +96,12 @@ func NewTieredLog(ctx context.Context, fast persistence.Log, archive persistence
 	}
 
 	t := &TieredLog{
-		fast:          fast,
-		archive:       archive,
-		flushInterval: flushInterval,
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
+		fast:           fast,
+		archive:        archive,
+		flushInterval:  flushInterval,
+		retainFastTier: options.RetainFastTier,
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 
 	if err := t.bootstrap(ctx); err != nil {
@@ -193,7 +199,7 @@ func (t *TieredLog) Flush(ctx context.Context) error {
 	}
 
 	archivedThrough := archiveRevision + Revision(len(records))
-	if truncater, ok := t.fast.(persistence.Truncater); ok {
+	if truncater, ok := t.fast.(persistence.Truncater); ok && !t.retainFastTier {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		if err := truncater.Truncate(ctx, archivedThrough); err != nil {
