@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -76,6 +77,7 @@ func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreate
 	}
 
 	w.stateCond = sync.NewCond(&w.stateMutex)
+	w.delivered.Store(uint64(watchDoneRevision))
 
 	if len(w.req.GetRangeEnd()) > 0 {
 		if bytes.Equal(w.req.GetRangeEnd(), []byte{0}) {
@@ -123,6 +125,8 @@ type memoryWatcher struct {
 	callback func(event *etcdserverpb.WatchResponse) error
 
 	watchDoneRevision Revision
+	// delivered mirrors watchDoneRevision for readers on other goroutines.
+	delivered atomic.Uint64
 
 	stateMutex sync.Mutex
 	stateCond  *sync.Cond
@@ -166,29 +170,53 @@ func (w *memoryWatcher) Run(ctx context.Context) error {
 		logPosition := w.logPosition
 		w.stateMutex.Unlock()
 
-		for {
-			if w.watchDoneRevision >= logPosition {
-				break
+		for w.watchDoneRevision < logPosition {
+			// Send one response for as many revisions as are ready, up to a
+			// bound: when the watcher is behind, one gRPC message per
+			// revision is what limits it (as in etcd, a WatchResponse may
+			// carry events from several revisions; each event has its own
+			// ModRevision, and the header carries the last).
+			var events []*mvccpb.Event
+			last := w.watchDoneRevision
+			for last < logPosition && last-w.watchDoneRevision < maxRevisionsPerResponse && len(events) < maxEventsPerResponse {
+				next := last + 1
+				evs, err := w.collect(next)
+				if err != nil {
+					log.Error(err, "failed to read events in watcher", "watcher.id", w.id, "watchPosition", next)
+					return err
+				}
+				events = append(events, evs...)
+				last = next
 			}
-
-			nextRevision := w.watchDoneRevision + 1
-			if err := w.send(ctx, nextRevision); err != nil {
-				log.Error(err, "failed to send event in watcher", "watcher.id", w.id, "watchPosition", nextRevision)
-				return err
+			if len(events) > 0 {
+				if err := w.callback(&etcdserverpb.WatchResponse{
+					Header:  createHeader(last),
+					WatchId: w.id,
+					Events:  events,
+				}); err != nil {
+					log.Error(err, "failed to send events in watcher", "watcher.id", w.id, "watchPosition", last)
+					return err
+				}
 			}
-			w.watchDoneRevision = nextRevision
+			w.watchDoneRevision = last
+			w.delivered.Store(uint64(last))
 		}
 	}
 }
 
-func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
-	// log := klog.FromContext(ctx)
+// maxRevisionsPerResponse and maxEventsPerResponse bound one WatchResponse
+// when a watcher is catching up.
+const (
+	maxRevisionsPerResponse = 256
+	maxEventsPerResponse    = 512
+)
 
-	// Check if this watcher should receive this event
-
+// collect returns the events of revision pos that this watcher should
+// receive, in the form it sends them.
+func (w *memoryWatcher) collect(pos Revision) ([]*mvccpb.Event, error) {
 	events, err := w.storage.getWatchEvent(pos)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var sendEvents []*mvccpb.Event
@@ -239,10 +267,8 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 	}
 
 	if len(sendEvents) == 0 {
-		return nil
+		return nil, nil
 	}
-
-	// log.Info("sending events for watcher", "watcher.key", w.req.GetKey(), "watcher.rangeEnd", w.req.GetRangeEnd(), "watcher.filters", w.req.GetFilters(), "watcher.prevKv", w.req.PrevKv, "watcher.id", w.id, "events", sendEvents)
 
 	if !w.req.PrevKv {
 		sendEventsWithoutPrevKv := make([]*mvccpb.Event, 0, len(sendEvents))
@@ -257,18 +283,7 @@ func (w *memoryWatcher) send(ctx context.Context, pos Revision) error {
 		sendEvents = sendEventsWithoutPrevKv
 	}
 
-	resp := &etcdserverpb.WatchResponse{
-		Header:  createHeader(pos),
-		WatchId: w.id,
-		Events:  sendEvents,
-	}
-
-	// klog.Infof("broadcasting event %v to watcher %d", resp, w.id)
-	if err := w.callback(resp); err != nil {
-		return err
-	}
-
-	return nil
+	return sendEvents, nil
 }
 
 func (w *MemoryStorage) getWatchEvent(pos Revision) ([]*mvccpb.Event, error) {
@@ -281,4 +296,21 @@ func (w *MemoryStorage) getWatchEvent(pos Revision) ([]*mvccpb.Event, error) {
 	}
 
 	return logEntry.Events, nil
+}
+
+// Watchers reports every open watcher's position, for diagnostics.
+func (m *MemoryStorage) Watchers() []storage.WatcherStatus {
+	m.watcherMu.RLock()
+	defer m.watcherMu.RUnlock()
+	var out []storage.WatcherStatus
+	for _, w := range m.watchers {
+		w.stateMutex.Lock()
+		closed, head := w.closed, w.logPosition
+		w.stateMutex.Unlock()
+		if closed {
+			continue
+		}
+		out = append(out, storage.WatcherStatus{ID: w.id, Delivered: Revision(w.delivered.Load()), Head: head})
+	}
+	return out
 }

@@ -138,6 +138,9 @@ type Stats struct {
 	// model said it was due. It grows without bound when the server cannot
 	// keep up, which makes it the primary "is the server keeping up" signal.
 	SchedulingLag Histogram
+	// ServerWatchLag samples, in revisions (stored as Duration units), how
+	// far behind the log head the server-side watchers were.
+	ServerWatchLag Histogram
 }
 
 const maxErrorSamples = 32

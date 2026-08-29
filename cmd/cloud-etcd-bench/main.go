@@ -152,8 +152,10 @@ func runBench(ctx context.Context, args []string) error {
 	}
 
 	addr := *endpoint
+	var srv *inprocess.Server
 	if addr == "" {
-		srv, err := inprocess.Start(ctx, *logURI)
+		var err error
+		srv, err = inprocess.Start(ctx, *logURI)
 		if err != nil {
 			return err
 		}
@@ -171,6 +173,9 @@ func runBench(ctx context.Context, args []string) error {
 	runner, err := workload.NewRunner(cfg, client, *workers)
 	if err != nil {
 		return err
+	}
+	if srv != nil {
+		runner.WatcherStatus = srv.Store.Watchers
 	}
 
 	fmt.Fprintf(os.Stderr, "model: %d nodes, %d pods, %d keys; blobs %v\n", cfg.Nodes, cfg.Pods(), cfg.Keys(), cfg.Blobs.Sizes())
