@@ -303,24 +303,21 @@ func TestMemoryStorageFilesystemLogReplay(t *testing.T) {
 		t.Errorf("Expected revision 6, got %d", getRevision(t, resp5))
 	}
 
-	// Step 9: Verify the new data is visible in storage2 but not storage1
-	keysResp, err = storage2.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
-	if err != nil {
-		t.Fatalf("Failed to list keys in storage2: %v", err)
-	}
-	keys = keysResp.Kvs
-	if len(keys) != 2 {
-		t.Errorf("Expected 2 keys in storage2, got %d", len(keys))
-	}
-
-	// storage1 should still only have the original key
-	keysResp, err = storage1.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
-	if err != nil {
-		t.Fatalf("Failed to list keys in storage1: %v", err)
-	}
-	keys = keysResp.Kvs
-	if len(keys) != 1 {
-		t.Errorf("Expected 1 key in storage1, got %d", len(keys))
+	// Step 9: Verify the new data is visible in storage2, and in storage1:
+	// both read the shared log at its current revision, and a storage applies
+	// any records committed since it last looked before it reads, so storage1
+	// never returns a header revision it has not caught up to.
+	for name, st := range map[string]*MemoryStorage{"storage1": storage1, "storage2": storage2} {
+		keysResp, err = st.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("aaa"), RangeEnd: []byte("zzz")})
+		if err != nil {
+			t.Fatalf("Failed to list keys in %s: %v", name, err)
+		}
+		if len(keysResp.Kvs) != 2 {
+			t.Errorf("Expected 2 keys in %s, got %d", name, len(keysResp.Kvs))
+		}
+		if keysResp.Header.Revision != 6 {
+			t.Errorf("Expected %s to read at revision 6, got %d", name, keysResp.Header.Revision)
+		}
 	}
 
 	// Test that deleted key is still deleted after replay

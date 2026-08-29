@@ -532,10 +532,14 @@ func (ws *watchStream) handleProgressRequest(ctx context.Context, req *etcdserve
 func (ws *watchStream) cleanup(closeGRPC bool) {
 	// TODO: Send cancellation events to all watches?
 
+	// handleCancelRequest may still be deleting from the map on the request
+	// goroutine when the stream's context ends.
+	ws.mu.Lock()
 	for _, watch := range ws.watches {
 		watch.close()
 	}
 	ws.watches = make(map[int64]*activeWatch)
+	ws.mu.Unlock()
 
 	if closeGRPC {
 		ws.cancel()
