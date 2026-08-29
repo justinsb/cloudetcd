@@ -77,6 +77,43 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeRecord(t *testing.T) {
+	in := batch(50)
+	data, err := Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range in {
+		got, err := DecodeRecord(data, i)
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if len(got.Events) != len(in[i].Events) {
+			t.Fatalf("record %d: %d events, want %d", i, len(got.Events), len(in[i].Events))
+		}
+		for j := range in[i].Events {
+			if !proto.Equal(got.Events[j], in[i].Events[j]) {
+				t.Fatalf("record %d event %d differs", i, j)
+			}
+		}
+	}
+	if _, err := DecodeRecord(data, len(in)); err == nil {
+		t.Error("decoded a record past the end of the batch")
+	}
+	if _, err := DecodeRecord(data[:len(data)-5], len(in)-1); err == nil {
+		t.Error("decoded the last record of a truncated batch")
+	}
+}
+
+func BenchmarkDecodeRecord(b *testing.B) {
+	data, _ := Encode(batch(500))
+	for i := 0; i < b.N; i++ {
+		if _, err := DecodeRecord(data, 250); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkEncode(b *testing.B) {
 	records := batch(500)
 	for i := 0; i < b.N; i++ {

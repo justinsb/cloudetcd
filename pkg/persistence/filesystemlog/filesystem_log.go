@@ -262,20 +262,16 @@ func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
 		return nil, fmt.Errorf("failed to read log file %q: %w", filepath, err)
 	}
 
-	record := &persistedBatch{}
-	if record.Records, err = logcodec.Decode(data); err != nil {
-		return nil, fmt.Errorf("failed to decode log records from file %s: %w", filepath, err)
-	}
-
+	// Decode just the record we want; the rest of the batch is skipped over.
 	pos := int(revision - fileMeta.firstRevision)
-	if pos < 0 || pos >= len(record.Records) {
-		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, len(record.Records))
+	if pos < 0 || pos >= fileMeta.count {
+		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, fileMeta.count)
 	}
-	if len(record.Records) != fileMeta.count {
-		// This would be a corruption error
-		klog.Warningf("log file %s has mismatched record count, file meta says %d, found %d", filepath, fileMeta.count, len(record.Records))
+	record, err := logcodec.DecodeRecord(data, pos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, filepath, err)
 	}
-	return record.Records[pos], nil
+	return record, nil
 }
 
 // findFileForRevision finds the log file containing the given revision.

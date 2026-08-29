@@ -52,6 +52,32 @@ func Encode(records []*persistence.LogRecord) ([]byte, error) {
 	return out, nil
 }
 
+// DecodeRecord decodes only record i of a batch, skipping the others: each
+// record is length-prefixed, so a skip is a varint read and a jump, and the
+// cost is the size of one record rather than of the batch. This is what a
+// log's GetLogEntry wants; Decode is for replay.
+func DecodeRecord(data []byte, i int) (*persistence.LogRecord, error) {
+	if !bytes.HasPrefix(data, magic) {
+		return nil, fmt.Errorf("not a cloudetcd log batch (bad header)")
+	}
+	data = data[len(magic):]
+	for n := 0; len(data) > 0; n++ {
+		m, k := protowire.ConsumeBytes(data)
+		if k < 0 {
+			return nil, fmt.Errorf("decoding record %d: %w", n, protowire.ParseError(k))
+		}
+		if n == i {
+			wr := &etcdserverpb.WatchResponse{}
+			if err := proto.Unmarshal(m, wr); err != nil {
+				return nil, fmt.Errorf("decoding record %d: %w", n, err)
+			}
+			return &persistence.LogRecord{Events: wr.Events}, nil
+		}
+		data = data[k:]
+	}
+	return nil, fmt.Errorf("record %d not in batch", i)
+}
+
 // Decode parses a batch produced by Encode.
 func Decode(data []byte) ([]*persistence.LogRecord, error) {
 	if !bytes.HasPrefix(data, magic) {
