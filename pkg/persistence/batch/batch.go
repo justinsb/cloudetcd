@@ -37,8 +37,6 @@ type TxnBatch struct {
 	// flushed is true if the batch has been flushed
 	flushed bool
 
-	flushFunc func(ctx context.Context, lastLogPosition Revision, batch *BatchCommit) error
-
 	// committedWrites is shared across all batches (owned by Batching) and
 	// records, for each key, the highest revision at which it has been
 	// written. It is only accessed under the Batching flushLock, which
@@ -135,31 +133,32 @@ func (b *TxnBatch) add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 	// })
 }
 
-func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, error) {
+// prepare validates the batch's transactions against the writes committed
+// since their snapshots, assigns each surviving transaction its revision
+// (starting at lastLogPosition+1) and records its writes in committedWrites,
+// It returns the commit to hand to the backend (nil if nothing survived),
+// the result channels of the surviving transactions in revision order, and
+// the result channels of the rejected ones. Rejections are delivered by
+// Batching only once the batch is published, so that a rejected transaction
+// re-evaluating at the log head sees the write that beat it. The batch's records are then written by the backend and
+// acknowledged with deliver, possibly concurrently with later batches.
+func (b *TxnBatch) prepare(ctx context.Context, lastLogPosition Revision) (commit *BatchCommit, accepted, rejected []chan BatchResult) {
 	log := klog.FromContext(ctx)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.flushed {
-		return 0, nil
+	if b.flushed || len(b.pendingBatch) == 0 {
+		return nil, nil, nil
 	}
+	b.flushed = true
 
-	if len(b.pendingBatch) == 0 {
-		return 0, nil
-	}
-
-	commit := &BatchCommit{}
-	resultChannels := make([]chan BatchResult, 0, len(b.pendingBatch))
+	commit = &BatchCommit{}
 	revision := lastLogPosition
 	for _, txn := range b.pendingBatch {
 		if !validateTxn(txn.Meta, lastLogPosition, b.committedWrites) {
-			log.Info("Skipping transaction due to conflict", "snapshotRevision", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition, "hasRangeRead", txn.Meta.HasRangeRead)
-			txn.resultChan <- BatchResult{
-				Revision: 0,
-				Success:  false,
-				Error:    nil,
-			}
+			log.V(2).Info("Skipping transaction due to conflict", "snapshotRevision", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition, "hasRangeRead", txn.Meta.HasRangeRead)
+			rejected = append(rejected, txn.resultChan)
 			continue
 		}
 
@@ -178,45 +177,22 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 				event.Kv.ModRevision = int64(revision)
 			}
 		}
+		// Record the writes at their assigned revision now, so that later
+		// batches validate against them. If this batch then fails to
+		// commit, every later batch fails too (see Batching), so nothing
+		// validates against a write that did not happen.
+		for key := range txn.Meta.WriteSet {
+			b.committedWrites[key] = revision
+		}
 
 		commit.Transactions = append(commit.Transactions, txn)
-		resultChannels = append(resultChannels, txn.resultChan)
+		accepted = append(accepted, txn.resultChan)
 	}
 
 	if len(commit.Transactions) == 0 {
-		return 0, nil
+		commit = nil
 	}
-
-	err := b.flushFunc(ctx, lastLogPosition, commit)
-	b.flushed = true
-	if err != nil {
-		for _, resultChannel := range resultChannels {
-			resultChannel <- BatchResult{
-				Revision: 0,
-				Success:  false,
-				Error:    err,
-			}
-		}
-		return 0, err
-	}
-
-	revision = lastLogPosition
-	for i, resultChannel := range resultChannels {
-		revision++
-		// Record this transaction's writes at their committed revision so
-		// that subsequent transactions (in later batches) validate their
-		// reads and writes against them.
-		for key := range commit.Transactions[i].Meta.WriteSet {
-			b.committedWrites[key] = revision
-		}
-		resultChannel <- BatchResult{
-			Revision: revision,
-			Success:  true,
-			Error:    nil,
-		}
-	}
-
-	return len(commit.Transactions), nil
+	return commit, accepted, rejected
 }
 
 // validateTxn reports whether a transaction can still be committed given the

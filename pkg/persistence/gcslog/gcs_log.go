@@ -242,6 +242,19 @@ func (g *GCSLog) replay(ctx context.Context) error {
 		return 0
 	})
 
+	// The objects must be contiguous. A gap means a write that was never
+	// acknowledged was left behind (a batch after a failed one that could
+	// not be aborted), or worse; either way it needs a person to look
+	// before anything is discarded.
+	for i := 1; i < len(g.logFiles); i++ {
+		prev := g.logFiles[i-1]
+		if next := g.logFiles[i]; next.firstRevision != prev.firstRevision+Revision(prev.count) {
+			return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed",
+				g.batchToObjectName(prev.firstRevision, prev.count), prev.firstRevision+Revision(prev.count)-1,
+				g.batchToObjectName(next.firstRevision, next.count), next.firstRevision)
+		}
+	}
+
 	// Find the highest revision
 	if len(g.logFiles) > 0 {
 		lastFile := g.logFiles[len(g.logFiles)-1]
@@ -271,24 +284,18 @@ func (g *GCSLog) AppendBatch(ctx context.Context, lastRevision Revision, records
 }
 
 // commitBatch commits all transactions in the current batch
-func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
+func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) (batch.Commit, error) {
 	log := klog.FromContext(ctx)
 
 	// Check if all transactions have the same condition position
-	if len(batch.Transactions) == 0 {
-		return fmt.Errorf("batch contains no transactions")
+	if len(bc.Transactions) == 0 {
+		return nil, fmt.Errorf("batch contains no transactions")
 	}
 
-	// Execute the batch under the main lock
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if lastLogPosition != l.lastRevision {
-		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
-	}
-
-	startRevision := l.lastRevision + 1
-	count := len(batch.Transactions)
+	// The write happens with no lock held, so that consecutive batches can
+	// be in flight at once; publication below is ordered by the sequencer.
+	startRevision := lastLogPosition + 1
+	count := len(bc.Transactions)
 
 	// Create object name with hex-encoded revision.
 	// The DoesNotExist precondition makes object creation the commit point:
@@ -300,14 +307,14 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 	// Serialize record to JSON
 	// TODO: Use proto for speed
 	data := &persistedBatch{
-		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+		Records: make([]*persistence.LogRecord, len(bc.Transactions)),
 	}
-	for i, txn := range batch.Transactions {
+	for i, txn := range bc.Transactions {
 		data.Records[i] = txn.LogRecord
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to marshal log record: %w", err)
+		return nil, fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to GCS
@@ -317,27 +324,42 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 
 	if _, err := writer.Write(b); err != nil {
 		writer.Close()
-		return wrapWriteError(objectName, err)
+		return nil, wrapWriteError(objectName, err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return wrapWriteError(objectName, err)
+		return nil, wrapWriteError(objectName, err)
 	}
 
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
-	newRevision := l.lastRevision + Revision(len(batch.Transactions))
-	l.lastRevision = newRevision
+	return &objectCommit{log: l, objectName: objectName, lastLogPosition: lastLogPosition, count: count, data: data}, nil
+}
 
-	l.cache.notifyBatch(startRevision, data)
+// objectCommit is a written, unpublished log object.
+type objectCommit struct {
+	log             *GCSLog
+	objectName      string
+	lastLogPosition Revision
+	count           int
+	data            *persistedBatch
+}
 
+func (c *objectCommit) Publish() {
+	l := c.log
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lastRevision != c.lastLogPosition {
+		// Batching publishes in order; this cannot happen.
+		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
+	}
+	startRevision := l.lastRevision + 1
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
+	l.lastRevision += Revision(c.count)
+	l.cache.notifyBatch(startRevision, c.data)
 	if l.listener != nil {
-		l.listener.OnLogEntry(newRevision)
+		l.listener.OnLogEntry(l.lastRevision)
 	}
-
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		len(batch.Transactions), startRevision, newRevision)
-
-	return nil
+		c.count, startRevision, l.lastRevision)
 }
 
 // GetCurrentRevision returns the current revision number

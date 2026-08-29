@@ -21,6 +21,7 @@ import (
 	"go.etcd.io/etcd/api/v3/mvccpb"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
+	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"justinsb.com/cloudetcd/pkg/persistence/logtests"
 )
 
@@ -41,7 +42,10 @@ func putRecord(key, value string) *persistence.LogRecord {
 // TestGCSLogFencing verifies that log object creation is the commit point:
 // when two writers share a bucket/prefix, the second writer to claim a
 // revision must fail with ErrRevisionConflict rather than silently
-// overwriting the first writer's committed batch.
+// overwriting the first writer's committed batch. The loser's write is
+// driven directly rather than through Append, because a failed write is
+// fatal to the process (see batch.FlushFunc): its position is taken and
+// nothing behind it can proceed.
 func TestGCSLogFencing(t *testing.T) {
 	bucketName := "cloudetcd-test"
 	startEmulator(t, bucketName)
@@ -74,14 +78,9 @@ func TestGCSLogFencing(t *testing.T) {
 	}
 
 	// log1 doesn't know, and tries to claim revision 1 as well.
-	loserMeta := logtests.NewTxnMeta(0)
-	loserMeta.AddWrite("contested")
-	_, ok, err = log1.Append(ctx, putRecord("contested", "loser"), loserMeta)
-	if ok {
-		t.Fatalf("loser append reported success; it should have lost the race")
-	}
-	if !errors.Is(err, persistence.ErrRevisionConflict) {
-		t.Fatalf("loser append: got error %v, want persistence.ErrRevisionConflict", err)
+	loser := &batch.BatchCommit{Transactions: []*batch.PendingTxn{{LogRecord: putRecord("contested", "loser")}}}
+	if _, err := log1.commitBatch(ctx, 0, loser); !errors.Is(err, persistence.ErrRevisionConflict) {
+		t.Fatalf("loser write: got error %v, want persistence.ErrRevisionConflict", err)
 	}
 
 	// The loser's local state must not have advanced.

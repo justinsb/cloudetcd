@@ -84,45 +84,48 @@ func (l *MemoryLog) AppendBatch(ctx context.Context, lastRevision Revision, reco
 	return l.batching.AddBatch(ctx, lastRevision, records)
 }
 
-// commitBatch commits all transactions in the current batch
-func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
-	// Check if all transactions have the same condition position
-	if len(batch.Transactions) == 0 {
-		return fmt.Errorf("batch contains no transactions")
+// commitBatch "writes" a batch (there is nothing to write; the optional
+// commit latency stands in for a backend round-trip) and returns the commit
+// that publishes it.
+func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, b *batch.BatchCommit) (batch.Commit, error) {
+	if len(b.Transactions) == 0 {
+		return nil, fmt.Errorf("batch contains no transactions")
 	}
 
 	if l.commitLatency > 0 {
 		select {
 		case <-time.After(l.commitLatency):
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
+	return &memoryCommit{log: l, lastLogPosition: lastLogPosition, batch: b}, nil
+}
 
-	// Execute the batch under the main lock
+type memoryCommit struct {
+	log             *MemoryLog
+	lastLogPosition Revision
+	batch           *batch.BatchCommit
+}
+
+func (c *memoryCommit) Publish() {
+	l := c.log
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	if lastLogPosition != l.lastRevision {
-		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
+	if l.lastRevision != c.lastLogPosition {
+		// Batching publishes in order; this cannot happen.
+		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
 	}
-
-	// Commit all transactions in the batch
 	startRevision := l.lastRevision + 1
-
-	for _, txn := range batch.Transactions {
+	for _, txn := range c.batch.Transactions {
 		l.lastRevision++
 		l.records = append(l.records, txn.LogRecord)
 	}
-
 	if l.listener != nil {
-		l.listener.OnLogEntry(persistence.Revision(l.lastRevision))
+		l.listener.OnLogEntry(l.lastRevision)
 	}
-
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		len(batch.Transactions), startRevision+1, l.lastRevision)
-
-	return nil
+		len(c.batch.Transactions), startRevision, l.lastRevision)
 }
 
 // GetCurrentRevision returns the current revision number
