@@ -98,17 +98,29 @@ etcdctl --endpoints=localhost:2379 get foo
 
 See [docs/start-kube.md](docs/start-kube.md) for running `kube-apiserver` against cloud-etcd.
 
+### Stress and performance testing
+
+```bash
+# Generate the etcd traffic of a 1,000-node cluster (no kube-apiserver or nodes needed)
+go run ./cmd/cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
+```
+
+See [docs/stress-testing.md](docs/stress-testing.md) for the traffic model, how to
+record a template from a real kube-apiserver, and how to read the results.
+
 ## Project Structure
 
 ```
 cloudetcd/
 ├── cmd/
-│   └── cloud-etcd/         # Main application entry point
+│   ├── cloud-etcd/         # Main application entry point
+│   └── cloud-etcd-bench/   # Cluster-scale traffic generator and recording analyzer
 ├── docs/                   # Documentation
 ├── pkg/
 │   ├── api/                # etcd v3 gRPC API layer (KV, Watch, Lease, Txn, Maintenance)
 │   ├── bptree/             # In-memory B+ tree index (key → revisions)
 │   ├── lease/              # Lease manager (TTL expiry, keepalive)
+│   ├── recording/          # Records etcd RPC traffic to JSONL for analysis
 │   ├── persistence/        # Change log and snapshot interfaces
 │   │   ├── batch/          # Batched commits with conflict detection
 │   │   ├── filesystemlog/  # Local filesystem log
@@ -117,10 +129,12 @@ cloudetcd/
 │   │   ├── logtests/       # Shared conformance tests for log implementations
 │   │   ├── memorylog/      # In-memory log
 │   │   └── tieredlog/      # Fast tier + async GCS archival
-│   └── storage/            # Storage interface
-│       └── memorystorage/  # In-memory MVCC storage backed by a persistence log
+│   ├── storage/            # Storage interface
+│   │   └── memorystorage/  # In-memory MVCC storage backed by a persistence log
+│   └── workload/           # Model of a Kubernetes cluster's etcd traffic, at any scale
 ├── tests/
-│   └── e2e/                # End-to-end tests
+│   ├── e2e/                # End-to-end tests (real kube-apiserver; kwok traffic capture)
+│   └── stress/             # Cluster-scale stress test (RUN_STRESS=1)
 └── README.md
 ```
 

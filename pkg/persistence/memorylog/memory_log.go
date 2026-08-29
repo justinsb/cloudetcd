@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
@@ -39,15 +40,32 @@ type MemoryLog struct {
 	lastRevision Revision // Atomic counter for revision numbers
 
 	listener LogListener
+
+	// commitLatency is an artificial delay applied to each batch commit.
+	commitLatency time.Duration
 }
 
 var _ persistence.Log = &MemoryLog{}
 var _ persistence.BatchAppender = &MemoryLog{}
 
+// Option configures a MemoryLog.
+type Option func(*MemoryLog)
+
+// WithCommitLatency makes every batch commit take at least d. It emulates the
+// round-trip of an object-store backend (a GCS conditional write is on the
+// order of tens of milliseconds) without needing one, so that batching
+// behaviour under realistic commit latency can be benchmarked offline.
+func WithCommitLatency(d time.Duration) Option {
+	return func(l *MemoryLog) { l.commitLatency = d }
+}
+
 // New creates a new memory-backed log
-func New() *MemoryLog {
+func New(opts ...Option) *MemoryLog {
 	log := &MemoryLog{
 		lastRevision: 0,
+	}
+	for _, opt := range opts {
+		opt(log)
 	}
 
 	// No replay is possible here
@@ -71,6 +89,14 @@ func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, b
 	// Check if all transactions have the same condition position
 	if len(batch.Transactions) == 0 {
 		return fmt.Errorf("batch contains no transactions")
+	}
+
+	if l.commitLatency > 0 {
+		select {
+		case <-time.After(l.commitLatency):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	// Execute the batch under the main lock

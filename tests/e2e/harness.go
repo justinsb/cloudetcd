@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -56,12 +57,26 @@ type Harness struct {
 	RESTConfig *rest.Config
 	// CloudetcdAddr is the host:port cloudetcd listens on.
 	CloudetcdAddr string
+	// Kubeconfig is the path of a kubeconfig with admin credentials.
+	Kubeconfig string
+}
+
+// HarnessOptions customizes a Harness.
+type HarnessOptions struct {
+	// ServerOptions are passed to the in-process cloudetcd server.
+	ServerOptions []api.Option
 }
 
 // NewHarness starts cloudetcd and a kube-apiserver and returns a ready Harness.
 // All processes are torn down via t.Cleanup. It skips the test on unsupported
 // platforms.
 func NewHarness(t *testing.T) *Harness {
+	t.Helper()
+	return NewHarnessWithOptions(t, HarnessOptions{})
+}
+
+// NewHarnessWithOptions is NewHarness with options.
+func NewHarnessWithOptions(t *testing.T, opts HarnessOptions) *Harness {
 	t.Helper()
 	skipIfUnsupported(t)
 
@@ -71,7 +86,7 @@ func NewHarness(t *testing.T) *Harness {
 	workDir := t.TempDir()
 
 	cloudetcdAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	startCloudetcd(ctx, t, cloudetcdAddr)
+	startCloudetcd(ctx, t, cloudetcdAddr, opts.ServerOptions...)
 
 	p := generatePKI(t, workDir)
 
@@ -80,6 +95,7 @@ func NewHarness(t *testing.T) *Harness {
 	startKubeAPIServer(ctx, t, binPath, workDir, p, cloudetcdAddr, apiserverPort)
 
 	host := fmt.Sprintf("https://127.0.0.1:%d", apiserverPort)
+	writeKubeconfig(t, filepath.Join(workDir, "kubeconfig"), host, p)
 	restConfig := &rest.Config{
 		Host: host,
 		TLSClientConfig: rest.TLSClientConfig{
@@ -101,6 +117,36 @@ func NewHarness(t *testing.T) *Harness {
 		Client:        client,
 		RESTConfig:    restConfig,
 		CloudetcdAddr: cloudetcdAddr,
+		Kubeconfig:    filepath.Join(workDir, "kubeconfig"),
+	}
+}
+
+// writeKubeconfig writes a kubeconfig for the admin client credentials, for
+// subprocesses (kwok, kubectl) that need to talk to the apiserver.
+func writeKubeconfig(t *testing.T, path, host string, p *pki) {
+	t.Helper()
+	b64 := base64.StdEncoding.EncodeToString
+	content := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: e2e
+  cluster:
+    server: %s
+    certificate-authority-data: %s
+users:
+- name: admin
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+contexts:
+- name: e2e
+  context:
+    cluster: e2e
+    user: admin
+current-context: e2e
+`, host, b64(p.caCertPEM), b64(p.adminCertPEM), b64(p.adminKeyPEM))
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
 	}
 }
 
@@ -120,7 +166,7 @@ func freePort(t *testing.T) int {
 // startCloudetcd starts an in-process cloudetcd server on addr and blocks until
 // it is serving. The backend defaults to an in-memory log; set E2E_CLOUDETCD_LOG
 // (e.g. "filesystem:///tmp/cloudetcd-e2e") to use a different backend.
-func startCloudetcd(ctx context.Context, t *testing.T, addr string) {
+func startCloudetcd(ctx context.Context, t *testing.T, addr string, serverOpts ...api.Option) {
 	t.Helper()
 
 	var lg persistence.Log
@@ -138,7 +184,7 @@ func startCloudetcd(ctx context.Context, t *testing.T, addr string) {
 		t.Fatalf("create storage: %v", err)
 	}
 
-	server := api.NewServer(store)
+	server := api.NewServer(store, serverOpts...)
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Start(ctx, addr) }()
 	t.Cleanup(func() { _ = server.GracefulStop() })

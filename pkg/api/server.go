@@ -26,13 +26,16 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"justinsb.com/cloudetcd/pkg/recording"
 	"justinsb.com/cloudetcd/pkg/storage"
 	"k8s.io/klog/v2"
 )
 
-// loggingInterceptor is a gRPC unary interceptor that logs requests.
+// loggingInterceptor is a gRPC unary interceptor that logs requests and
+// responses at verbosity 4 (run with -v=4 to see them). Formatting every
+// request is far too expensive to do unconditionally on the hot path.
 func loggingInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	log := klog.FromContext(ctx)
+	log := klog.FromContext(ctx).V(4)
 	log.Info("gRPC call", "method", info.FullMethod, "request", req)
 	resp, err := handler(ctx, req)
 	if err != nil {
@@ -46,7 +49,7 @@ func loggingInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo
 // loggingStreamInterceptor is a gRPC stream interceptor that logs requests.
 func loggingStreamInterceptor(srv any, serverStream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	ctx := serverStream.Context()
-	log := klog.FromContext(ctx)
+	log := klog.FromContext(ctx).V(4)
 	log.Info("gRPC stream call", "method", info.FullMethod)
 	return handler(srv, &loggingServerStream{ServerStream: serverStream, log: log})
 }
@@ -123,6 +126,8 @@ type Server struct {
 	leaseManager storage.LeaseManager
 	grpc         *grpc.Server
 
+	recorder *recording.Recorder
+
 	mu                sync.RWMutex
 	watchStreams      map[int64]*watchStream
 	nextWatchStreamID int64
@@ -171,14 +176,26 @@ func (s *Server) LeaseKeepAlive(stream etcdserverpb.Lease_LeaseKeepAliveServer) 
 	}
 }
 
+// Option configures a Server.
+type Option func(*Server)
+
+// WithRecorder records every RPC the server handles to r (see pkg/recording).
+func WithRecorder(r *recording.Recorder) Option {
+	return func(s *Server) { s.recorder = r }
+}
+
 // NewServer creates a new etcd API server
-func NewServer(store storage.Storage) *Server {
-	return &Server{
+func NewServer(store storage.Storage, opts ...Option) *Server {
+	s := &Server{
 		storage:           store,
 		leaseManager:      store.LeaseManager(),
 		watchStreams:      make(map[int64]*watchStream),
 		nextWatchStreamID: 1,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Start starts the gRPC server on the given address
@@ -190,9 +207,15 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
+	unary := []grpc.UnaryServerInterceptor{loggingInterceptor}
+	stream := []grpc.StreamServerInterceptor{loggingStreamInterceptor}
+	if s.recorder != nil {
+		unary = append(unary, s.recorder.UnaryInterceptor())
+		stream = append(stream, s.recorder.StreamInterceptor())
+	}
 	s.grpc = grpc.NewServer(
-		grpc.UnaryInterceptor(loggingInterceptor),
-		grpc.StreamInterceptor(loggingStreamInterceptor),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	)
 	etcdserverpb.RegisterKVServer(s.grpc, s)
 	etcdserverpb.RegisterWatchServer(s.grpc, s)

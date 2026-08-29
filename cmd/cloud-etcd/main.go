@@ -24,7 +24,9 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/api"
 	"justinsb.com/cloudetcd/pkg/persistence/logfactory"
+	"justinsb.com/cloudetcd/pkg/recording"
 	"justinsb.com/cloudetcd/pkg/storage/memorystorage"
+	"k8s.io/klog/v2"
 )
 
 func main() {
@@ -43,8 +45,25 @@ func run(ctx context.Context) error {
 	addr := ":2379"
 	logURI := "memory://"
 	flag.StringVar(&addr, "addr", addr, "Address to listen on")
+	recordPath := ""
 	flag.StringVar(&logURI, "log", logURI, "Log URI")
+	flag.StringVar(&recordPath, "record", recordPath, "If set, record all etcd RPCs to this JSONL file (see pkg/recording)")
+	klog.InitFlags(nil) // -v=4 logs every RPC
 	flag.Parse()
+
+	var serverOpts []api.Option
+	if recordPath != "" {
+		recorder, err := recording.NewFileRecorder(recordPath)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := recorder.Close(); err != nil {
+				klog.Errorf("closing recording: %v", err)
+			}
+		}()
+		serverOpts = append(serverOpts, api.WithRecorder(recorder))
+	}
 
 	// Create log
 	log, err := logfactory.NewLog(ctx, logURI)
@@ -59,7 +78,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Create and start the etcd API server
-	server := api.NewServer(store)
+	server := api.NewServer(store, serverOpts...)
 
 	// Start the server
 	if err := server.Start(ctx, addr); err != nil {
