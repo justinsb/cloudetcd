@@ -121,7 +121,8 @@ RUN_CAPTURE=1 CAPTURE_NODES=20 CAPTURE_PODS_PER_NODE=5 CAPTURE_DURATION=2m \
 # value sizes, watches and their event counts.
 go run ./cmd/cloud-etcd-bench analyze .build/capture/kwok-20n-5p.jsonl
 
-# Pull median-sized real values out of the recording for the benchmark to use.
+# Pull median-sized real values out of the recording for the benchmark to use
+# instead of the generated objects.
 go run ./cmd/cloud-etcd-bench extract-blobs .build/capture/kwok-20n-5p.jsonl .build/capture/blobs
 go run ./cmd/cloud-etcd-bench run -nodes 1000 -blobs .build/capture/blobs
 ```
@@ -137,9 +138,23 @@ model says 6), pods took 1 create + 3 updates + get&delete per lifecycle, 60
 watch streams were opened with exactly the modelled options, and the
 recording corrected the model on object counts (only events go through
 etcd), the shape of consistent reads, and the apiserver's own 10s
-housekeeping. The default (synthetic) value blobs are sized from that
-capture; no Events were captured since nothing emits them in the harness (no
-scheduler or controller-manager runs), so that size is an estimate.
+housekeeping.
+
+### Values
+
+cloudetcd never inspects values, so what matters is their size and, for any
+future compression, their content. By default the bench and stress test
+write **generated Kubernetes objects encoded exactly as the apiserver stores
+them** (`pkg/workload/kubeblobs`: the protobuf serializer with its `k8s\x00`
+framing, including `managedFields`, which are a large share of a stored
+object). The objects resemble a managed cluster's: a kubelet-reported Node
+with its image list (~12 KB at 30 images, `-node-images`), a Deployment pod
+with probes/env/volumes (~6 KB, `-pod-containers`), a node Lease (~480 B;
+the capture measured 510), an Event, and the masterlease Endpoints. This is
+the only part of the benchmark that imports Kubernetes API types;
+`pkg/workload` itself stays kube-free, and `-blobs synthetic` or
+`-blobs <dir>` (captured values from `extract-blobs`) substitute other
+values.
 
 `analyze` prints a `per-node/min` column: a shape whose rate scales with the
 node count shows a stable per-node rate across captures of different sizes
