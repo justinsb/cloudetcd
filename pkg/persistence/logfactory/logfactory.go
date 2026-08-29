@@ -53,17 +53,8 @@ func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
 		}
 		return gcslog.NewGCSLogWithOptions(ctx, u.Host, strings.TrimPrefix(u.Path, "/"), gcslog.Options{CacheBytes: cacheBytes})
 	case "memory":
-		// memory://?commitLatency=50ms emulates an object-store backend's
-		// commit round-trip on top of the in-memory log.
-		var opts []memorylog.Option
-		if v := u.Query().Get("commitLatency"); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, fmt.Errorf("parsing commitLatency %q: %w", v, err)
-			}
-			opts = append(opts, memorylog.WithCommitLatency(d))
-		}
-		return memorylog.New(opts...), nil
+		// A throwaway log in a temporary directory, removed on Close.
+		return memorylog.New(), nil
 	case "tiered":
 		return newTieredLog(ctx, u)
 	default:

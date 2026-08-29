@@ -28,8 +28,8 @@ endpoint) and drives it with the traffic of a cluster of the given size:
 # 1,000 nodes with 30 pods each, 2 minutes of steady state
 go run ./cmd/cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
 
-# Emulate an object-store backend (a GCS conditional write is ~50ms) without one
-go run ./cmd/cloud-etcd-bench run -nodes 1000 -log 'memory://?commitLatency=50ms'
+# On a real directory (memory:// is a temporary directory removed at exit)
+go run ./cmd/cloud-etcd-bench run -nodes 1000 -log filesystem:///var/tmp/bench
 
 # All phases, JSON output, CPU profile
 go run ./cmd/cloud-etcd-bench run -nodes 100 -phases populate,steady,list-storm -o json -cpuprofile cpu.prof
@@ -101,7 +101,7 @@ up. It is skipped unless `RUN_STRESS` is set:
 
 ```bash
 RUN_STRESS=1 go test ./tests/stress -v
-RUN_STRESS=1 STRESS_NODES=1000 STRESS_PODS_PER_NODE=10 STRESS_DURATION=1m STRESS_LOG='memory://?commitLatency=20ms' go test ./tests/stress -v
+RUN_STRESS=1 STRESS_NODES=1000 STRESS_PODS_PER_NODE=10 STRESS_DURATION=1m STRESS_LOG=filesystem:///var/tmp/stress go test ./tests/stress -v
 ```
 
 ## Capturing a template from a real kube-apiserver

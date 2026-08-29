@@ -16,7 +16,7 @@
 // nodes against cloudetcd, without running kube-apiserver or any nodes.
 //
 //	cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
-//	cloud-etcd-bench run -nodes 100 -log 'memory://?commitLatency=50ms' -phases populate,steady,list-storm
+//	cloud-etcd-bench run -nodes 100 -log filesystem:///var/tmp/bench -phases populate,steady,list-storm
 //	cloud-etcd-bench run -endpoint 127.0.0.1:2379 -nodes 100
 //	cloud-etcd-bench run -nodes 100 -node-images 50 -pod-containers 3
 //	cloud-etcd-bench analyze recording.jsonl
@@ -95,7 +95,7 @@ func runBench(ctx context.Context, args []string) error {
 
 	duration := fs.Duration("duration", time.Minute, "Duration of the steady-state phase")
 	phases := fs.String("phases", "populate,steady", "Comma-separated phases to run: populate, steady, list-storm")
-	logURI := fs.String("log", "memory://", "Log URI for the in-process server (e.g. memory://?commitLatency=50ms, filesystem:///tmp/log)")
+	logURI := fs.String("log", "memory://", "Log URI for the in-process server (memory:// is a temporary directory; filesystem:///path; gs://bucket/prefix)")
 	endpoint := fs.String("endpoint", "", "Run against this etcd endpoint instead of starting an in-process server")
 	workers := fs.Int("workers", 64, "Concurrent requests in flight")
 	blobs := fs.String("blobs", "kube", "Values to write: 'kube' (generated Kubernetes objects encoded as the apiserver stores them), 'synthetic' (random bytes of captured sizes), or a directory of captured blobs (see extract-blobs)")
