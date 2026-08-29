@@ -19,7 +19,6 @@ import (
 	"sort"
 	"sync"
 	"testing"
-	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
@@ -32,9 +31,7 @@ import (
 // the Else Range showing the winner's value) rather than error or overwrite.
 func TestConcurrentConditionalUpdatesSerialize(t *testing.T) {
 	ctx := t.Context()
-	// A commit latency makes the batching window wide enough that the racing
-	// transactions land in the same batch, which is the case that matters.
-	store, err := NewMemoryStorage(memorylog.New(memorylog.WithCommitLatency(20 * time.Millisecond)))
+	store, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +104,7 @@ func TestConcurrentConditionalUpdatesSerialize(t *testing.T) {
 // revision each response reported, with the log and index agreeing.
 func TestConcurrentWritesToDistinctKeys(t *testing.T) {
 	ctx := t.Context()
-	store, err := NewMemoryStorage(memorylog.New(memorylog.WithCommitLatency(20 * time.Millisecond)))
+	store, err := NewMemoryStorage(memorylog.New())
 	if err != nil {
 		t.Fatal(err)
 	}

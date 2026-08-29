@@ -63,7 +63,9 @@ type FilesystemLog struct {
 	mu           sync.RWMutex
 	dir          string
 	lastRevision Revision
-	listener     LogListener
+	// removeOnClose deletes dir when the log is closed (see NewTempLog).
+	removeOnClose bool
+	listener      LogListener
 
 	// logFiles is an in-memory index of log files, sorted by firstRevision
 	logFiles []logFileMeta
@@ -85,6 +87,24 @@ var _ persistence.Truncater = &FilesystemLog{}
 // NewFilesystemLog creates a new filesystem-backed log with default Options.
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
 	return NewFilesystemLogWithOptions(dir, Options{})
+}
+
+// NewTempLog creates a log in a new temporary directory that is removed when
+// the log is closed. It is the log for tests and benchmarks: a real file log
+// (batching, encoding, fsync, record offsets, the record cache) on real
+// files, so anything that works here works on disk.
+func NewTempLog(opts Options) (*FilesystemLog, error) {
+	dir, err := os.MkdirTemp("", "cloudetcd-log-")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary log directory: %w", err)
+	}
+	log, err := NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	log.removeOnClose = true
+	return log, nil
 }
 
 // NewFilesystemLogWithOptions creates a new filesystem-backed log.
@@ -429,7 +449,12 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 
 // Close closes the log and releases any resources
 func (f *FilesystemLog) Close() error {
-	// For filesystem implementation, there's nothing to clean up
+	if err := f.batching.Close(); err != nil {
+		return err
+	}
+	if f.removeOnClose {
+		return os.RemoveAll(f.dir)
+	}
 	return nil
 }
 
