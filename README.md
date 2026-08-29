@@ -49,7 +49,7 @@ The project is in early development. Currently implemented:
 
 ### Prerequisites
 
-- Go 1.24 or later
+- Go 1.27 or later
 
 ### Running Tests
 
