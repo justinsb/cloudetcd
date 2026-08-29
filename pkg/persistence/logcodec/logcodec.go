@@ -30,6 +30,7 @@ import (
 	"io"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
@@ -176,4 +177,128 @@ func Decode(data []byte) ([]*persistence.LogRecord, error) {
 		records = append(records, &persistence.LogRecord{Events: wr.Events})
 	}
 	return records, nil
+}
+
+// DecodeMessageAlias is DecodeMessage without copying: the returned record's
+// keys and values alias m, so m must stay valid and unmodified for as long as
+// the record is in use (a read-only mapping of a closed log file is). It
+// parses exactly the fields of etcdserverpb.WatchResponse, mvccpb.Event and
+// mvccpb.KeyValue that the log writes, and skips any others.
+func DecodeMessageAlias(m []byte) (*persistence.LogRecord, error) {
+	record := &persistence.LogRecord{}
+	for len(m) > 0 {
+		num, typ, n := protowire.ConsumeTag(m)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		m = m[n:]
+		if num == 11 && typ == protowire.BytesType { // WatchResponse.events
+			v, n := protowire.ConsumeBytes(m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			ev, err := decodeEventAlias(v)
+			if err != nil {
+				return nil, err
+			}
+			record.Events = append(record.Events, ev)
+			m = m[n:]
+			continue
+		}
+		n = protowire.ConsumeFieldValue(num, typ, m)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		m = m[n:]
+	}
+	return record, nil
+}
+
+func decodeEventAlias(m []byte) (*mvccpb.Event, error) {
+	ev := &mvccpb.Event{}
+	for len(m) > 0 {
+		num, typ, n := protowire.ConsumeTag(m)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		m = m[n:]
+		switch {
+		case num == 1 && typ == protowire.VarintType: // type
+			v, n := protowire.ConsumeVarint(m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			ev.Type = mvccpb.Event_EventType(v)
+			m = m[n:]
+		case (num == 2 || num == 3) && typ == protowire.BytesType: // kv, prev_kv
+			v, n := protowire.ConsumeBytes(m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			kv, err := decodeKeyValueAlias(v)
+			if err != nil {
+				return nil, err
+			}
+			if num == 2 {
+				ev.Kv = kv
+			} else {
+				ev.PrevKv = kv
+			}
+			m = m[n:]
+		default:
+			n = protowire.ConsumeFieldValue(num, typ, m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			m = m[n:]
+		}
+	}
+	return ev, nil
+}
+
+func decodeKeyValueAlias(m []byte) (*mvccpb.KeyValue, error) {
+	kv := &mvccpb.KeyValue{}
+	for len(m) > 0 {
+		num, typ, n := protowire.ConsumeTag(m)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		m = m[n:]
+		switch {
+		case (num == 1 || num == 5) && typ == protowire.BytesType: // key, value
+			v, n := protowire.ConsumeBytes(m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			if num == 1 {
+				kv.Key = v
+			} else {
+				kv.Value = v
+			}
+			m = m[n:]
+		case typ == protowire.VarintType && num >= 2 && num <= 6: // create_revision, mod_revision, version, lease
+			v, n := protowire.ConsumeVarint(m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			switch num {
+			case 2:
+				kv.CreateRevision = int64(v)
+			case 3:
+				kv.ModRevision = int64(v)
+			case 4:
+				kv.Version = int64(v)
+			case 6:
+				kv.Lease = int64(v)
+			}
+			m = m[n:]
+		default:
+			n = protowire.ConsumeFieldValue(num, typ, m)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			m = m[n:]
+		}
+	}
+	return kv, nil
 }
