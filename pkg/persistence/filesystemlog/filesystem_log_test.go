@@ -17,6 +17,7 @@ package filesystemlog
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -342,6 +343,106 @@ func TestFilesystemLog_ReadsAfterRestart(t *testing.T) {
 		}
 		if want := fmt.Sprintf("k%03d", r-1); string(rec.Events[0].Kv.Key) != want || len(rec.Events[0].Kv.Value) != 100+int(r-1) {
 			t.Fatalf("GetLogEntry(%d) = %s (%d bytes), want %s (%d bytes)", r, rec.Events[0].Kv.Key, len(rec.Events[0].Kv.Value), want, 100+int(r-1))
+		}
+	}
+}
+
+// TestRotation checks that the active file rotates by size, that reads span
+// files, and that a reopened log continues from the right revision.
+func TestRotation(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	opts := Options{RotateBytes: 300, CacheBytes: 1}
+	log, err := NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 30
+	for i := 0; i < n; i++ {
+		rec := &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte(fmt.Sprintf("k%03d", i)), Value: make([]byte, 40)}}}}
+		if _, ok, err := log.Append(ctx, rec, persistence.NewTxnMeta(0)); err != nil || !ok {
+			t.Fatalf("append %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) < 3 {
+		t.Fatalf("expected several files after %d records with RotateBytes=300, got %d", n, len(entries))
+	}
+	for r := persistence.Revision(1); r <= n; r++ {
+		rec, err := log.GetLogEntry(r)
+		if err != nil {
+			t.Fatalf("GetLogEntry(%d): %v", r, err)
+		}
+		if want := fmt.Sprintf("k%03d", r-1); string(rec.Events[0].Kv.Key) != want {
+			t.Fatalf("GetLogEntry(%d) = %s, want %s", r, rec.Events[0].Kv.Key, want)
+		}
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	log2, err := NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log2.Close()
+	if rev, _ := log2.GetCurrentRevision(ctx); rev != n {
+		t.Fatalf("reopened log at revision %d, want %d", rev, n)
+	}
+	rec := &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte("after"), Value: []byte("v")}}}}
+	if rev, ok, err := log2.Append(ctx, rec, persistence.NewTxnMeta(0)); err != nil || !ok || rev != n+1 {
+		t.Fatalf("append after reopen: rev=%d ok=%v err=%v", rev, ok, err)
+	}
+}
+
+// TestTornTail checks that a write cut short by a crash is dropped on the
+// next open: the file is truncated to its last complete record, the revision
+// is what was acknowledged, and appending continues.
+func TestTornTail(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	log, err := NewFilesystemLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		rec := &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte(fmt.Sprintf("k%d", i)), Value: []byte("v")}}}}
+		if _, ok, err := log.Append(ctx, rec, persistence.NewTxnMeta(0)); err != nil || !ok {
+			t.Fatalf("append %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash mid-append: a partial record at the end of the file.
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("expected one file, got %d", len(entries))
+	}
+	path := filepath.Join(dir, entries[0].Name())
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte{0x80, 0x01, 0xde, 0xad}) // a 128-byte length prefix followed by 2 bytes
+	f.Close()
+
+	log2, err := NewFilesystemLog(dir)
+	if err != nil {
+		t.Fatalf("reopening a log with a torn tail: %v", err)
+	}
+	defer log2.Close()
+	if rev, _ := log2.GetCurrentRevision(ctx); rev != 3 {
+		t.Fatalf("revision after torn tail = %d, want 3", rev)
+	}
+	rec := &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte("k3"), Value: []byte("v")}}}}
+	if rev, ok, err := log2.Append(ctx, rec, persistence.NewTxnMeta(0)); err != nil || !ok || rev != 4 {
+		t.Fatalf("append after repair: rev=%d ok=%v err=%v", rev, ok, err)
+	}
+	for r := persistence.Revision(1); r <= 4; r++ {
+		if _, err := log2.GetLogEntry(r); err != nil {
+			t.Fatalf("GetLogEntry(%d) after repair: %v", r, err)
 		}
 	}
 }

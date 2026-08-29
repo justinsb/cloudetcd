@@ -25,7 +25,9 @@ package logcodec
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -37,19 +39,36 @@ import (
 // magic identifies the format; the last byte is the version.
 var magic = []byte("cloudetcd-log\x00\x01")
 
-// Encode serializes records as one batch.
+// Header is what a log file starts with.
+func Header() []byte { return magic }
+
+// Encode serializes records as a whole file: Header followed by the records.
 func Encode(records []*persistence.LogRecord) ([]byte, error) {
-	out := make([]byte, 0, len(magic)+len(records)*512)
-	out = append(out, magic...)
+	return EncodeRecords(append([]byte(nil), magic...), records)
+}
+
+// EncodeRecords appends the encoding of records to buf, for appending to a
+// file that already has its header.
+func EncodeRecords(buf []byte, records []*persistence.LogRecord) ([]byte, error) {
+	buf, _, err := AppendRecords(buf, records)
+	return buf, err
+}
+
+// AppendRecords is EncodeRecords that also returns each record's Span
+// relative to the start of buf.
+func AppendRecords(buf []byte, records []*persistence.LogRecord) ([]byte, []Span, error) {
 	opts := proto.MarshalOptions{}
+	spans := make([]Span, 0, len(records))
 	for i, r := range records {
 		m, err := opts.MarshalAppend(nil, &etcdserverpb.WatchResponse{Events: r.Events})
 		if err != nil {
-			return nil, fmt.Errorf("encoding record %d: %w", i, err)
+			return nil, nil, fmt.Errorf("encoding record %d: %w", i, err)
 		}
-		out = protowire.AppendBytes(out, m)
+		buf = protowire.AppendVarint(buf, uint64(len(m)))
+		spans = append(spans, Span{Offset: len(buf), Length: len(m)})
+		buf = append(buf, m...)
 	}
-	return out, nil
+	return buf, spans, nil
 }
 
 // DecodeRecord decodes only record i of a batch, skipping the others: each
@@ -84,27 +103,47 @@ type Span struct {
 	Length int
 }
 
-// Offsets returns the span of every record in a batch without decoding any
+// Offsets returns the span of every record in a file without decoding any
 // of them: it reads only the length prefixes. With the spans, a record can be
-// read from storage by itself (see DecodeMessage).
+// read from storage by itself (see DecodeMessage). A truncated final record
+// is an error; see Scan for recovering a file with a torn tail.
 func Offsets(data []byte) ([]Span, error) {
+	spans, complete, err := Scan(data)
+	if err != nil {
+		return nil, err
+	}
+	if complete != len(data) {
+		return nil, fmt.Errorf("decoding record %d: truncated", len(spans))
+	}
+	return spans, nil
+}
+
+// Scan returns the spans of the complete records in a file, and the number
+// of bytes they occupy including the header. If complete < len(data), the
+// file ends in a torn record (a write that was cut short); the file's valid
+// content is data[:complete].
+func Scan(data []byte) (spans []Span, complete int, err error) {
 	if !bytes.HasPrefix(data, magic) {
-		return nil, fmt.Errorf("not a cloudetcd log batch (bad header)")
+		return nil, 0, fmt.Errorf("not a cloudetcd log file (bad header)")
 	}
 	pos := len(magic)
-	var spans []Span
 	for pos < len(data) {
 		n, k := protowire.ConsumeVarint(data[pos:])
 		if k < 0 {
-			return nil, fmt.Errorf("decoding record %d: %w", len(spans), protowire.ParseError(k))
+			if perr := protowire.ParseError(k); errors.Is(perr, io.ErrUnexpectedEOF) {
+				// Not enough bytes for the length prefix: a torn tail.
+				return spans, pos, nil
+			} else {
+				return nil, 0, fmt.Errorf("decoding record %d: %w", len(spans), perr)
+			}
 		}
 		if uint64(len(data)-pos-k) < n {
-			return nil, fmt.Errorf("decoding record %d: truncated", len(spans))
+			return spans, pos, nil
 		}
 		spans = append(spans, Span{Offset: pos + k, Length: int(n)})
 		pos += k + int(n)
 	}
-	return spans, nil
+	return spans, pos, nil
 }
 
 // DecodeMessage decodes one record from its message bytes (the Span returned
