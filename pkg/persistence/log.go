@@ -16,11 +16,19 @@ package persistence
 
 import (
 	"context"
+	"errors"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
 type Revision uint64
+
+// ErrRevisionConflict indicates that an append lost a race with another
+// writer: the storage slot for the revision we tried to claim was already
+// taken. Our view of the log is stale — nothing was overwritten, and no
+// acknowledged write was lost, but this writer must re-read the log before
+// it can append again.
+var ErrRevisionConflict = errors.New("log revision already claimed by another writer")
 
 // LogRecord represents a single entry in the log
 type LogRecord struct {
