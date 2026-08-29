@@ -78,6 +78,45 @@ func DecodeRecord(data []byte, i int) (*persistence.LogRecord, error) {
 	return nil, fmt.Errorf("record %d not in batch", i)
 }
 
+// Span locates one record's message bytes within an encoded batch.
+type Span struct {
+	Offset int
+	Length int
+}
+
+// Offsets returns the span of every record in a batch without decoding any
+// of them: it reads only the length prefixes. With the spans, a record can be
+// read from storage by itself (see DecodeMessage).
+func Offsets(data []byte) ([]Span, error) {
+	if !bytes.HasPrefix(data, magic) {
+		return nil, fmt.Errorf("not a cloudetcd log batch (bad header)")
+	}
+	pos := len(magic)
+	var spans []Span
+	for pos < len(data) {
+		n, k := protowire.ConsumeVarint(data[pos:])
+		if k < 0 {
+			return nil, fmt.Errorf("decoding record %d: %w", len(spans), protowire.ParseError(k))
+		}
+		if uint64(len(data)-pos-k) < n {
+			return nil, fmt.Errorf("decoding record %d: truncated", len(spans))
+		}
+		spans = append(spans, Span{Offset: pos + k, Length: int(n)})
+		pos += k + int(n)
+	}
+	return spans, nil
+}
+
+// DecodeMessage decodes one record from its message bytes (the Span returned
+// by Offsets).
+func DecodeMessage(m []byte) (*persistence.LogRecord, error) {
+	wr := &etcdserverpb.WatchResponse{}
+	if err := proto.Unmarshal(m, wr); err != nil {
+		return nil, err
+	}
+	return &persistence.LogRecord{Events: wr.Events}, nil
+}
+
 // Decode parses a batch produced by Encode.
 func Decode(data []byte) ([]*persistence.LogRecord, error) {
 	if !bytes.HasPrefix(data, magic) {

@@ -16,6 +16,7 @@ package workload
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -46,6 +47,10 @@ type Report struct {
 
 	// ErrorSamples lists distinct errors seen and how often.
 	ErrorSamples map[string]int64 `json:"errorSamples,omitempty"`
+
+	// HeapInuseBytes is the Go heap in use at the end of the phase, for
+	// the process running the report (the server too, when in-process).
+	HeapInuseBytes uint64 `json:"heapInuseBytes"`
 }
 
 // OpReport summarizes one op label.
@@ -139,6 +144,9 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 			Lag:              latencyReport(&ws.Lag),
 		}
 	}
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	rep.HeapInuseBytes = mem.HeapInuse
 	if len(stats.errs) > 0 {
 		rep.ErrorSamples = map[string]int64{}
 		for msg, n := range stats.errs {
@@ -151,8 +159,8 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 // Text renders the report as a table.
 func (r *Report) Text() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "== %s: %d nodes, %d pods (%d keys), %s, %d ops (%.0f/s), %d errors\n",
-		r.Phase, r.Nodes, r.Pods, r.Keys, r.Duration.Round(time.Millisecond), r.TotalOps, r.TotalRate, r.Errors)
+	fmt.Fprintf(&sb, "== %s: %d nodes, %d pods (%d keys), %s, %d ops (%.0f/s), %d errors, heap %.0f MB\n",
+		r.Phase, r.Nodes, r.Pods, r.Keys, r.Duration.Round(time.Millisecond), r.TotalOps, r.TotalRate, r.Errors, float64(r.HeapInuseBytes)/(1<<20))
 	tw := tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "op\tcount\terrors\tconflicts\trate/s\texpected/s\tp50\tp90\tp99\tp99.9\tmax")
 	labels := make([]string, 0, len(r.Ops))

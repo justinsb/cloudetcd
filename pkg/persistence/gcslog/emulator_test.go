@@ -79,3 +79,20 @@ func TestGCSLogWithEmulator(t *testing.T) {
 
 	logtests.RunAll(t, logFactory)
 }
+
+// TestGCSLogWithEmulatorTinyCache runs the suite with a record cache too
+// small to hold anything, so every GetLogEntry re-fetches its batch.
+func TestGCSLogWithEmulatorTinyCache(t *testing.T) {
+	bucketName := "cloudetcd-test-tinycache"
+	startEmulator(t, bucketName)
+
+	ctx := t.Context()
+	logtests.RunAll(t, func(t *testing.T) persistence.Log {
+		prefix := fmt.Sprintf("test-log-%d/", time.Now().UnixNano())
+		log, err := NewGCSLogWithOptions(ctx, bucketName, prefix, Options{CacheBytes: 1})
+		if err != nil {
+			t.Fatalf("Failed to create GCS log: %v", err)
+		}
+		return log
+	})
+}
