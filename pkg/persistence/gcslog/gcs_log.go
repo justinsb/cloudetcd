@@ -16,7 +16,6 @@ package gcslog
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +40,7 @@ import (
 	"google.golang.org/grpc/status"
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
+	"justinsb.com/cloudetcd/pkg/persistence/logcodec"
 	"k8s.io/klog/v2"
 )
 
@@ -304,23 +304,21 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *
 	objectName := l.batchToObjectName(startRevision, count)
 	obj := l.bucket.Object(objectName).If(storage.Conditions{DoesNotExist: true})
 
-	// Serialize record to JSON
-	// TODO: Use proto for speed
 	data := &persistedBatch{
 		Records: make([]*persistence.LogRecord, len(bc.Transactions)),
 	}
 	for i, txn := range bc.Transactions {
 		data.Records[i] = txn.LogRecord
 	}
-	b, err := json.Marshal(data)
+	b, err := logcodec.Encode(data.Records)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal log record: %w", err)
+		return nil, fmt.Errorf("failed to encode log records: %w", err)
 	}
 
 	// Write to GCS
 	log.Info("Writing log entry to GCS object", "objectName", objectName)
 	writer := obj.NewWriter(ctx)
-	writer.ContentType = "application/json"
+	writer.ContentType = "application/octet-stream"
 
 	if _, err := writer.Write(b); err != nil {
 		writer.Close()
@@ -396,8 +394,8 @@ func (g *GCSLog) loadBatch(ctx context.Context, fileMeta logFileMeta) (*persiste
 	}
 
 	pBatch := &persistedBatch{}
-	if err := json.Unmarshal(data, pBatch); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal log record from GCS object %s: %w", objectName, err)
+	if pBatch.Records, err = logcodec.Decode(data); err != nil {
+		return nil, fmt.Errorf("failed to decode log records from GCS object %s: %w", objectName, err)
 	}
 	return pBatch, nil
 }

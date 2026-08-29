@@ -16,7 +16,6 @@ package filesystemlog
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +26,7 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
+	"justinsb.com/cloudetcd/pkg/persistence/logcodec"
 	"k8s.io/klog/v2"
 )
 
@@ -191,17 +191,13 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 	filename := batchToFilename(startRevision, count)
 	filepath := filepath.Join(l.dir, filename)
 
-	// Serialize record to JSON
-	// TODO: Use proto for speed
-	data := &persistedBatch{
-		Records: make([]*persistence.LogRecord, len(bc.Transactions)),
-	}
+	records := make([]*persistence.LogRecord, len(bc.Transactions))
 	for i, txn := range bc.Transactions {
-		data.Records[i] = txn.LogRecord
+		records[i] = txn.LogRecord
 	}
-	b, err := json.Marshal(data)
+	b, err := logcodec.Encode(records)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal log records: %w", err)
+		return nil, fmt.Errorf("failed to encode log records: %w", err)
 	}
 
 	// Write and fsync: this is the commit point, so the record must be
@@ -266,20 +262,16 @@ func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
 		return nil, fmt.Errorf("failed to read log file %q: %w", filepath, err)
 	}
 
-	record := &persistedBatch{}
-	if err := json.Unmarshal(data, record); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal log record from file %s: %w", filepath, err)
-	}
-
+	// Decode just the record we want; the rest of the batch is skipped over.
 	pos := int(revision - fileMeta.firstRevision)
-	if pos < 0 || pos >= len(record.Records) {
-		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, len(record.Records))
+	if pos < 0 || pos >= fileMeta.count {
+		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, fileMeta.count)
 	}
-	if len(record.Records) != fileMeta.count {
-		// This would be a corruption error
-		klog.Warningf("log file %s has mismatched record count, file meta says %d, found %d", filepath, fileMeta.count, len(record.Records))
+	record, err := logcodec.DecodeRecord(data, pos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, filepath, err)
 	}
-	return record.Records[pos], nil
+	return record, nil
 }
 
 // findFileForRevision finds the log file containing the given revision.
@@ -320,8 +312,8 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 		}
 
 		pBatch := &persistedBatch{}
-		if err := json.Unmarshal(data, pBatch); err != nil {
-			return fmt.Errorf("failed to unmarshal log record from file %s: %w", filepath, err)
+		if pBatch.Records, err = logcodec.Decode(data); err != nil {
+			return fmt.Errorf("failed to decode log records from file %s: %w", filepath, err)
 		}
 
 		for i, record := range pBatch.Records {
