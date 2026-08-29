@@ -12,23 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package filesystemlog is the log: an append-only sequence of files in a
+// directory, optionally archived to an object store.
+//
+// Batches are appended to the active file and fsynced; that is the commit.
+// The active file is rotated when it reaches a size or an age, and each
+// closed file is uploaded to the Archive (if there is one) in the
+// background. Local files are the read store: the log keeps in memory only
+// its file index, each record's byte span within its file, and a bounded
+// cache of recently written or read records; anything else is a positioned
+// read of one record. On a machine with no local files, the archive is
+// downloaded first.
 package filesystemlog
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"k8s.io/klog/v2"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/batch"
 	"justinsb.com/cloudetcd/pkg/persistence/logcodec"
 	"justinsb.com/cloudetcd/pkg/persistence/recordcache"
-	"k8s.io/klog/v2"
 )
 
 type Revision = persistence.Revision
@@ -36,9 +51,19 @@ type LogRecord = persistence.LogRecord
 type LogListener = persistence.LogListener
 type TxnMeta = persistence.TxnMeta
 
-type logFileMeta struct {
-	firstRevision Revision
-	count         int
+// Archive is an object store that closed log files are copied to, and
+// restored from on a machine that has none.
+type Archive interface {
+	// List returns the names of the archived files.
+	List(ctx context.Context) ([]string, error)
+	// Upload stores the file at path under name. It succeeds if the archive
+	// already holds an identical file, and returns an error wrapping
+	// persistence.ErrRevisionConflict if it holds a different one: another
+	// writer is using the archive, which the single-writer design does not
+	// allow.
+	Upload(ctx context.Context, name string, path string) error
+	// Download copies the archived file name to path.
+	Download(ctx context.Context, name string, path string) error
 }
 
 // Options configures a FilesystemLog.
@@ -46,53 +71,85 @@ type Options struct {
 	// CacheBytes bounds the in-memory cache of decoded records; records not
 	// in it are read from disk on demand. <= 0 means unbounded.
 	CacheBytes int64
+	// RotateBytes rotates the active file once it is this large.
+	RotateBytes int64
+	// RotateAfter rotates the active file once it is this old and has any
+	// records. So a busy log rotates by size every few seconds and an idle
+	// one by age, and the archive is never more than RotateAfter behind.
+	RotateAfter time.Duration
+	// Archive, if set, receives every closed file.
+	Archive Archive
 }
 
-// DefaultCacheBytes is the record cache budget when Options.CacheBytes is 0.
-const DefaultCacheBytes = 256 << 20
+// Defaults for Options.
+const (
+	DefaultCacheBytes  = 256 << 20
+	DefaultRotateBytes = 64 << 20
+	DefaultRotateAfter = 5 * time.Minute
+)
 
-// FilesystemLog is a filesystem-backed implementation of the Log interface.
-//
-// Values live on disk: the log keeps in memory only its file index, the byte
-// offset of each record within its file, and a bounded cache of recently
-// written or read records. Reading a record that is not cached is a single
-// positioned read of that record's bytes.
+// logFile is one file of the log. All but the last are closed.
+type logFile struct {
+	name  string
+	first Revision
+	count int
+	// size is the file's length in bytes, header included.
+	size int64
+	// opened is when the file was created, for age-based rotation.
+	opened time.Time
+	// archived is whether the archive holds this (closed) file.
+	archived bool
+}
+
+func (f *logFile) last() Revision { return f.first + Revision(f.count) - 1 }
+
+// FilesystemLog is the log; see the package comment.
 type FilesystemLog struct {
+	dir  string
+	opts Options
+
 	batching *batch.Batching
 
-	mu           sync.RWMutex
-	dir          string
-	lastRevision Revision
-	// removeOnClose deletes dir when the log is closed (see NewTempLog).
-	removeOnClose bool
-	listener      LogListener
+	// writeMu serializes appends and rotation, so that a commit's fsync does
+	// not hold mu and block readers.
+	writeMu sync.Mutex
+	// active is the file being appended to, the last of files.
+	active *os.File
 
-	// logFiles is an in-memory index of log files, sorted by firstRevision
-	logFiles []logFileMeta
+	// mu guards the index below.
+	mu           sync.RWMutex
+	files        []*logFile
+	lastRevision Revision
+	listener     LogListener
 
 	// spans locates each record within its file, keyed by the file's first
-	// revision. Filled at commit time; rebuilt on first use for files that
-	// existed at startup. Guarded by spansMu.
+	// revision. Maintained for the active file as records are appended;
+	// rebuilt on first use for closed files.
 	spansMu sync.Mutex
 	spans   map[Revision][]logcodec.Span
 
 	// cache holds recently written and read records.
 	cache *recordcache.Cache
+
+	// uploads carries closed files to the uploader goroutine.
+	uploads      chan string
+	uploaderDone chan struct{}
+	stop         chan struct{}
+	rotatorDone  chan struct{}
+
+	removeOnClose bool
 }
 
 var _ persistence.Log = &FilesystemLog{}
-var _ persistence.BatchAppender = &FilesystemLog{}
-var _ persistence.Truncater = &FilesystemLog{}
 
-// NewFilesystemLog creates a new filesystem-backed log with default Options.
+// NewFilesystemLog creates or opens the log in dir with default Options.
 func NewFilesystemLog(dir string) (*FilesystemLog, error) {
 	return NewFilesystemLogWithOptions(dir, Options{})
 }
 
 // NewTempLog creates a log in a new temporary directory that is removed when
-// the log is closed. It is the log for tests and benchmarks: a real file log
-// (batching, encoding, fsync, record offsets, the record cache) on real
-// files, so anything that works here works on disk.
+// the log is closed. It is the log for tests and benchmarks: the real log on
+// real files, so anything that works here works on disk.
 func NewTempLog(opts Options) (*FilesystemLog, error) {
 	dir, err := os.MkdirTemp("", "cloudetcd-log-")
 	if err != nil {
@@ -107,334 +164,473 @@ func NewTempLog(opts Options) (*FilesystemLog, error) {
 	return log, nil
 }
 
-// NewFilesystemLogWithOptions creates a new filesystem-backed log.
+// NewFilesystemLogWithOptions creates or opens the log in dir.
 func NewFilesystemLogWithOptions(dir string, opts Options) (*FilesystemLog, error) {
-	// Ensure the directory exists
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
-	cacheBytes := opts.CacheBytes
-	if cacheBytes == 0 {
-		cacheBytes = DefaultCacheBytes
+	if opts.CacheBytes == 0 {
+		opts.CacheBytes = DefaultCacheBytes
+	}
+	if opts.RotateBytes <= 0 {
+		opts.RotateBytes = DefaultRotateBytes
+	}
+	if opts.RotateAfter <= 0 {
+		opts.RotateAfter = DefaultRotateAfter
 	}
 
-	log := &FilesystemLog{
-		dir:   dir,
-		spans: map[Revision][]logcodec.Span{},
-		cache: recordcache.New(cacheBytes),
+	l := &FilesystemLog{
+		dir:          dir,
+		opts:         opts,
+		spans:        map[Revision][]logcodec.Span{},
+		cache:        recordcache.New(opts.CacheBytes),
+		uploads:      make(chan string, 1024),
+		uploaderDone: make(chan struct{}),
+		stop:         make(chan struct{}),
+		rotatorDone:  make(chan struct{}),
 	}
 
-	// Replay existing log entries to determine current revision
-	if err := log.replay(); err != nil {
-		return nil, fmt.Errorf("failed to replay existing log: %w", err)
+	ctx := context.Background()
+	if err := l.open(ctx); err != nil {
+		return nil, err
 	}
 
-	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
-
-	return log, nil
+	l.batching = batch.NewBatching(l.lastRevision, l.commitBatch)
+	go l.uploader(ctx)
+	go l.rotator()
+	return l, nil
 }
 
-// replay reads all existing log files to determine the current revision
-func (f *FilesystemLog) replay() error {
-	entries, err := os.ReadDir(f.dir)
+// open builds the index from the files in the directory (and the archive),
+// repairs a torn tail on the last file, and opens it for appending.
+func (l *FilesystemLog) open(ctx context.Context) error {
+	files, err := l.listFiles()
 	if err != nil {
-		return fmt.Errorf("failed to read log directory: %w", err)
+		return err
 	}
 
-	f.logFiles = nil
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	if l.opts.Archive != nil {
+		if files, err = l.reconcileArchive(ctx, files); err != nil {
+			return err
 		}
+	}
 
-		// Parse revision from filename
-		filename := entry.Name()
-		firstRevision, count, err := filenameToMeta(filename)
+	for i, f := range files {
+		data, err := os.ReadFile(filepath.Join(l.dir, f.name))
 		if err != nil {
-			// Skip invalid filenames
-			klog.Warningf("ignoring file with unexpected name %q: %v", filename, err)
+			return fmt.Errorf("failed to read log file %s: %w", f.name, err)
+		}
+		spans, complete, err := logcodec.Scan(data)
+		if err != nil {
+			return fmt.Errorf("log file %s: %w", f.name, err)
+		}
+		if complete < len(data) {
+			if i < len(files)-1 {
+				return fmt.Errorf("log file %s is truncated at byte %d but is not the last file; recovery needed", f.name, complete)
+			}
+			// A write cut short by a crash: nothing past it was acknowledged.
+			klog.Warningf("log file %s ends in a torn record; truncating from %d to %d bytes", f.name, len(data), complete)
+			if err := os.Truncate(filepath.Join(l.dir, f.name), int64(complete)); err != nil {
+				return fmt.Errorf("truncating log file %s: %w", f.name, err)
+			}
+		}
+		f.count = len(spans)
+		f.size = int64(complete)
+		if i > 0 {
+			prev := files[i-1]
+			if f.first != prev.first+Revision(prev.count) {
+				return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed", prev.name, prev.last(), f.name, f.first)
+			}
+		} else if f.first != 1 {
+			return fmt.Errorf("log starts at revision %d, not 1; recovery needed", f.first)
+		}
+		if i == len(files)-1 {
+			l.spans[f.first] = spans
+		}
+	}
+
+	l.files = files
+	if len(files) == 0 {
+		return l.newActiveFile()
+	}
+	last := files[len(files)-1]
+	l.lastRevision = last.last()
+
+	// Closed files that never made it to the archive (a crash after
+	// rotating, before the upload finished).
+	if l.opts.Archive != nil {
+		for _, f := range files[:len(files)-1] {
+			if !f.archived {
+				l.uploads <- f.name
+			}
+		}
+	}
+
+	if last.archived {
+		// An archived file is never appended to again (its object would no
+		// longer match); start the next one.
+		return l.newActiveFile()
+	}
+	l.active, err = os.OpenFile(filepath.Join(l.dir, last.name), os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("opening log file %s for append: %w", last.name, err)
+	}
+	last.opened = time.Now()
+	return nil
+}
+
+// listFiles returns the log files in the directory, sorted.
+func (l *FilesystemLog) listFiles() ([]*logFile, error) {
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read log directory: %w", err)
+	}
+	var files []*logFile
+	for _, e := range entries {
+		if e.IsDir() {
 			continue
 		}
+		first, err := filenameToRevision(e.Name())
+		if err != nil {
+			klog.Warningf("ignoring file with unexpected name %q: %v", e.Name(), err)
+			continue
+		}
+		files = append(files, &logFile{name: e.Name(), first: first})
+	}
+	slices.SortFunc(files, func(a, b *logFile) int { return int(a.first) - int(b.first) })
+	return files, nil
+}
 
-		f.logFiles = append(f.logFiles, logFileMeta{firstRevision: firstRevision, count: count})
+// reconcileArchive brings the directory and the archive into agreement: a
+// directory with no files is restored from the archive; otherwise every
+// archived file must be present locally (the archive is written only by
+// this log), and closed local files missing from the archive are uploaded.
+func (l *FilesystemLog) reconcileArchive(ctx context.Context, files []*logFile) ([]*logFile, error) {
+	names, err := l.opts.Archive.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing archive: %w", err)
+	}
+	archived := map[string]bool{}
+	for _, name := range names {
+		archived[name] = true
 	}
 
-	// Sort the log files by revision
-	slices.SortFunc(f.logFiles, func(a, b logFileMeta) int {
-		if a.firstRevision < b.firstRevision {
-			return -1
+	if len(files) == 0 && len(names) > 0 {
+		klog.Infof("log directory is empty; restoring %d file(s) from the archive", len(names))
+		for _, name := range names {
+			if err := l.opts.Archive.Download(ctx, name, filepath.Join(l.dir, name)); err != nil {
+				return nil, fmt.Errorf("restoring %s from the archive: %w", name, err)
+			}
 		}
-		if a.firstRevision > b.firstRevision {
-			return 1
-		}
-		return 0
-	})
-
-	// The files must be contiguous. A gap means a write that was never
-	// acknowledged was left behind (a batch after a failed one that could
-	// not be aborted), or worse; either way it needs a person to look
-	// before anything is discarded.
-	for i := 1; i < len(f.logFiles); i++ {
-		prev := f.logFiles[i-1]
-		if next := f.logFiles[i]; next.firstRevision != prev.firstRevision+Revision(prev.count) {
-			return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed",
-				batchToFilename(prev.firstRevision, prev.count), prev.firstRevision+Revision(prev.count)-1,
-				batchToFilename(next.firstRevision, next.count), next.firstRevision)
+		if files, err = l.listFiles(); err != nil {
+			return nil, err
 		}
 	}
 
-	// Find the highest revision
-	if len(f.logFiles) > 0 {
-		lastFile := f.logFiles[len(f.logFiles)-1]
-		f.lastRevision = lastFile.firstRevision + Revision(lastFile.count) - 1
+	local := map[string]*logFile{}
+	for _, f := range files {
+		local[f.name] = f
 	}
+	for _, name := range names {
+		f, ok := local[name]
+		if !ok {
+			return nil, fmt.Errorf("archive holds %s, which this log does not have; is another instance writing to the archive?", name)
+		}
+		f.archived = true
+	}
+	return files, nil
+}
 
+// newActiveFile starts the file for revision lastRevision+1. Called with
+// writeMu and mu held (or before the log is shared).
+func (l *FilesystemLog) newActiveFile() error {
+	first := l.lastRevision + 1
+	name := revisionToFilename(first)
+	f, err := os.OpenFile(filepath.Join(l.dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("creating log file %s: %w", name, err)
+	}
+	header := logcodec.Header()
+	if _, err := f.Write(header); err != nil {
+		f.Close()
+		return fmt.Errorf("writing log file %s: %w", name, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("syncing log file %s: %w", name, err)
+	}
+	if err := syncDir(l.dir); err != nil {
+		f.Close()
+		return err
+	}
+	l.files = append(l.files, &logFile{name: name, first: first, size: int64(len(header)), opened: time.Now()})
+	l.spansMu.Lock()
+	l.spans[first] = nil
+	l.spansMu.Unlock()
+	l.active = f
 	return nil
 }
 
 // Append adds a new record to the log and returns the revision number
-func (f *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error) {
-	return f.batching.Add(ctx, logRecord, txnMeta)
-}
-
-// AppendBatch appends a contiguous range of records starting at lastRevision+1, preserving revisions.
-func (f *FilesystemLog) AppendBatch(ctx context.Context, lastRevision Revision, records []*LogRecord) (bool, error) {
-	return f.batching.AddBatch(ctx, lastRevision, records)
-}
-
-// Truncate discards records with revisions <= throughRevision.
-// It only removes whole log files, and always retains the newest file so that
-// the current revision can be recovered after a restart.
-func (f *FilesystemLog) Truncate(ctx context.Context, throughRevision Revision) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var kept []logFileMeta
-	for i, fileMeta := range f.logFiles {
-		fileLastRevision := fileMeta.firstRevision + Revision(fileMeta.count) - 1
-		if fileLastRevision <= throughRevision && i < len(f.logFiles)-1 {
-			filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
-			if err := os.Remove(filepath.Join(f.dir, filename)); err != nil {
-				f.logFiles = append(kept, f.logFiles[i:]...)
-				return fmt.Errorf("failed to remove log file %q: %w", filename, err)
-			}
-			f.spansMu.Lock()
-			delete(f.spans, fileMeta.firstRevision)
-			f.spansMu.Unlock()
-			for r := fileMeta.firstRevision; r <= fileLastRevision; r++ {
-				f.cache.Remove(r)
-			}
-		} else {
-			kept = append(kept, fileMeta)
-		}
-	}
-	f.logFiles = kept
-	return nil
+func (l *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error) {
+	return l.batching.Add(ctx, logRecord, txnMeta)
 }
 
 type persistedBatch struct {
 	Records []*persistence.LogRecord
 }
 
-// commitBatch commits all transactions in the current batch
-func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) (batch.Commit, error) {
-	// Check if all transactions have the same condition position
+// commitBatch appends a batch to the active file, fsyncs it, and publishes
+// it. This is the commit point.
+func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) error {
 	if len(bc.Transactions) == 0 {
-		return nil, fmt.Errorf("batch contains no transactions")
+		return fmt.Errorf("batch contains no transactions")
 	}
-
-	// The write happens with no lock held, so that consecutive batches can
-	// be in flight at once; publication below is ordered by the sequencer.
-	startRevision := lastLogPosition + 1
-	count := len(bc.Transactions)
-
-	// Create filename with hex-encoded revision
-	filename := batchToFilename(startRevision, count)
-	filepath := filepath.Join(l.dir, filename)
-
 	records := make([]*persistence.LogRecord, len(bc.Transactions))
 	for i, txn := range bc.Transactions {
 		records[i] = txn.LogRecord
 	}
-	b, err := logcodec.Encode(records)
+	buf, spans, err := logcodec.AppendRecords(nil, records)
 	if err != nil {
-		return nil, fmt.Errorf("failed to encode log records: %w", err)
+		return fmt.Errorf("failed to encode log records: %w", err)
 	}
 
-	// Write and fsync: this is the commit point, so the record must be
-	// durable on disk (not just in the page cache) before we acknowledge.
-	if err := writeFileSync(filepath, b, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write log file: %w", err)
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+
+	if lastLogPosition != l.lastRevision {
+		return fmt.Errorf("batch is not contiguous with the log: batch starts after %d, log is at %d", lastLogPosition, l.lastRevision)
+	}
+	active := l.files[len(l.files)-1]
+	if _, err := l.active.Write(buf); err != nil {
+		return fmt.Errorf("failed to write log file %s: %w", active.name, err)
+	}
+	if err := l.active.Sync(); err != nil {
+		return fmt.Errorf("failed to sync log file %s: %w", active.name, err)
 	}
 
-	spans, err := logcodec.Offsets(b)
-	if err != nil {
-		return nil, fmt.Errorf("indexing log file %s: %w", filepath, err)
-	}
-	return &fileCommit{log: l, path: filepath, lastLogPosition: lastLogPosition, records: records, spans: spans}, nil
-}
-
-// fileCommit is a written, unpublished log file.
-type fileCommit struct {
-	log             *FilesystemLog
-	path            string
-	lastLogPosition Revision
-	records         []*persistence.LogRecord
-	spans           []logcodec.Span
-}
-
-func (c *fileCommit) Publish() {
-	l := c.log
+	// Publish.
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.lastRevision != c.lastLogPosition {
-		// Batching publishes in order; this cannot happen.
-		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
+	base := int(active.size)
+	for i := range spans {
+		spans[i].Offset += base
 	}
-	startRevision := l.lastRevision + 1
-	count := len(c.records)
 	l.spansMu.Lock()
-	l.spans[startRevision] = c.spans
+	l.spans[active.first] = append(l.spans[active.first], spans...)
 	l.spansMu.Unlock()
-	// Just-published records are the hottest: the transactions that wrote
-	// them, the index apply and the watchers all read them next.
-	for i, r := range c.records {
+	startRevision := l.lastRevision + 1
+	for i, r := range records {
 		l.cache.Put(startRevision+Revision(i), r)
 	}
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
-	l.lastRevision += Revision(count)
+	active.count += len(records)
+	active.size += int64(len(buf))
+	l.lastRevision += Revision(len(records))
 	if l.listener != nil {
 		l.listener.OnLogEntry(l.lastRevision)
 	}
-	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		count, startRevision, l.lastRevision)
+	klog.V(2).Infof("committed batch of %d transactions, revisions %d-%d", len(records), startRevision, l.lastRevision)
+
+	var rotateErr error
+	if active.size >= l.opts.RotateBytes {
+		rotateErr = l.rotateLocked()
+	}
+	l.mu.Unlock()
+	return rotateErr
+}
+
+// rotateLocked closes the active file and starts the next one. Called with
+// writeMu and mu held. The next file is created before the old one is handed
+// to the uploader, so the last file in the directory is always the active
+// one and a closed file is never appended to again.
+func (l *FilesystemLog) rotateLocked() error {
+	old := l.files[len(l.files)-1]
+	if old.count == 0 {
+		return nil
+	}
+	if err := l.active.Close(); err != nil {
+		return fmt.Errorf("closing log file %s: %w", old.name, err)
+	}
+	if err := l.newActiveFile(); err != nil {
+		return err
+	}
+	klog.V(2).Infof("rotated log file %s (%d records, %d bytes)", old.name, old.count, old.size)
+	if l.opts.Archive != nil {
+		l.uploads <- old.name
+	}
+	return nil
+}
+
+// rotator rotates the active file by age.
+func (l *FilesystemLog) rotator() {
+	defer close(l.rotatorDone)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-ticker.C:
+		}
+		l.writeMu.Lock()
+		l.mu.Lock()
+		active := l.files[len(l.files)-1]
+		if active.count > 0 && time.Since(active.opened) >= l.opts.RotateAfter {
+			if err := l.rotateLocked(); err != nil {
+				klog.Errorf("rotating log file: %v", err)
+			}
+		}
+		l.mu.Unlock()
+		l.writeMu.Unlock()
+	}
+}
+
+// uploader copies closed files to the archive, retrying until each succeeds.
+// A conflict means another writer is using the archive, which is fatal.
+func (l *FilesystemLog) uploader(ctx context.Context) {
+	defer close(l.uploaderDone)
+	if l.opts.Archive == nil {
+		return
+	}
+	for name := range l.uploads {
+		backoff := time.Second
+		for {
+			err := l.opts.Archive.Upload(ctx, name, filepath.Join(l.dir, name))
+			if err == nil {
+				klog.V(2).Infof("archived log file %s", name)
+				l.mu.Lock()
+				for _, f := range l.files {
+					if f.name == name {
+						f.archived = true
+					}
+				}
+				l.mu.Unlock()
+				break
+			}
+			if errors.Is(err, persistence.ErrRevisionConflict) {
+				panic(fmt.Sprintf("archiving log file %s: %v", name, err))
+			}
+			klog.Errorf("archiving log file %s (retrying in %s): %v", name, backoff, err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		}
+	}
 }
 
 // GetCurrentRevision returns the current revision number
-func (f *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.lastRevision, nil
+func (l *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.lastRevision, nil
 }
 
 // GetLogEntry returns the log entry for the given revision
-func (f *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.getLogEntry(revision)
-}
-
-func (f *FilesystemLog) getLogEntry(revision Revision) (*LogRecord, error) {
-	if record, ok := f.cache.Get(revision); ok {
+func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
+	if record, ok := l.cache.Get(revision); ok {
 		return record, nil
 	}
 
-	fileMeta, ok := f.findFileForRevision(revision)
+	l.mu.RLock()
+	f, ok := l.findFile(revision)
+	l.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
 	}
-	pos := int(revision - fileMeta.firstRevision)
-	if pos < 0 || pos >= fileMeta.count {
-		return nil, fmt.Errorf("log entry not found in batch for revision %d (pos %d, count %d)", revision, pos, fileMeta.count)
-	}
-
-	filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
-	filepath := filepath.Join(f.dir, filename)
-	spans, err := f.fileSpans(fileMeta, filepath)
+	spans, err := l.fileSpans(f)
 	if err != nil {
 		return nil, err
 	}
-	if pos >= len(spans) {
-		return nil, fmt.Errorf("log file %s has %d records, expected %d", filepath, len(spans), fileMeta.count)
+	pos := int(revision - f.first)
+	if pos < 0 || pos >= len(spans) {
+		return nil, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
 	}
 
 	// One positioned read of exactly this record's bytes.
 	span := spans[pos]
-	file, err := os.Open(filepath)
+	file, err := os.Open(filepath.Join(l.dir, f.name))
 	if err != nil {
-		return nil, fmt.Errorf("failed to open log file %q: %w", filepath, err)
+		return nil, fmt.Errorf("failed to open log file %s: %w", f.name, err)
 	}
 	defer file.Close()
 	buf := make([]byte, span.Length)
 	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
-		return nil, fmt.Errorf("failed to read record %d from log file %q: %w", revision, filepath, err)
+		return nil, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
 	}
 	record, err := logcodec.DecodeMessage(buf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, filepath, err)
+		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, f.name, err)
 	}
-	f.cache.Put(revision, record)
+	l.cache.Put(revision, record)
 	return record, nil
 }
 
-// fileSpans returns the record spans of a log file, scanning the file's
-// length prefixes on first use for files that predate this process.
-func (f *FilesystemLog) fileSpans(fileMeta logFileMeta, filepath string) ([]logcodec.Span, error) {
-	f.spansMu.Lock()
-	spans, ok := f.spans[fileMeta.firstRevision]
-	f.spansMu.Unlock()
+// fileSpans returns the record spans of a file, scanning its length
+// prefixes on first use for closed files.
+func (l *FilesystemLog) fileSpans(f *logFile) ([]logcodec.Span, error) {
+	l.spansMu.Lock()
+	spans, ok := l.spans[f.first]
+	l.spansMu.Unlock()
 	if ok {
 		return spans, nil
 	}
-	data, err := os.ReadFile(filepath)
+	data, err := os.ReadFile(filepath.Join(l.dir, f.name))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read log file %q: %w", filepath, err)
+		return nil, fmt.Errorf("failed to read log file %s: %w", f.name, err)
 	}
 	spans, err = logcodec.Offsets(data)
 	if err != nil {
-		return nil, fmt.Errorf("indexing log file %s: %w", filepath, err)
+		return nil, fmt.Errorf("indexing log file %s: %w", f.name, err)
 	}
-	f.spansMu.Lock()
-	f.spans[fileMeta.firstRevision] = spans
-	f.spansMu.Unlock()
+	l.spansMu.Lock()
+	l.spans[f.first] = spans
+	l.spansMu.Unlock()
 	return spans, nil
 }
 
-// findFileForRevision finds the log file containing the given revision.
-// It uses the in-memory index.
-func (f *FilesystemLog) findFileForRevision(revision Revision) (logFileMeta, bool) {
-	// The logFiles slice is sorted by firstRevision.
-	// A reverse loop is simple and efficient enough, especially as recent revisions are more likely to be requested.
-	for i := len(f.logFiles) - 1; i >= 0; i-- {
-		fileMeta := f.logFiles[i]
-		if fileMeta.firstRevision <= revision {
-			if revision < fileMeta.firstRevision+Revision(fileMeta.count) {
-				return fileMeta, true
-			}
-			// We've gone past our revision, and because the list is sorted,
-			// no earlier file will contain it.
-			return logFileMeta{}, false
+// findFile finds the file containing revision. Called with mu held.
+func (l *FilesystemLog) findFile(revision Revision) (*logFile, bool) {
+	// Recent revisions are the most requested; search from the end.
+	for i := len(l.files) - 1; i >= 0; i-- {
+		f := l.files[i]
+		if f.first <= revision {
+			return f, revision <= f.last()
 		}
 	}
-	return logFileMeta{}, false
+	return nil, false
 }
 
 // Read reads records from the log starting from the given revision
-func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callback func(Revision, *LogRecord) bool) error {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+func (l *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callback func(Revision, *LogRecord) bool) error {
+	l.mu.RLock()
+	files := append([]*logFile(nil), l.files...)
+	sizes := make([]int64, len(files))
+	for i, f := range files {
+		sizes[i] = f.size
+	}
+	l.mu.RUnlock()
 
-	for _, fileMeta := range f.logFiles {
-		fileLastRevision := fileMeta.firstRevision + Revision(fileMeta.count) - 1
-		if fileLastRevision < fromRevision {
+	for i, f := range files {
+		if f.count == 0 || f.last() < fromRevision {
 			continue
 		}
-
-		filename := batchToFilename(fileMeta.firstRevision, fileMeta.count)
-		filepath := filepath.Join(f.dir, filename)
-		data, err := os.ReadFile(filepath)
+		// Read only what was published; the active file may be growing.
+		data := make([]byte, sizes[i])
+		file, err := os.Open(filepath.Join(l.dir, f.name))
 		if err != nil {
-			return fmt.Errorf("failed to read log file %q: %w", filepath, err)
+			return fmt.Errorf("failed to open log file %s: %w", f.name, err)
 		}
-
-		pBatch := &persistedBatch{}
-		if pBatch.Records, err = logcodec.Decode(data); err != nil {
-			return fmt.Errorf("failed to decode log records from file %s: %w", filepath, err)
+		_, err = io.ReadFull(file, data)
+		file.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read log file %s: %w", f.name, err)
 		}
-
-		for i, record := range pBatch.Records {
-			revision := fileMeta.firstRevision + Revision(i)
+		records, err := logcodec.Decode(data)
+		if err != nil {
+			return fmt.Errorf("failed to decode log file %s: %w", f.name, err)
+		}
+		for j, record := range records {
+			revision := f.first + Revision(j)
 			if revision < fromRevision {
 				continue
 			}
@@ -443,82 +639,75 @@ func (f *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 			}
 		}
 	}
-
 	return nil
 }
 
-// Close closes the log and releases any resources
-func (f *FilesystemLog) Close() error {
-	if err := f.batching.Close(); err != nil {
+// Close flushes queued transactions, rotates the active file so that
+// everything committed is archived, waits for uploads, and releases the log.
+func (l *FilesystemLog) Close() error {
+	if err := l.batching.Close(); err != nil {
 		return err
 	}
-	if f.removeOnClose {
-		return os.RemoveAll(f.dir)
+	close(l.stop)
+	<-l.rotatorDone
+
+	l.writeMu.Lock()
+	l.mu.Lock()
+	var err error
+	if l.opts.Archive != nil {
+		err = l.rotateLocked()
 	}
-	return nil
+	if cerr := l.active.Close(); err == nil {
+		err = cerr
+	}
+	l.mu.Unlock()
+	l.writeMu.Unlock()
+
+	close(l.uploads)
+	select {
+	case <-l.uploaderDone:
+	case <-time.After(30 * time.Second):
+		klog.Warningf("log closed with uploads still pending; they will resume on the next start")
+	}
+
+	if l.removeOnClose {
+		if rerr := os.RemoveAll(l.dir); err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
 
 // SetListener sets the log listener
-func (f *FilesystemLog) SetListener(listener LogListener) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.listener = listener
+func (l *FilesystemLog) SetListener(listener LogListener) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.listener = listener
 }
 
-// writeFileSync writes data to path and fsyncs both the file and its parent
-// directory, so that the file and its directory entry survive a machine crash
-// or power loss, not just a process crash.
-func writeFileSync(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+// syncDir fsyncs a directory so that new directory entries are durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	defer d.Close()
+	return d.Sync()
 }
 
-// batchToFilename converts a first-revision and count to a filename
-func batchToFilename(firstRevision Revision, count int) string {
-	return fmt.Sprintf("%016x-%x.log", uint64(firstRevision), count)
+// revisionToFilename names the file whose first record has this revision.
+func revisionToFilename(first Revision) string {
+	return fmt.Sprintf("%016x.log", uint64(first))
 }
 
-// filenameToMeta converts a filename to a first-revision and count
-func filenameToMeta(filename string) (Revision, int, error) {
+// filenameToRevision is the inverse of revisionToFilename.
+func filenameToRevision(filename string) (Revision, error) {
 	if !strings.HasSuffix(filename, ".log") {
-		return 0, 0, fmt.Errorf("invalid filename format: %s", filename)
+		return 0, fmt.Errorf("invalid filename format: %s", filename)
 	}
-
-	base := strings.TrimSuffix(filename, ".log")
-	parts := strings.SplitN(base, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid filename format (expected <revision>-<count>.log): %s", filename)
-	}
-
-	revisionVal, err := strconv.ParseUint(parts[0], 16, 64)
+	n, err := strconv.ParseUint(strings.TrimSuffix(filename, ".log"), 16, 64)
 	if err != nil {
-		return 0, 0, fmt.Errorf("parsing revision from %q: %w", filename, err)
+		return 0, fmt.Errorf("invalid filename format: %s", filename)
 	}
-
-	countVal, err := strconv.ParseUint(parts[1], 16, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parsing count from %q: %w", filename, err)
-	}
-
-	return Revision(revisionVal), int(countVal), nil
+	return Revision(n), nil
 }

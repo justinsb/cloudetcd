@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package logfactory constructs a log from a URI:
+//
+//	filesystem:///var/lib/cloudetcd/log
+//	filesystem:///var/lib/cloudetcd/log?archive=gs://bucket/prefix&rotateBytes=64MB&rotateAfter=5m&cache=256MB
+//	memory://
+//
+// The log is always local files; archive= attaches a GCS bucket that every
+// closed log file is copied to (and restored from on a machine with no
+// files). memory:// is a temporary directory removed on Close, for tests.
 package logfactory
 
 import (
@@ -24,9 +33,8 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
-	"justinsb.com/cloudetcd/pkg/persistence/gcslog"
+	"justinsb.com/cloudetcd/pkg/persistence/gcsarchive"
 	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
-	"justinsb.com/cloudetcd/pkg/persistence/tieredlog"
 )
 
 func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
@@ -36,80 +44,49 @@ func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
 	}
 	switch u.Scheme {
 	case "filesystem":
-		// filesystem:///var/lib/cloudetcd/log?cache=256MB bounds the in-memory
-		// record cache; values are read from disk on demand.
 		dir := "/" + u.Host + "/" + u.Path
-		cacheBytes, err := parseSize(u.Query().Get("cache"))
+		opts, err := parseOptions(ctx, u.Query())
 		if err != nil {
 			return nil, err
 		}
-		return filesystemlog.NewFilesystemLogWithOptions(dir, filesystemlog.Options{CacheBytes: cacheBytes})
-	case "gs":
-		// gs://bucket/some/prefix/ => bucket "bucket", object prefix "some/prefix/"
-		// (GCS object names do not start with a slash)
-		cacheBytes, err := parseSize(u.Query().Get("cache"))
-		if err != nil {
-			return nil, err
-		}
-		return gcslog.NewGCSLogWithOptions(ctx, u.Host, strings.TrimPrefix(u.Path, "/"), gcslog.Options{CacheBytes: cacheBytes})
+		return filesystemlog.NewFilesystemLogWithOptions(dir, opts)
 	case "memory":
-		// A throwaway log in a temporary directory, removed on Close.
 		return memorylog.New(), nil
-	case "tiered":
-		return newTieredLog(ctx, u)
+	case "gs", "tiered":
+		return nil, fmt.Errorf("log URI %q: the log is always local files; archive to GCS with filesystem:///path?archive=gs://bucket/prefix", uri)
 	default:
 		return nil, fmt.Errorf("unsupported log scheme %q", u.Scheme)
 	}
 }
 
-// newTieredLog builds a tiered log from a URI of the form:
-//
-//	tiered:?fast=filesystem:///var/lib/cloudetcd/log&archive=gs://bucket/logs/&flushInterval=5m&retain=true
-//
-// The fast and archive parameters are themselves log URIs (URL-encoded).
-// retain=true keeps archived records in the fast tier so reads stay local.
-func newTieredLog(ctx context.Context, u *url.URL) (persistence.Log, error) {
-	query := u.Query()
-
-	fastURI := query.Get("fast")
-	archiveURI := query.Get("archive")
-	if fastURI == "" || archiveURI == "" {
-		return nil, fmt.Errorf("tiered log URI must have fast and archive parameters, e.g. tiered:?fast=filesystem:///var/log&archive=gs://bucket/prefix/")
+func parseOptions(ctx context.Context, q url.Values) (filesystemlog.Options, error) {
+	var opts filesystemlog.Options
+	var err error
+	if opts.CacheBytes, err = parseSize(q.Get("cache")); err != nil {
+		return opts, err
 	}
-
-	options := tieredlog.Options{}
-	if retain := query.Get("retain"); retain != "" {
-		b, err := strconv.ParseBool(retain)
-		if err != nil {
-			return nil, fmt.Errorf("parsing retain %q: %w", retain, err)
+	if opts.RotateBytes, err = parseSize(q.Get("rotateBytes")); err != nil {
+		return opts, err
+	}
+	if v := q.Get("rotateAfter"); v != "" {
+		if opts.RotateAfter, err = time.ParseDuration(v); err != nil {
+			return opts, fmt.Errorf("parsing rotateAfter %q: %w", v, err)
 		}
-		options.RetainFastTier = b
 	}
-	if flushInterval := query.Get("flushInterval"); flushInterval != "" {
-		d, err := time.ParseDuration(flushInterval)
-		if err != nil {
-			return nil, fmt.Errorf("parsing flushInterval %q: %w", flushInterval, err)
+	if v := q.Get("archive"); v != "" {
+		au, err := url.Parse(v)
+		if err != nil || au.Scheme != "gs" {
+			return opts, fmt.Errorf("archive %q: want gs://bucket/prefix", v)
 		}
-		options.FlushInterval = d
+		// gs://bucket/some/prefix/ => bucket "bucket", object prefix "some/prefix/"
+		// (GCS object names do not start with a slash)
+		archive, err := gcsarchive.New(ctx, au.Host, strings.TrimPrefix(au.Path, "/"))
+		if err != nil {
+			return opts, err
+		}
+		opts.Archive = archive
 	}
-
-	fast, err := NewLog(ctx, fastURI)
-	if err != nil {
-		return nil, fmt.Errorf("creating fast tier log: %w", err)
-	}
-	archive, err := NewLog(ctx, archiveURI)
-	if err != nil {
-		fast.Close()
-		return nil, fmt.Errorf("creating archive tier log: %w", err)
-	}
-
-	log, err := tieredlog.NewTieredLog(ctx, fast, archive, options)
-	if err != nil {
-		fast.Close()
-		archive.Close()
-		return nil, err
-	}
-	return log, nil
+	return opts, nil
 }
 
 // parseSize parses a byte size such as "256MB", "1GiB", "64k" or "1048576".

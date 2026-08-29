@@ -46,7 +46,7 @@ In a second terminal, from the root of this repository:
 
 ```bash
 STORAGE_EMULATOR_HOST=localhost:8080 \
-  go run ./cmd/cloud-etcd --log gs://cloudetcd/log/
+  go run ./cmd/cloud-etcd --log 'filesystem:///tmp/cloudetcd-log?archive=gs://cloudetcd/log/&rotateAfter=5s'
 ```
 
 `STORAGE_EMULATOR_HOST` points the GCS client at the local server; the same
@@ -96,7 +96,7 @@ Stop cloud-etcd (Ctrl-C in its terminal), then start it again:
 
 ```bash
 STORAGE_EMULATOR_HOST=localhost:8080 \
-  go run ./cmd/cloud-etcd --log gs://cloudetcd/log/
+  go run ./cmd/cloud-etcd --log 'filesystem:///tmp/cloudetcd-log?archive=gs://cloudetcd/log/&rotateAfter=5s'
 ```
 
 On startup it lists the log objects, replays them to rebuild its state, and
@@ -108,28 +108,24 @@ etcdctl --endpoints=localhost:2379 get /hello
 # world
 ```
 
-## 6. Optional: the tiered log
+## 6. How the archive works
 
-Committing every transaction to object storage costs one round-trip per
-batch. The tiered log commits to a fast local tier first and drains to the
-object-store archive in the background:
-
-```bash
-STORAGE_EMULATOR_HOST=localhost:8080 \
-  go run ./cmd/cloud-etcd \
-  --log 'tiered:?fast=filesystem:///tmp/cloudetcd-fast&archive=gs://cloudetcd/log/&flushInterval=5s'
-```
-
-Write a key, wait a few seconds, and list the bucket again — you'll see the
-batch appear in the archive after the flush interval.
+The log is always local files: batches are appended to the active file and
+fsynced, which is the commit. The active file is rotated when it reaches a
+size (64 MB by default) or an age (`rotateAfter`, 5 minutes by default; 5
+seconds above so you can watch it happen), and every rotated file is uploaded
+to the bucket as one object, created with a conditional write so that two
+instances pointed at the same prefix are detected. Start the server again on
+an empty directory with the same `archive=` and it restores the files from
+the bucket before serving.
 
 ## Running the tests against the emulator
 
-The GCS log's test suite runs against an in-process instance of the same
+The archive's tests run against an in-process instance of the same
 emulator, so it needs no credentials and runs with plain `go test`:
 
 ```bash
-go test ./pkg/persistence/gcslog/ -run TestGCSLogWithEmulator -v
+go test ./pkg/persistence/gcsarchive/ -v
 ```
 
 (The `TestGCSLog` suite additionally runs against real GCS when

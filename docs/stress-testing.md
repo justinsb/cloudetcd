@@ -31,6 +31,9 @@ go run ./cmd/cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
 # On a real directory (memory:// is a temporary directory removed at exit)
 go run ./cmd/cloud-etcd-bench run -nodes 1000 -log filesystem:///var/tmp/bench
 
+# ... with rotated files archived to a bucket (or the local emulator, see docs/walkthrough)
+go run ./cmd/cloud-etcd-bench run -nodes 1000 -log 'filesystem:///var/tmp/bench?archive=gs://bucket/bench&rotateAfter=10s'
+
 # All phases, JSON output, CPU profile
 go run ./cmd/cloud-etcd-bench run -nodes 100 -phases populate,steady,list-storm -o json -cpuprofile cpu.prof
 

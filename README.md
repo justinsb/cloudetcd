@@ -39,11 +39,10 @@ The project is in early development. Currently implemented:
   - Watch (create/cancel, streaming events)
   - Lease management (grant, revoke, keepalive, TTL expiry)
   - Compatible with official etcd client library
-- **Persistence Log**: Pluggable change log backends selected by URI
-  - `memory://` — in-memory log for testing
-  - `filesystem://` — local on-disk log
-  - `gs://` — Google Cloud Storage log using conditional (generation-based) writes
-  - `tiered:` — tiered log combining a fast tier with async archival to GCS
+- **Persistence Log**: an append-only log of files, optionally archived to Google Cloud Storage
+  - `filesystem:///path` — batches are appended to an active file and fsynced; the file is rotated by size or age
+  - `filesystem:///path?archive=gs://bucket/prefix` — every rotated file is uploaded to GCS (with a conditional write, so two writers are detected), and a machine with no local files restores from it
+  - `memory://` — a temporary directory removed on exit, for tests and benchmarks
 
 ## Building and Testing
 
@@ -76,11 +75,8 @@ go run cmd/cloud-etcd/main.go -addr :2380
 # Persist the change log to the local filesystem
 go run cmd/cloud-etcd/main.go -log filesystem:///var/lib/cloudetcd/log
 
-# Persist the change log to a GCS bucket
-go run cmd/cloud-etcd/main.go -log gs://my-bucket/logs/
-
-# Use a tiered log: fast local tier with async archival to GCS
-go run cmd/cloud-etcd/main.go -log 'tiered:?fast=filesystem:///var/lib/cloudetcd/log&archive=gs://my-bucket/logs/&flushInterval=5m'
+# ... and archive every rotated log file to a GCS bucket
+go run cmd/cloud-etcd/main.go -log 'filesystem:///var/lib/cloudetcd/log?archive=gs://my-bucket/logs/&rotateAfter=1m'
 ```
 
 ### Testing with etcd Client
@@ -123,12 +119,13 @@ cloudetcd/
 │   ├── recording/          # Records etcd RPC traffic to JSONL for analysis
 │   ├── persistence/        # Change log and snapshot interfaces
 │   │   ├── batch/          # Batched commits with conflict detection
-│   │   ├── filesystemlog/  # Local filesystem log
-│   │   ├── gcslog/         # Google Cloud Storage log
+│   │   ├── filesystemlog/  # The log: an active file, rotated by size/age, archived
+│   │   ├── gcsarchive/     # Archives rotated log files to Google Cloud Storage
+│   │   ├── logcodec/       # On-disk encoding of a log file
 │   │   ├── logfactory/     # Constructs a log from a URI
-│   │   ├── logtests/       # Shared conformance tests for log implementations
-│   │   ├── memorylog/      # In-memory log
-│   │   └── tieredlog/      # Fast tier + async GCS archival
+│   │   ├── logtests/       # Conformance tests for the log
+│   │   ├── memorylog/      # The file log over a temporary directory, for tests
+│   │   └── recordcache/    # Bounded in-memory cache of recently used records
 │   ├── storage/            # Storage interface
 │   │   └── memorystorage/  # In-memory MVCC storage backed by a persistence log
 │   └── workload/           # Model of a Kubernetes cluster's etcd traffic, at any scale
