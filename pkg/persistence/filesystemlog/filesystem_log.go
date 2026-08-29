@@ -43,6 +43,8 @@ type logFileMeta struct {
 // FilesystemLog is a filesystem-backed implementation of the Log interface
 type FilesystemLog struct {
 	batching *batch.Batching
+	// seq orders the publication of batches written concurrently; see batch.FlushFunc.
+	seq *batch.Sequencer
 
 	mu           sync.RWMutex
 	dir          string
@@ -73,6 +75,7 @@ func NewFilesystemLog(dir string) (*FilesystemLog, error) {
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
 
+	log.seq = batch.NewSequencer(log.lastRevision)
 	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 
 	return log, nil
@@ -114,6 +117,26 @@ func (f *FilesystemLog) replay() error {
 		}
 		return 0
 	})
+
+	// Files past a gap were written by a batch whose predecessor failed
+	// (see batch.Batching); they were never acknowledged and are not part
+	// of the log. Discard them so the next writer can reuse the revisions.
+	for i := 1; i < len(f.logFiles); i++ {
+		prev := f.logFiles[i-1]
+		if f.logFiles[i].firstRevision == prev.firstRevision+Revision(prev.count) {
+			continue
+		}
+		orphans := f.logFiles[i:]
+		f.logFiles = f.logFiles[:i]
+		klog.Warningf("log has a gap after revision %d; discarding %d unacknowledged file(s)", prev.firstRevision+Revision(prev.count)-1, len(orphans))
+		for _, orphan := range orphans {
+			name := filepath.Join(f.dir, batchToFilename(orphan.firstRevision, orphan.count))
+			if err := os.Remove(name); err != nil {
+				return fmt.Errorf("deleting unacknowledged log file %s: %w", name, err)
+			}
+		}
+		break
+	}
 
 	// Find the highest revision
 	if len(f.logFiles) > 0 {
@@ -169,16 +192,9 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 		return fmt.Errorf("batch contains no transactions")
 	}
 
-	// Execute the batch under the main lock
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if lastLogPosition != l.lastRevision {
-		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
-	}
-
-	// Commit all transactions in the batch
-	startRevision := l.lastRevision + 1
+	// The write happens with no lock held, so that consecutive batches can
+	// be in flight at once; publication below is ordered by the sequencer.
+	startRevision := lastLogPosition + 1
 	count := len(batch.Transactions)
 
 	// Create filename with hex-encoded revision
@@ -204,15 +220,28 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 		return fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
-	l.lastRevision += Revision(count)
-
-	if l.listener != nil {
-		l.listener.OnLogEntry(persistence.Revision(l.lastRevision))
+	// Publish in order: wait for the batch before us to be visible. If that
+	// never happens (it failed, and Batching cancelled us), our file must
+	// not remain past the gap.
+	if err := l.seq.Wait(ctx, lastLogPosition); err != nil {
+		if rmErr := os.Remove(filepath); rmErr != nil {
+			klog.Errorf("failed to remove unpublished log file %s: %v", filepath, rmErr)
+		}
+		return err
 	}
 
+	l.mu.Lock()
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
+	newRevision := lastLogPosition + Revision(count)
+	l.lastRevision = newRevision
+	if l.listener != nil {
+		l.listener.OnLogEntry(newRevision)
+	}
+	l.mu.Unlock()
+	l.seq.Advance(newRevision)
+
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		count, startRevision, l.lastRevision)
+		count, startRevision, newRevision)
 
 	return nil
 }

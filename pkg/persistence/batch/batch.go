@@ -135,19 +135,23 @@ func (b *TxnBatch) add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 	// })
 }
 
-func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, error) {
+// prepare validates the batch's transactions against the writes committed
+// since their snapshots, assigns each surviving transaction its revision
+// (starting at lastLogPosition+1) and records its writes in committedWrites,
+// and rejects the rest. It returns the commit to hand to the backend and the
+// result channels of its transactions, in revision order; a nil commit means
+// nothing survived. The batch's records are then written by the backend and
+// acknowledged with deliver, possibly concurrently with later batches.
+func (b *TxnBatch) prepare(ctx context.Context, lastLogPosition Revision) (*BatchCommit, []chan BatchResult) {
 	log := klog.FromContext(ctx)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.flushed {
-		return 0, nil
+	if b.flushed || len(b.pendingBatch) == 0 {
+		return nil, nil
 	}
-
-	if len(b.pendingBatch) == 0 {
-		return 0, nil
-	}
+	b.flushed = true
 
 	commit := &BatchCommit{}
 	resultChannels := make([]chan BatchResult, 0, len(b.pendingBatch))
@@ -178,45 +182,49 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 				event.Kv.ModRevision = int64(revision)
 			}
 		}
+		// Record the writes at their assigned revision now, so that later
+		// batches validate against them. If this batch then fails to
+		// commit, every later batch fails too (see Batching), so nothing
+		// validates against a write that did not happen.
+		for key := range txn.Meta.WriteSet {
+			b.committedWrites[key] = revision
+		}
 
 		commit.Transactions = append(commit.Transactions, txn)
 		resultChannels = append(resultChannels, txn.resultChan)
 	}
 
 	if len(commit.Transactions) == 0 {
-		return 0, nil
+		return nil, nil
 	}
+	return commit, resultChannels
+}
 
-	err := b.flushFunc(ctx, lastLogPosition, commit)
+// failAll rejects every transaction in the batch with err.
+func (b *TxnBatch) failAll(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.flushed {
+		return
+	}
 	b.flushed = true
-	if err != nil {
-		for _, resultChannel := range resultChannels {
-			resultChannel <- BatchResult{
-				Revision: 0,
-				Success:  false,
-				Error:    err,
-			}
-		}
-		return 0, err
+	for _, txn := range b.pendingBatch {
+		txn.resultChan <- BatchResult{Error: err}
 	}
+}
 
-	revision = lastLogPosition
-	for i, resultChannel := range resultChannels {
+// deliver acknowledges the transactions of a prepared batch whose first
+// revision is lastLogPosition+1: with their revisions on success, or with err.
+func deliver(resultChannels []chan BatchResult, lastLogPosition Revision, err error) {
+	revision := lastLogPosition
+	for _, resultChannel := range resultChannels {
 		revision++
-		// Record this transaction's writes at their committed revision so
-		// that subsequent transactions (in later batches) validate their
-		// reads and writes against them.
-		for key := range commit.Transactions[i].Meta.WriteSet {
-			b.committedWrites[key] = revision
+		if err != nil {
+			resultChannel <- BatchResult{Error: err}
+			continue
 		}
-		resultChannel <- BatchResult{
-			Revision: revision,
-			Success:  true,
-			Error:    nil,
-		}
+		resultChannel <- BatchResult{Revision: revision, Success: true}
 	}
-
-	return len(commit.Transactions), nil
 }
 
 // validateTxn reports whether a transaction can still be committed given the

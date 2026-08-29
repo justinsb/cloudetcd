@@ -33,6 +33,8 @@ type TxnBatch = batch.TxnBatch
 // MemoryLog is a memory-backed implementation of the Log interface
 type MemoryLog struct {
 	batching *batch.Batching
+	// seq orders the publication of batches written concurrently; see batch.FlushFunc.
+	seq *batch.Sequencer
 
 	mu sync.RWMutex
 
@@ -70,6 +72,7 @@ func New(opts ...Option) *MemoryLog {
 
 	// No replay is possible here
 
+	log.seq = batch.NewSequencer(log.lastRevision)
 	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 	return log
 }
@@ -99,28 +102,26 @@ func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, b
 		}
 	}
 
-	// Execute the batch under the main lock
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if lastLogPosition != l.lastRevision {
-		return fmt.Errorf("batch is not contiguous with the last batch, expected %d, got %d", l.lastRevision, lastLogPosition)
+	// Publish in order: wait for the batch before us to be visible.
+	if err := l.seq.Wait(ctx, lastLogPosition); err != nil {
+		return err
 	}
 
-	// Commit all transactions in the batch
+	l.mu.Lock()
 	startRevision := l.lastRevision + 1
-
 	for _, txn := range batch.Transactions {
 		l.lastRevision++
 		l.records = append(l.records, txn.LogRecord)
 	}
-
+	newRevision := l.lastRevision
 	if l.listener != nil {
-		l.listener.OnLogEntry(persistence.Revision(l.lastRevision))
+		l.listener.OnLogEntry(newRevision)
 	}
+	l.mu.Unlock()
+	l.seq.Advance(newRevision)
 
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		len(batch.Transactions), startRevision+1, l.lastRevision)
+		len(batch.Transactions), startRevision, newRevision)
 
 	return nil
 }
