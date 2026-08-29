@@ -15,32 +15,15 @@
 package workload
 
 import (
-	"embed"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 )
 
-// embeddedBlobs holds values captured from a kube-apiserver v1.36 with kwok
-// nodes (tests/e2e TestCaptureKwok). A kwok Node is smaller than a real
-// kubelet's (which carries its image list), and no events were captured, so
-// the Event value is synthetic.
-//
-//go:embed blobs/*.bin
-var embeddedBlobs embed.FS
-
-// DefaultBlobs returns the captured values embedded in the package, falling
-// back to synthetic ones for anything not captured.
-func DefaultBlobs() *Blobs {
-	b := SyntheticBlobs()
-	for name, p := range b.fields() {
-		if data, err := embeddedBlobs.ReadFile("blobs/" + name); err == nil {
-			*p = data
-		}
-	}
-	return b
-}
+// DefaultBlobs returns the values used when none are supplied: synthetic
+// bytes sized from a capture (see SyntheticBlobs).
+func DefaultBlobs() *Blobs { return SyntheticBlobs() }
 
 // Blobs holds the values written for each resource type. cloudetcd treats
 // values as opaque bytes, so these can be real protobuf-encoded Kubernetes
@@ -74,16 +57,19 @@ func (b *Blobs) Sizes() map[string]int {
 	return sizes
 }
 
-// SyntheticBlobs returns blobs of sizes representative of protobuf-encoded
-// Kubernetes objects: a kubelet-reported Node (with images and conditions),
-// a coordination Lease, a Pod, an Event, and a masterlease value (an IP).
+// SyntheticBlobs returns blobs sized like the protobuf-encoded objects a
+// kube-apiserver v1.36 stored for kwok nodes (tests/e2e TestCaptureKwok,
+// 10 nodes x 5 pods): Node 2093 B, Lease 510 B, Pod 1755 B, masterlease
+// 62 B. A real kubelet's Node is larger (it carries the node's image list);
+// no Events were captured, so that size is an estimate. Only the sizes
+// matter to cloudetcd, which never inspects values.
 func SyntheticBlobs() *Blobs {
 	return &Blobs{
-		Node:        syntheticBytes(1, 4096),
-		NodeLease:   syntheticBytes(2, 256),
-		Pod:         syntheticBytes(3, 3072),
+		Node:        syntheticBytes(1, 2093),
+		NodeLease:   syntheticBytes(2, 510),
+		Pod:         syntheticBytes(3, 1755),
 		Event:       syntheticBytes(4, 640),
-		MasterLease: []byte("10.0.0.1"),
+		MasterLease: syntheticBytes(5, 62),
 	}
 }
 

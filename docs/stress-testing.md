@@ -137,9 +137,9 @@ model says 6), pods took 1 create + 3 updates + get&delete per lifecycle, 60
 watch streams were opened with exactly the modelled options, and the
 recording corrected the model on object counts (only events go through
 etcd), the shape of consistent reads, and the apiserver's own 10s
-housekeeping. The embedded value blobs (`pkg/workload/blobs`) come from that
-capture; the Event value is synthetic since nothing emitted events (no
-scheduler or controller-manager runs in the harness).
+housekeeping. The default (synthetic) value blobs are sized from that
+capture; no Events were captured since nothing emits them in the harness (no
+scheduler or controller-manager runs), so that size is an estimate.
 
 `analyze` prints a `per-node/min` column: a shape whose rate scales with the
 node count shows a stable per-node rate across captures of different sizes
