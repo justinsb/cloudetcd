@@ -42,7 +42,17 @@ func NewLog(ctx context.Context, uri string) (persistence.Log, error) {
 		// (GCS object names do not start with a slash)
 		return gcslog.NewGCSLog(ctx, u.Host, strings.TrimPrefix(u.Path, "/"))
 	case "memory":
-		return memorylog.New(), nil
+		// memory://?commitLatency=50ms emulates an object-store backend's
+		// commit round-trip on top of the in-memory log.
+		var opts []memorylog.Option
+		if v := u.Query().Get("commitLatency"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("parsing commitLatency %q: %w", v, err)
+			}
+			opts = append(opts, memorylog.WithCommitLatency(d))
+		}
+		return memorylog.New(opts...), nil
 	case "tiered":
 		return newTieredLog(ctx, u)
 	default:

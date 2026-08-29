@@ -240,7 +240,7 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 
 	// Let's see if we can commit this transaction without conflicts
 
-	log.Info("committing transaction", "events", &etcdserverpb.WatchResponse{Events: t.logEvents})
+	log.V(4).Info("committing transaction", "events", &etcdserverpb.WatchResponse{Events: t.logEvents})
 
 	logRecord := &persistence.LogRecord{
 		Events: t.logEvents,
@@ -353,6 +353,29 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 					// klog.Infof("condition failed: modRevision %d != targetValue %d (prevEvent: %v, snapshotTimestamp: %d)", modRevision, targetValue.ModRevision, prevEvent, snapshotTimestamp)
 					conditionsFailed = true
 					break
+				}
+
+			default:
+				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+			}
+
+		case etcdserverpb.Compare_VERSION:
+			// kube-apiserver's compactor guards compact_rev_key with
+			// version(key) == v; a missing or deleted key has version 0.
+			version := int64(0)
+			if prevEvent != nil && prevEvent.Type != mvccpb.DELETE {
+				version = prevEvent.Kv.Version
+			}
+
+			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_Version)
+			if !ok {
+				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
+			}
+
+			switch cond.GetResult() {
+			case etcdserverpb.Compare_EQUAL:
+				if version != targetValue.Version {
+					conditionsFailed = true
 				}
 
 			default:
