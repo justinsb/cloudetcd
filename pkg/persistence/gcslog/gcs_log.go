@@ -58,8 +58,6 @@ type GCSLog struct {
 	prefix string // Prefix for log objects
 
 	batching *batch.Batching
-	// seq orders the publication of batches written concurrently; see batch.FlushFunc.
-	seq *batch.Sequencer
 
 	cache *Cache
 
@@ -198,7 +196,6 @@ func NewGCSLog(ctx context.Context, bucketName, prefix string) (*GCSLog, error) 
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
 
-	log.seq = batch.NewSequencer(log.lastRevision)
 	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 
 	return log, nil
@@ -245,24 +242,17 @@ func (g *GCSLog) replay(ctx context.Context) error {
 		return 0
 	})
 
-	// Objects past a gap were written by a batch whose predecessor failed
-	// (see batch.Batching); they were never acknowledged and are not part
-	// of the log. Discard them so the next writer can reuse the revisions.
+	// The objects must be contiguous. A gap means a write that was never
+	// acknowledged was left behind (a batch after a failed one that could
+	// not be aborted), or worse; either way it needs a person to look
+	// before anything is discarded.
 	for i := 1; i < len(g.logFiles); i++ {
 		prev := g.logFiles[i-1]
-		if g.logFiles[i].firstRevision == prev.firstRevision+Revision(prev.count) {
-			continue
+		if next := g.logFiles[i]; next.firstRevision != prev.firstRevision+Revision(prev.count) {
+			return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed",
+				g.batchToObjectName(prev.firstRevision, prev.count), prev.firstRevision+Revision(prev.count)-1,
+				g.batchToObjectName(next.firstRevision, next.count), next.firstRevision)
 		}
-		orphans := g.logFiles[i:]
-		g.logFiles = g.logFiles[:i]
-		klog.Warningf("log has a gap after revision %d; discarding %d unacknowledged object(s)", prev.firstRevision+Revision(prev.count)-1, len(orphans))
-		for _, orphan := range orphans {
-			name := g.batchToObjectName(orphan.firstRevision, orphan.count)
-			if err := g.bucket.Object(name).Delete(ctx); err != nil {
-				return fmt.Errorf("deleting unacknowledged log object %s: %w", name, err)
-			}
-		}
-		break
 	}
 
 	// Find the highest revision
@@ -294,18 +284,18 @@ func (g *GCSLog) AppendBatch(ctx context.Context, lastRevision Revision, records
 }
 
 // commitBatch commits all transactions in the current batch
-func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
+func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) (batch.Commit, error) {
 	log := klog.FromContext(ctx)
 
 	// Check if all transactions have the same condition position
-	if len(batch.Transactions) == 0 {
-		return fmt.Errorf("batch contains no transactions")
+	if len(bc.Transactions) == 0 {
+		return nil, fmt.Errorf("batch contains no transactions")
 	}
 
 	// The write happens with no lock held, so that consecutive batches can
 	// be in flight at once; publication below is ordered by the sequencer.
 	startRevision := lastLogPosition + 1
-	count := len(batch.Transactions)
+	count := len(bc.Transactions)
 
 	// Create object name with hex-encoded revision.
 	// The DoesNotExist precondition makes object creation the commit point:
@@ -317,14 +307,14 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 	// Serialize record to JSON
 	// TODO: Use proto for speed
 	data := &persistedBatch{
-		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+		Records: make([]*persistence.LogRecord, len(bc.Transactions)),
 	}
-	for i, txn := range batch.Transactions {
+	for i, txn := range bc.Transactions {
 		data.Records[i] = txn.LogRecord
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to marshal log record: %w", err)
+		return nil, fmt.Errorf("failed to marshal log record: %w", err)
 	}
 
 	// Write to GCS
@@ -334,39 +324,52 @@ func (l *GCSLog) commitBatch(ctx context.Context, lastLogPosition Revision, batc
 
 	if _, err := writer.Write(b); err != nil {
 		writer.Close()
-		return wrapWriteError(objectName, err)
+		return nil, wrapWriteError(objectName, err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return wrapWriteError(objectName, err)
+		return nil, wrapWriteError(objectName, err)
 	}
 
-	// Publish in order: wait for the batch before us to be visible. If that
-	// never happens (it failed, and Batching cancelled us), our object must
-	// not remain: it would be past a gap, unreadable and in the way of a
-	// future writer.
-	if err := l.seq.Wait(ctx, lastLogPosition); err != nil {
-		if delErr := l.bucket.Object(objectName).Delete(context.Background()); delErr != nil {
-			log.Error(delErr, "failed to delete unpublished log object; delete it by hand before restarting", "objectName", objectName)
-		}
-		return err
-	}
+	return &objectCommit{log: l, objectName: objectName, lastLogPosition: lastLogPosition, count: count, data: data}, nil
+}
 
+// objectCommit is a written, unpublished log object.
+type objectCommit struct {
+	log             *GCSLog
+	objectName      string
+	lastLogPosition Revision
+	count           int
+	data            *persistedBatch
+}
+
+func (c *objectCommit) Publish() error {
+	l := c.log
 	l.mu.Lock()
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
-	newRevision := lastLogPosition + Revision(count)
-	l.lastRevision = newRevision
-	l.cache.notifyBatch(startRevision, data)
-	if l.listener != nil {
-		l.listener.OnLogEntry(newRevision)
+	defer l.mu.Unlock()
+	if l.lastRevision != c.lastLogPosition {
+		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
 	}
-	l.mu.Unlock()
-	l.seq.Advance(newRevision)
-
+	startRevision := l.lastRevision + 1
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
+	l.lastRevision += Revision(c.count)
+	l.cache.notifyBatch(startRevision, c.data)
+	if l.listener != nil {
+		l.listener.OnLogEntry(l.lastRevision)
+	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		len(batch.Transactions), startRevision, newRevision)
-
+		c.count, startRevision, l.lastRevision)
 	return nil
+}
+
+// Abort deletes the object: a batch before it failed, so its revisions were
+// never acknowledged and must be reusable by a later writer. If the delete
+// fails the object is left past a gap, which the next start refuses to
+// read past until a person removes it.
+func (c *objectCommit) Abort() {
+	if err := c.log.bucket.Object(c.objectName).Delete(context.Background()); err != nil {
+		klog.Errorf("failed to delete unpublished log object %s; delete it by hand before restarting: %v", c.objectName, err)
+	}
 }
 
 // GetCurrentRevision returns the current revision number

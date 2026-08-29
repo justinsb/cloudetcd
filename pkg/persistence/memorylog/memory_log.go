@@ -33,8 +33,6 @@ type TxnBatch = batch.TxnBatch
 // MemoryLog is a memory-backed implementation of the Log interface
 type MemoryLog struct {
 	batching *batch.Batching
-	// seq orders the publication of batches written concurrently; see batch.FlushFunc.
-	seq *batch.Sequencer
 
 	mu sync.RWMutex
 
@@ -72,7 +70,6 @@ func New(opts ...Option) *MemoryLog {
 
 	// No replay is possible here
 
-	log.seq = batch.NewSequencer(log.lastRevision)
 	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 	return log
 }
@@ -87,44 +84,51 @@ func (l *MemoryLog) AppendBatch(ctx context.Context, lastRevision Revision, reco
 	return l.batching.AddBatch(ctx, lastRevision, records)
 }
 
-// commitBatch commits all transactions in the current batch
-func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
-	// Check if all transactions have the same condition position
-	if len(batch.Transactions) == 0 {
-		return fmt.Errorf("batch contains no transactions")
+// commitBatch "writes" a batch (there is nothing to write; the optional
+// commit latency stands in for a backend round-trip) and returns the commit
+// that publishes it.
+func (l *MemoryLog) commitBatch(ctx context.Context, lastLogPosition Revision, b *batch.BatchCommit) (batch.Commit, error) {
+	if len(b.Transactions) == 0 {
+		return nil, fmt.Errorf("batch contains no transactions")
 	}
 
 	if l.commitLatency > 0 {
 		select {
 		case <-time.After(l.commitLatency):
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
+	return &memoryCommit{log: l, lastLogPosition: lastLogPosition, batch: b}, nil
+}
 
-	// Publish in order: wait for the batch before us to be visible.
-	if err := l.seq.Wait(ctx, lastLogPosition); err != nil {
-		return err
-	}
+type memoryCommit struct {
+	log             *MemoryLog
+	lastLogPosition Revision
+	batch           *batch.BatchCommit
+}
 
+func (c *memoryCommit) Publish() error {
+	l := c.log
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lastRevision != c.lastLogPosition {
+		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
+	}
 	startRevision := l.lastRevision + 1
-	for _, txn := range batch.Transactions {
+	for _, txn := range c.batch.Transactions {
 		l.lastRevision++
 		l.records = append(l.records, txn.LogRecord)
 	}
-	newRevision := l.lastRevision
 	if l.listener != nil {
-		l.listener.OnLogEntry(newRevision)
+		l.listener.OnLogEntry(l.lastRevision)
 	}
-	l.mu.Unlock()
-	l.seq.Advance(newRevision)
-
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		len(batch.Transactions), startRevision, newRevision)
-
+		len(c.batch.Transactions), startRevision, l.lastRevision)
 	return nil
 }
+
+func (c *memoryCommit) Abort() {}
 
 // GetCurrentRevision returns the current revision number
 func (m *MemoryLog) GetCurrentRevision(ctx context.Context) (Revision, error) {

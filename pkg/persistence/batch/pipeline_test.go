@@ -26,21 +26,45 @@ import (
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
-// fakeBackend is a FlushFunc whose writes take latency and publish through a
-// Sequencer, like the real logs. failAt makes the batch starting at that
-// revision fail.
+// fakeBackend is a FlushFunc whose writes take latency and complete out of
+// order, like the real logs; Batching must still publish in order. failAt
+// makes the batch starting at that revision fail.
 type fakeBackend struct {
 	latency time.Duration
-	seq     *Sequencer
 	failAt  Revision
 
 	mu        sync.Mutex
+	position  Revision   // last published revision
 	published []Revision // first revision of each batch, in publish order
+	aborted   []Revision
 	maxDepth  int
 	inflight  atomic.Int32
 }
 
-func (f *fakeBackend) flush(ctx context.Context, lastLogPosition Revision, commit *BatchCommit) error {
+type fakeCommit struct {
+	f               *fakeBackend
+	lastLogPosition Revision
+	count           int
+}
+
+func (c *fakeCommit) Publish() error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	if c.f.position != c.lastLogPosition {
+		return fmt.Errorf("published out of order: log at %d, batch starts after %d", c.f.position, c.lastLogPosition)
+	}
+	c.f.published = append(c.f.published, c.lastLogPosition+1)
+	c.f.position += Revision(c.count)
+	return nil
+}
+
+func (c *fakeCommit) Abort() {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.aborted = append(c.f.aborted, c.lastLogPosition+1)
+}
+
+func (f *fakeBackend) flush(ctx context.Context, lastLogPosition Revision, commit *BatchCommit) (Commit, error) {
 	depth := int(f.inflight.Add(1))
 	defer f.inflight.Add(-1)
 	f.mu.Lock()
@@ -54,19 +78,18 @@ func (f *fakeBackend) flush(ctx context.Context, lastLogPosition Revision, commi
 	select {
 	case <-time.After(f.latency + jitter):
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	if f.failAt != 0 && lastLogPosition+1 == f.failAt {
-		return errors.New("simulated write failure")
+		return nil, errors.New("simulated write failure")
 	}
-	if err := f.seq.Wait(ctx, lastLogPosition); err != nil {
-		return err
-	}
+	return &fakeCommit{f: f, lastLogPosition: lastLogPosition, count: len(commit.Transactions)}, nil
+}
+
+func (f *fakeBackend) Position() Revision {
 	f.mu.Lock()
-	f.published = append(f.published, lastLogPosition+1)
-	f.mu.Unlock()
-	f.seq.Advance(lastLogPosition + Revision(len(commit.Transactions)))
-	return nil
+	defer f.mu.Unlock()
+	return f.position
 }
 
 func add(t *testing.T, b *Batching, key string) (Revision, bool, error) {
@@ -81,7 +104,7 @@ func add(t *testing.T, b *Batching, key string) (Revision, bool, error) {
 // revisions — and that throughput is not bounded by one write per latency.
 func TestPipelinedFlushes(t *testing.T) {
 	const latency = 30 * time.Millisecond
-	backend := &fakeBackend{latency: latency, seq: NewSequencer(0)}
+	backend := &fakeBackend{latency: latency}
 	b := NewBatchingWithOptions(0, backend.flush, Options{Window: 2 * time.Millisecond, MaxInFlight: 8})
 	defer b.Close()
 
@@ -146,7 +169,7 @@ func TestPipelinedFlushes(t *testing.T) {
 // batch after it fails (none of their records are published) and the log
 // refuses further writes, so no acknowledged write ever sits past a gap.
 func TestPipelinedFlushFailureStopsLog(t *testing.T) {
-	backend := &fakeBackend{latency: 20 * time.Millisecond, seq: NewSequencer(0)}
+	backend := &fakeBackend{latency: 20 * time.Millisecond}
 	b := NewBatchingWithOptions(0, backend.flush, Options{Window: 2 * time.Millisecond, MaxInFlight: 8})
 	defer b.Close()
 
@@ -176,8 +199,15 @@ func TestPipelinedFlushFailureStopsLog(t *testing.T) {
 			t.Errorf("write after the failure was acknowledged: rev=%d ok=%v", r.rev, r.ok)
 		}
 	}
-	if got := backend.seq.Position(); got != 1 {
+	if got := backend.Position(); got != 1 {
 		t.Errorf("published position %d after failure, want 1", got)
+	}
+	// Batches written behind the failure were aborted, not published.
+	backend.mu.Lock()
+	aborted := len(backend.aborted)
+	backend.mu.Unlock()
+	if aborted == 0 {
+		t.Error("no batch behind the failure was aborted")
 	}
 	if _, _, err := add(t, b, "later"); !errors.Is(err, ErrLogFailed) {
 		t.Errorf("add after failure: err=%v, want ErrLogFailed", err)

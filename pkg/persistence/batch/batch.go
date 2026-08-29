@@ -37,8 +37,6 @@ type TxnBatch struct {
 	// flushed is true if the batch has been flushed
 	flushed bool
 
-	flushFunc func(ctx context.Context, lastLogPosition Revision, batch *BatchCommit) error
-
 	// committedWrites is shared across all batches (owned by Batching) and
 	// records, for each key, the highest revision at which it has been
 	// written. It is only accessed under the Batching flushLock, which
@@ -210,20 +208,6 @@ func (b *TxnBatch) failAll(err error) {
 	b.flushed = true
 	for _, txn := range b.pendingBatch {
 		txn.resultChan <- BatchResult{Error: err}
-	}
-}
-
-// deliver acknowledges the transactions of a prepared batch whose first
-// revision is lastLogPosition+1: with their revisions on success, or with err.
-func deliver(resultChannels []chan BatchResult, lastLogPosition Revision, err error) {
-	revision := lastLogPosition
-	for _, resultChannel := range resultChannels {
-		revision++
-		if err != nil {
-			resultChannel <- BatchResult{Error: err}
-			continue
-		}
-		resultChannel <- BatchResult{Revision: revision, Success: true}
 	}
 }
 

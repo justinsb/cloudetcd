@@ -43,8 +43,6 @@ type logFileMeta struct {
 // FilesystemLog is a filesystem-backed implementation of the Log interface
 type FilesystemLog struct {
 	batching *batch.Batching
-	// seq orders the publication of batches written concurrently; see batch.FlushFunc.
-	seq *batch.Sequencer
 
 	mu           sync.RWMutex
 	dir          string
@@ -75,7 +73,6 @@ func NewFilesystemLog(dir string) (*FilesystemLog, error) {
 		return nil, fmt.Errorf("failed to replay existing log: %w", err)
 	}
 
-	log.seq = batch.NewSequencer(log.lastRevision)
 	log.batching = batch.NewBatching(log.lastRevision, log.commitBatch)
 
 	return log, nil
@@ -118,24 +115,17 @@ func (f *FilesystemLog) replay() error {
 		return 0
 	})
 
-	// Files past a gap were written by a batch whose predecessor failed
-	// (see batch.Batching); they were never acknowledged and are not part
-	// of the log. Discard them so the next writer can reuse the revisions.
+	// The files must be contiguous. A gap means a write that was never
+	// acknowledged was left behind (a batch after a failed one that could
+	// not be aborted), or worse; either way it needs a person to look
+	// before anything is discarded.
 	for i := 1; i < len(f.logFiles); i++ {
 		prev := f.logFiles[i-1]
-		if f.logFiles[i].firstRevision == prev.firstRevision+Revision(prev.count) {
-			continue
+		if next := f.logFiles[i]; next.firstRevision != prev.firstRevision+Revision(prev.count) {
+			return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed",
+				batchToFilename(prev.firstRevision, prev.count), prev.firstRevision+Revision(prev.count)-1,
+				batchToFilename(next.firstRevision, next.count), next.firstRevision)
 		}
-		orphans := f.logFiles[i:]
-		f.logFiles = f.logFiles[:i]
-		klog.Warningf("log has a gap after revision %d; discarding %d unacknowledged file(s)", prev.firstRevision+Revision(prev.count)-1, len(orphans))
-		for _, orphan := range orphans {
-			name := filepath.Join(f.dir, batchToFilename(orphan.firstRevision, orphan.count))
-			if err := os.Remove(name); err != nil {
-				return fmt.Errorf("deleting unacknowledged log file %s: %w", name, err)
-			}
-		}
-		break
 	}
 
 	// Find the highest revision
@@ -186,16 +176,16 @@ type persistedBatch struct {
 }
 
 // commitBatch commits all transactions in the current batch
-func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, batch *batch.BatchCommit) error {
+func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) (batch.Commit, error) {
 	// Check if all transactions have the same condition position
-	if len(batch.Transactions) == 0 {
-		return fmt.Errorf("batch contains no transactions")
+	if len(bc.Transactions) == 0 {
+		return nil, fmt.Errorf("batch contains no transactions")
 	}
 
 	// The write happens with no lock held, so that consecutive batches can
 	// be in flight at once; publication below is ordered by the sequencer.
 	startRevision := lastLogPosition + 1
-	count := len(batch.Transactions)
+	count := len(bc.Transactions)
 
 	// Create filename with hex-encoded revision
 	filename := batchToFilename(startRevision, count)
@@ -204,46 +194,57 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 	// Serialize record to JSON
 	// TODO: Use proto for speed
 	data := &persistedBatch{
-		Records: make([]*persistence.LogRecord, len(batch.Transactions)),
+		Records: make([]*persistence.LogRecord, len(bc.Transactions)),
 	}
-	for i, txn := range batch.Transactions {
+	for i, txn := range bc.Transactions {
 		data.Records[i] = txn.LogRecord
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to marshal log records: %w", err)
+		return nil, fmt.Errorf("failed to marshal log records: %w", err)
 	}
 
 	// Write and fsync: this is the commit point, so the record must be
 	// durable on disk (not just in the page cache) before we acknowledge.
 	if err := writeFileSync(filepath, b, 0644); err != nil {
-		return fmt.Errorf("failed to write log file: %w", err)
+		return nil, fmt.Errorf("failed to write log file: %w", err)
 	}
 
-	// Publish in order: wait for the batch before us to be visible. If that
-	// never happens (it failed, and Batching cancelled us), our file must
-	// not remain past the gap.
-	if err := l.seq.Wait(ctx, lastLogPosition); err != nil {
-		if rmErr := os.Remove(filepath); rmErr != nil {
-			klog.Errorf("failed to remove unpublished log file %s: %v", filepath, rmErr)
-		}
-		return err
-	}
+	return &fileCommit{log: l, path: filepath, lastLogPosition: lastLogPosition, count: count}, nil
+}
 
+// fileCommit is a written, unpublished log file.
+type fileCommit struct {
+	log             *FilesystemLog
+	path            string
+	lastLogPosition Revision
+	count           int
+}
+
+func (c *fileCommit) Publish() error {
+	l := c.log
 	l.mu.Lock()
-	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: count})
-	newRevision := lastLogPosition + Revision(count)
-	l.lastRevision = newRevision
-	if l.listener != nil {
-		l.listener.OnLogEntry(newRevision)
+	defer l.mu.Unlock()
+	if l.lastRevision != c.lastLogPosition {
+		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
 	}
-	l.mu.Unlock()
-	l.seq.Advance(newRevision)
-
+	startRevision := l.lastRevision + 1
+	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
+	l.lastRevision += Revision(c.count)
+	if l.listener != nil {
+		l.listener.OnLogEntry(l.lastRevision)
+	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
-		count, startRevision, newRevision)
-
+		c.count, startRevision, l.lastRevision)
 	return nil
+}
+
+// Abort removes the file: a batch before it failed, so its revisions were
+// never acknowledged and must be reusable by a later writer.
+func (c *fileCommit) Abort() {
+	if err := os.Remove(c.path); err != nil {
+		klog.Errorf("failed to remove unpublished log file %s: %v", c.path, err)
+	}
 }
 
 // GetCurrentRevision returns the current revision number
