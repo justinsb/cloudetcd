@@ -29,6 +29,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -100,6 +102,7 @@ func runBench(ctx context.Context, args []string) error {
 	stormRounds := fs.Int("list-storm-rounds", 1, "Full lists per lister in the list-storm phase")
 	cpuProfile := fs.String("cpuprofile", "", "Write a CPU profile to this file")
 	memProfile := fs.String("memprofile", "", "Write a heap profile to this file at the end")
+	pprofAddr := fs.String("pprof-addr", "", "Serve net/http/pprof on this address during the run (e.g. 127.0.0.1:6060)")
 	klog.InitFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -114,6 +117,14 @@ func runBench(ctx context.Context, args []string) error {
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+
+	if *pprofAddr != "" {
+		go func() {
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "pprof server: %v\n", err)
+			}
+		}()
 	}
 
 	if *cpuProfile != "" {
