@@ -221,12 +221,13 @@ type fileCommit struct {
 	count           int
 }
 
-func (c *fileCommit) Publish() error {
+func (c *fileCommit) Publish() {
 	l := c.log
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lastRevision != c.lastLogPosition {
-		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
+		// Batching publishes in order; this cannot happen.
+		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
 	}
 	startRevision := l.lastRevision + 1
 	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
@@ -236,15 +237,6 @@ func (c *fileCommit) Publish() error {
 	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
 		c.count, startRevision, l.lastRevision)
-	return nil
-}
-
-// Abort removes the file: a batch before it failed, so its revisions were
-// never acknowledged and must be reusable by a later writer.
-func (c *fileCommit) Abort() {
-	if err := os.Remove(c.path); err != nil {
-		klog.Errorf("failed to remove unpublished log file %s: %v", c.path, err)
-	}
 }
 
 // GetCurrentRevision returns the current revision number

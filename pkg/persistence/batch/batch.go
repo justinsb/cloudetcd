@@ -136,32 +136,29 @@ func (b *TxnBatch) add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 // prepare validates the batch's transactions against the writes committed
 // since their snapshots, assigns each surviving transaction its revision
 // (starting at lastLogPosition+1) and records its writes in committedWrites,
-// and rejects the rest. It returns the commit to hand to the backend and the
-// result channels of its transactions, in revision order; a nil commit means
-// nothing survived. The batch's records are then written by the backend and
+// It returns the commit to hand to the backend (nil if nothing survived),
+// the result channels of the surviving transactions in revision order, and
+// the result channels of the rejected ones. Rejections are delivered by
+// Batching only once the batch is published, so that a rejected transaction
+// re-evaluating at the log head sees the write that beat it. The batch's records are then written by the backend and
 // acknowledged with deliver, possibly concurrently with later batches.
-func (b *TxnBatch) prepare(ctx context.Context, lastLogPosition Revision) (*BatchCommit, []chan BatchResult) {
+func (b *TxnBatch) prepare(ctx context.Context, lastLogPosition Revision) (commit *BatchCommit, accepted, rejected []chan BatchResult) {
 	log := klog.FromContext(ctx)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.flushed || len(b.pendingBatch) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	b.flushed = true
 
-	commit := &BatchCommit{}
-	resultChannels := make([]chan BatchResult, 0, len(b.pendingBatch))
+	commit = &BatchCommit{}
 	revision := lastLogPosition
 	for _, txn := range b.pendingBatch {
 		if !validateTxn(txn.Meta, lastLogPosition, b.committedWrites) {
-			log.Info("Skipping transaction due to conflict", "snapshotRevision", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition, "hasRangeRead", txn.Meta.HasRangeRead)
-			txn.resultChan <- BatchResult{
-				Revision: 0,
-				Success:  false,
-				Error:    nil,
-			}
+			log.V(2).Info("Skipping transaction due to conflict", "snapshotRevision", txn.Meta.SnapshotRevision, "lastLogPosition", lastLogPosition, "hasRangeRead", txn.Meta.HasRangeRead)
+			rejected = append(rejected, txn.resultChan)
 			continue
 		}
 
@@ -189,26 +186,13 @@ func (b *TxnBatch) prepare(ctx context.Context, lastLogPosition Revision) (*Batc
 		}
 
 		commit.Transactions = append(commit.Transactions, txn)
-		resultChannels = append(resultChannels, txn.resultChan)
+		accepted = append(accepted, txn.resultChan)
 	}
 
 	if len(commit.Transactions) == 0 {
-		return nil, nil
+		commit = nil
 	}
-	return commit, resultChannels
-}
-
-// failAll rejects every transaction in the batch with err.
-func (b *TxnBatch) failAll(err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.flushed {
-		return
-	}
-	b.flushed = true
-	for _, txn := range b.pendingBatch {
-		txn.resultChan <- BatchResult{Error: err}
-	}
+	return commit, accepted, rejected
 }
 
 // validateTxn reports whether a transaction can still be committed given the

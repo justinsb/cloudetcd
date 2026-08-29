@@ -16,7 +16,6 @@ package batch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -27,16 +26,13 @@ import (
 )
 
 // fakeBackend is a FlushFunc whose writes take latency and complete out of
-// order, like the real logs; Batching must still publish in order. failAt
-// makes the batch starting at that revision fail.
+// order, like the real logs; Batching must still publish in order.
 type fakeBackend struct {
 	latency time.Duration
-	failAt  Revision
 
 	mu        sync.Mutex
 	position  Revision   // last published revision
 	published []Revision // first revision of each batch, in publish order
-	aborted   []Revision
 	maxDepth  int
 	inflight  atomic.Int32
 }
@@ -47,21 +43,14 @@ type fakeCommit struct {
 	count           int
 }
 
-func (c *fakeCommit) Publish() error {
+func (c *fakeCommit) Publish() {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	if c.f.position != c.lastLogPosition {
-		return fmt.Errorf("published out of order: log at %d, batch starts after %d", c.f.position, c.lastLogPosition)
+		panic(fmt.Sprintf("published out of order: log at %d, batch starts after %d", c.f.position, c.lastLogPosition))
 	}
 	c.f.published = append(c.f.published, c.lastLogPosition+1)
 	c.f.position += Revision(c.count)
-	return nil
-}
-
-func (c *fakeCommit) Abort() {
-	c.f.mu.Lock()
-	defer c.f.mu.Unlock()
-	c.f.aborted = append(c.f.aborted, c.lastLogPosition+1)
 }
 
 func (f *fakeBackend) flush(ctx context.Context, lastLogPosition Revision, commit *BatchCommit) (Commit, error) {
@@ -79,9 +68,6 @@ func (f *fakeBackend) flush(ctx context.Context, lastLogPosition Revision, commi
 	case <-time.After(f.latency + jitter):
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	}
-	if f.failAt != 0 && lastLogPosition+1 == f.failAt {
-		return nil, errors.New("simulated write failure")
 	}
 	return &fakeCommit{f: f, lastLogPosition: lastLogPosition, count: len(commit.Transactions)}, nil
 }
@@ -163,53 +149,4 @@ func TestPipelinedFlushes(t *testing.T) {
 		t.Errorf("took %s for %d batches; serial would be %s, so nothing was pipelined", elapsed, len(backend.published), serial)
 	}
 	t.Logf("%d batches, max depth %d, %s (serial would be >= %s)", len(backend.published), backend.maxDepth, elapsed, time.Duration(len(backend.published))*latency)
-}
-
-// TestPipelinedFlushFailureStopsLog checks that when a batch fails, every
-// batch after it fails (none of their records are published) and the log
-// refuses further writes, so no acknowledged write ever sits past a gap.
-func TestPipelinedFlushFailureStopsLog(t *testing.T) {
-	backend := &fakeBackend{latency: 20 * time.Millisecond}
-	b := NewBatchingWithOptions(0, backend.flush, Options{Window: 2 * time.Millisecond, MaxInFlight: 8})
-	defer b.Close()
-
-	// First batch commits normally.
-	if rev, ok, err := add(t, b, "a"); err != nil || !ok || rev != 1 {
-		t.Fatalf("first add: rev=%d ok=%v err=%v", rev, ok, err)
-	}
-
-	// The batch at revision 2 will fail; batches 3.. are in flight behind it.
-	backend.failAt = 2
-	type result struct {
-		rev Revision
-		ok  bool
-		err error
-	}
-	results := make(chan result, 3)
-	for i := 0; i < 3; i++ {
-		go func(i int) {
-			rev, ok, err := add(t, b, fmt.Sprintf("k%d", i))
-			results <- result{rev, ok, err}
-		}(i)
-		time.Sleep(5 * time.Millisecond) // separate batches
-	}
-	for i := 0; i < 3; i++ {
-		r := <-results
-		if r.err == nil {
-			t.Errorf("write after the failure was acknowledged: rev=%d ok=%v", r.rev, r.ok)
-		}
-	}
-	if got := backend.Position(); got != 1 {
-		t.Errorf("published position %d after failure, want 1", got)
-	}
-	// Batches written behind the failure were aborted, not published.
-	backend.mu.Lock()
-	aborted := len(backend.aborted)
-	backend.mu.Unlock()
-	if aborted == 0 {
-		t.Error("no batch behind the failure was aborted")
-	}
-	if _, _, err := add(t, b, "later"); !errors.Is(err, ErrLogFailed) {
-		t.Errorf("add after failure: err=%v, want ErrLogFailed", err)
-	}
 }

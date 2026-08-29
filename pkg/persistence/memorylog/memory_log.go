@@ -108,12 +108,13 @@ type memoryCommit struct {
 	batch           *batch.BatchCommit
 }
 
-func (c *memoryCommit) Publish() error {
+func (c *memoryCommit) Publish() {
 	l := c.log
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lastRevision != c.lastLogPosition {
-		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
+		// Batching publishes in order; this cannot happen.
+		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
 	}
 	startRevision := l.lastRevision + 1
 	for _, txn := range c.batch.Transactions {
@@ -125,10 +126,7 @@ func (c *memoryCommit) Publish() error {
 	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
 		len(c.batch.Transactions), startRevision, l.lastRevision)
-	return nil
 }
-
-func (c *memoryCommit) Abort() {}
 
 // GetCurrentRevision returns the current revision number
 func (m *MemoryLog) GetCurrentRevision(ctx context.Context) (Revision, error) {

@@ -343,12 +343,13 @@ type objectCommit struct {
 	data            *persistedBatch
 }
 
-func (c *objectCommit) Publish() error {
+func (c *objectCommit) Publish() {
 	l := c.log
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lastRevision != c.lastLogPosition {
-		return fmt.Errorf("batch is not contiguous with the log: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision)
+		// Batching publishes in order; this cannot happen.
+		panic(fmt.Sprintf("batch published out of order: expected to publish after %d, log is at %d", c.lastLogPosition, l.lastRevision))
 	}
 	startRevision := l.lastRevision + 1
 	l.logFiles = append(l.logFiles, logFileMeta{firstRevision: startRevision, count: c.count})
@@ -359,17 +360,6 @@ func (c *objectCommit) Publish() error {
 	}
 	klog.V(2).Infof("Executed batch of %d transactions, revisions %d-%d",
 		c.count, startRevision, l.lastRevision)
-	return nil
-}
-
-// Abort deletes the object: a batch before it failed, so its revisions were
-// never acknowledged and must be reusable by a later writer. If the delete
-// fails the object is left past a gap, which the next start refuses to
-// read past until a person removes it.
-func (c *objectCommit) Abort() {
-	if err := c.log.bucket.Object(c.objectName).Delete(context.Background()); err != nil {
-		klog.Errorf("failed to delete unpublished log object %s; delete it by hand before restarting: %v", c.objectName, err)
-	}
 }
 
 // GetCurrentRevision returns the current revision number

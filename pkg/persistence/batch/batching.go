@@ -16,18 +16,20 @@ package batch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
-
-	"k8s.io/klog/v2"
 )
 
 // FlushFunc writes a batch whose first record has revision lastLogPosition+1
-// to the backend, durably but without making it visible, and returns a Commit
-// for Batching to publish or abort. Batching may call it for consecutive
-// batches concurrently; it publishes the Commits strictly in batch order.
+// to the backend, durably but without making it visible, and returns the
+// Commit that publishes it. Batching may call it for consecutive batches
+// concurrently; it publishes the Commits strictly in batch order.
+//
+// A batch has been assigned its position by the time FlushFunc is called,
+// and transactions behind it are being assigned positions after it: there
+// is no way to not write it. If the write fails, Batching stops the process
+// (a person has to look at the backend), and on restart the log is re-read.
 type FlushFunc func(ctx context.Context, lastLogPosition Revision, batch *BatchCommit) (Commit, error)
 
 // Commit is a written but not yet visible batch.
@@ -35,11 +37,7 @@ type Commit interface {
 	// Publish makes the batch visible: the log's current revision advances
 	// past it, readers can fetch its records, and the listener is notified.
 	// Batching calls Publish for consecutive batches in order.
-	Publish() error
-	// Abort discards the written batch because a batch before it failed.
-	// It should remove what Publish would have made visible (an object or
-	// file), since a later writer must be able to reuse the revisions.
-	Abort()
+	Publish()
 }
 
 // Options tunes Batching.
@@ -67,11 +65,6 @@ const (
 // their batch and every batch before it is published. So the backend's
 // commit round-trip is paid once per batch rather than once per transaction,
 // and several batches can be in flight at once.
-//
-// If a batch fails to commit, every batch after it (which was assigned
-// revisions on the assumption it would commit) is aborted, and the Batching
-// stops accepting transactions: its view of the log is no longer known to
-// match the backend, so the log must be re-read (today: restart the process).
 type Batching struct {
 	flushFunc   FlushFunc
 	window      time.Duration
@@ -95,8 +88,6 @@ type Batching struct {
 	// has been written since batching started, for per-key conflict
 	// validation.
 	committedWrites map[string]Revision
-	// failed is set when a batch fails to commit; see the type comment.
-	failed error
 	// inflight holds the batches handed to the backend and not yet
 	// acknowledged, in batch order; the acknowledger takes them from the
 	// front, so publication is in order by construction.
@@ -105,23 +96,17 @@ type Batching struct {
 	ackDone  chan struct{}
 }
 
-// flushJob is one batch handed to the backend.
+// flushJob is one batch handed to the backend (commit may be nil if every
+// transaction was rejected; the job then only delivers the rejections in
+// order).
 type flushJob struct {
-	start   Revision
-	commit  *BatchCommit
-	results []chan BatchResult
-	cancel  context.CancelFunc
-	// done receives the backend's Commit (or error) when its write finishes.
-	done chan writeResult
+	start    Revision
+	commit   *BatchCommit
+	accepted []chan BatchResult
+	rejected []chan BatchResult
+	// written receives the backend's Commit when its write finishes.
+	written chan Commit
 }
-
-type writeResult struct {
-	commit Commit
-	err    error
-}
-
-// ErrLogFailed is returned by Add after a batch failed to commit.
-var ErrLogFailed = errors.New("log stopped after a failed commit; the log must be re-read")
 
 // NewBatching creates a Batching with default Options.
 func NewBatching(lastLogPosition Revision, flushFunc FlushFunc) *Batching {
@@ -157,18 +142,11 @@ func newTxnBatch(committedWrites map[string]Revision) *TxnBatch {
 	return &TxnBatch{committedWrites: committedWrites}
 }
 
-// Add queues a transaction and blocks until its batch is committed (or
-// rejected). It returns the transaction's revision and true on success, false
-// (without error) if per-key validation rejected it, or an error if the
-// commit failed.
+// Add queues a transaction and blocks until its batch is committed. It
+// returns the transaction's revision and true on success, or false (without
+// error) if per-key validation rejected it. If ctx ends first the
+// transaction is still committed; only the wait is abandoned.
 func (b *Batching) Add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMeta) (Revision, bool, error) {
-	b.flushLock.Lock()
-	failed := b.failed
-	b.flushLock.Unlock()
-	if failed != nil {
-		return 0, false, fmt.Errorf("%w: %v", ErrLogFailed, failed)
-	}
-
 	b.batchLock.Lock()
 
 	shouldNotify := false
@@ -199,7 +177,7 @@ func (b *Batching) Add(ctx context.Context, logRecord *LogRecord, txnMeta *TxnMe
 
 	select {
 	case result := <-resultChan:
-		return result.Revision, result.Success, result.Error
+		return result.Revision, result.Success, nil
 	case <-ctx.Done():
 		return 0, false, ctx.Err()
 	}
@@ -224,9 +202,6 @@ func (b *Batching) AddBatch(ctx context.Context, lastLogPosition Revision, recor
 	for len(b.inflight) > 0 {
 		b.flushCond.Wait()
 	}
-	if b.failed != nil {
-		return false, fmt.Errorf("%w: %v", ErrLogFailed, b.failed)
-	}
 	if b.lastLogPosition != lastLogPosition {
 		return false, nil
 	}
@@ -242,9 +217,7 @@ func (b *Batching) AddBatch(ctx context.Context, lastLogPosition Revision, recor
 	if err != nil {
 		return false, err
 	}
-	if err := written.Publish(); err != nil {
-		return false, err
-	}
+	written.Publish()
 	b.lastLogPosition += Revision(len(records))
 	return true, nil
 }
@@ -290,49 +263,49 @@ func (b *Batching) doBackgroundFlush() {
 // publishes and delivers the results once the write, and every write before
 // it, is done.
 func (b *Batching) flushBatch(batch *TxnBatch) {
-	ctx := context.Background()
-
 	b.flushLock.Lock()
 	// While MaxInFlight batches are in flight, stop starting new writes
 	// until one completes; the open batch keeps growing meanwhile.
-	for len(b.inflight) >= b.maxInFlight && b.failed == nil {
+	for len(b.inflight) >= b.maxInFlight {
 		b.flushCond.Wait()
 	}
-	if b.failed != nil {
-		b.flushLock.Unlock()
-		batch.failAll(fmt.Errorf("%w: %v", ErrLogFailed, b.failed))
-		return
-	}
-	commit, results := batch.prepare(ctx, b.lastLogPosition)
-	if commit == nil {
+	commit, accepted, rejected := batch.prepare(context.Background(), b.lastLogPosition)
+	if commit == nil && len(rejected) == 0 {
 		b.flushLock.Unlock()
 		return
 	}
-	jobCtx, cancel := context.WithCancel(ctx)
 	job := &flushJob{
-		start:   b.lastLogPosition,
-		commit:  commit,
-		results: results,
-		cancel:  cancel,
-		done:    make(chan writeResult, 1),
+		start:    b.lastLogPosition,
+		commit:   commit,
+		accepted: accepted,
+		rejected: rejected,
+		written:  make(chan Commit, 1),
 	}
-	b.lastLogPosition += Revision(len(commit.Transactions))
+	if commit != nil {
+		b.lastLogPosition += Revision(len(commit.Transactions))
+	}
 	b.inflight = append(b.inflight, job)
 	b.flushCond.Broadcast()
 	b.flushLock.Unlock()
 
+	if commit == nil {
+		return
+	}
 	go func() {
-		written, err := b.flushFunc(jobCtx, job.start, job.commit)
-		job.done <- writeResult{commit: written, err: err}
+		written, err := b.flushFunc(context.Background(), job.start, job.commit)
+		if err != nil {
+			// See FlushFunc: the batch's position is taken and transactions
+			// behind it depend on it; there is nothing to do but stop.
+			panic(fmt.Sprintf("failed to commit log batch (revisions %d-%d): %v", job.start+1, job.start+Revision(len(job.commit.Transactions)), err))
+		}
+		job.written <- written
 	}()
 }
 
 // doAcknowledge publishes written batches and delivers their results, in
-// batch order. After a failure it cancels every later batch's write, aborts
-// what was written, and rejects their transactions.
+// batch order.
 func (b *Batching) doAcknowledge() {
 	defer close(b.ackDone)
-	log := klog.FromContext(context.Background())
 	for {
 		b.flushLock.Lock()
 		for len(b.inflight) == 0 && !b.closed {
@@ -343,39 +316,19 @@ func (b *Batching) doAcknowledge() {
 			return
 		}
 		job := b.inflight[0]
-		failed := b.failed
 		b.flushLock.Unlock()
 
-		var err error
-		if failed != nil {
-			job.cancel()
-			written := <-job.done
-			if written.commit != nil {
-				written.commit.Abort()
-			}
-			err = fmt.Errorf("%w: %v", ErrLogFailed, failed)
-		} else {
-			written := <-job.done
-			err = written.err
-			if err == nil {
-				err = written.commit.Publish()
-			}
-			if err != nil {
-				log.Error(err, "failed to commit batch; the log will not accept further writes", "firstRevision", job.start+1, "count", len(job.commit.Transactions))
-				b.flushLock.Lock()
-				b.failed = err
-				b.flushLock.Unlock()
-			}
+		if job.commit != nil {
+			written := <-job.written
+			written.Publish()
 		}
-		job.cancel()
-
-		// Deliver results: revisions on success, the error otherwise.
-		for i, resultChan := range job.results {
-			if err != nil {
-				resultChan <- BatchResult{Error: err}
-			} else {
-				resultChan <- BatchResult{Revision: job.start + Revision(i) + 1, Success: true}
-			}
+		for i, resultChan := range job.accepted {
+			resultChan <- BatchResult{Revision: job.start + Revision(i) + 1, Success: true}
+		}
+		// Now that this batch (and every batch before it) is published, a
+		// rejected transaction's retry will see the write that beat it.
+		for _, resultChan := range job.rejected {
+			resultChan <- BatchResult{Success: false}
 		}
 
 		b.flushLock.Lock()
