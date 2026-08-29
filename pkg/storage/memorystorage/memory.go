@@ -39,6 +39,12 @@ type MemoryStorage struct {
 
 	revisions bptree.BPTree
 
+	// applied is the highest log revision whose events have been applied to
+	// revisions (and the lease manager). Records are committed by the log's
+	// batching layer, possibly many per batch, and applied here in log order
+	// by applyUpTo; guarded by mu.
+	applied Revision
+
 	log persistence.Log // Persistence log
 
 	watcherMu sync.RWMutex
@@ -95,6 +101,7 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 		if newRevision != 1 {
 			return fmt.Errorf("expected revision 1, got %d", newRevision)
 		}
+		m.applied = newRevision
 		return nil
 	}
 
@@ -125,7 +132,45 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 	if err := m.log.Read(ctx, 1, callback); err != nil {
 		return fmt.Errorf("failed to read log records: %w", err)
 	}
+	m.applied = currentRevision
 
+	return nil
+}
+
+// applyUpTo applies every committed log record up to and including rev to
+// the index, in log order. Any goroutine may call it: a transaction after its
+// append returns, or a reader before it evaluates at a snapshot, so that the
+// index always reflects the revision a caller is about to read at, no matter
+// which goroutine's append happened to commit it.
+func (m *MemoryStorage) applyUpTo(ctx context.Context, rev Revision) error {
+	m.mu.RLock()
+	applied := m.applied
+	m.mu.RUnlock()
+	if applied >= rev {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for r := m.applied + 1; r <= rev; r++ {
+		record, err := m.log.GetLogEntry(r)
+		if err != nil {
+			return fmt.Errorf("reading log record %d: %w", r, err)
+		}
+		if record == nil {
+			return fmt.Errorf("log record %d not found", r)
+		}
+		for _, event := range record.Events {
+			switch event.Type {
+			case mvccpb.PUT, mvccpb.DELETE:
+				m.revisions.AddRevision(event.Kv.Key, r)
+			default:
+				klog.Fatalf("unknown operation: %s", event.Type)
+			}
+			m.leaseManager.OnLogEvent(event)
+		}
+		m.applied = r
+	}
 	return nil
 }
 
@@ -231,11 +276,15 @@ func (t *txn) put(ctx context.Context, req *etcdserverpb.PutRequest) (*etcdserve
 	return response, nil
 }
 
-func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error {
+// commit appends the transaction's events to the log. It returns false (and
+// no error) if the batching layer rejected the transaction because a key it
+// read or wrote was committed by another transaction after its snapshot; the
+// caller re-evaluates at a fresh snapshot.
+func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) (bool, error) {
 	log := klog.FromContext(ctx)
 
 	if len(t.logEvents) == 0 {
-		return nil
+		return true, nil
 	}
 
 	// Let's see if we can commit this transaction without conflicts
@@ -247,26 +296,17 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 	}
 
 	newLogRevision, ok, err := t.storage.log.Append(ctx, logRecord, t.meta)
-	if err != nil || !ok {
-		return fmt.Errorf("failed to append to log: %w", err)
+	if err != nil {
+		return false, fmt.Errorf("failed to append to log: %w", err)
+	}
+	if !ok {
+		return false, nil
 	}
 
-	// TODO: Can we reuse replay?
-
-	for _, event := range logRecord.Events {
-		switch event.Type {
-		case mvccpb.PUT:
-			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
-
-		case mvccpb.DELETE:
-			t.storage.revisions.AddRevision(event.Kv.Key, newLogRevision)
-
-		default:
-			// Skip unknown operations
-			klog.Fatalf("unknown operation: %s", event.Type)
-		}
-
-		t.storage.leaseManager.OnLogEvent(event)
+	// The batch may have committed other transactions ahead of ours; apply
+	// everything up to our revision so the response is visible to reads.
+	if err := t.storage.applyUpTo(ctx, newLogRevision); err != nil {
+		return false, err
 	}
 
 	resp.Header.Revision = int64(newLogRevision)
@@ -283,23 +323,69 @@ func (t *txn) commit(ctx context.Context, resp *etcdserverpb.TxnResponse) error 
 			response.ResponseRange.Header = resp.Header
 
 		default:
-			return fmt.Errorf("unsupported response type: %T", response)
+			return false, fmt.Errorf("unsupported response type: %T", response)
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
-// Txn executes a transaction against the storage.
-func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// maxTxnAttempts bounds how many times a transaction is re-evaluated after
+// losing optimistic validation. Kubernetes transactions touch one key each,
+// so a retry only happens when that key was concurrently written, and the
+// re-evaluation then fails the compare rather than conflicting again.
+const maxTxnAttempts = 64
 
+// Txn executes a transaction against the storage.
+//
+// Transactions run optimistically: each is evaluated at a snapshot under a
+// read lock, its events are appended to the log without any storage lock held
+// (so the log's batching layer can commit many transactions per write to the
+// backend), and the batching layer validates per key that nothing the
+// transaction read or wrote was committed after its snapshot. A transaction
+// that loses that validation is re-evaluated at a fresh snapshot, where its
+// compares see the concurrent write.
+func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	for attempt := 0; attempt < maxTxnAttempts; attempt++ {
+		resp, committed, err := m.tryTxn(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if committed {
+			return resp, nil
+		}
+	}
+	return nil, fmt.Errorf("transaction conflicted with concurrent writes %d times", maxTxnAttempts)
+}
+
+func (m *MemoryStorage) tryTxn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, bool, error) {
 	snapshotTimestamp, err := m.log.GetCurrentRevision(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get current revision: %w", err)
+		return nil, false, fmt.Errorf("failed to get current revision: %w", err)
+	}
+	// The log may have committed records that no goroutine has applied yet.
+	if err := m.applyUpTo(ctx, snapshotTimestamp); err != nil {
+		return nil, false, err
 	}
 
+	resp, txn, err := m.evaluate(ctx, req, snapshotTimestamp)
+	if err != nil {
+		return nil, false, err
+	}
+	committed, err := txn.commit(ctx, resp)
+	if err != nil {
+		return nil, false, err
+	}
+	return resp, committed, nil
+}
+
+// evaluate runs the transaction's compares and operations against the index
+// at snapshotTimestamp, staging its events; nothing is written.
+func (m *MemoryStorage) evaluate(ctx context.Context, req *etcdserverpb.TxnRequest, snapshotTimestamp Revision) (*etcdserverpb.TxnResponse, *txn, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var err error
 	txn := &txn{
 		snapshotTimestamp: snapshotTimestamp,
 		storage:           m,
@@ -344,7 +430,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_ModRevision)
 			if !ok {
-				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
+				return nil, nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
 			}
 
 			switch cond.GetResult() {
@@ -356,7 +442,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				}
 
 			default:
-				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+				return nil, nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
 			}
 
 		case etcdserverpb.Compare_VERSION:
@@ -369,7 +455,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_Version)
 			if !ok {
-				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
+				return nil, nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
 			}
 
 			switch cond.GetResult() {
@@ -379,7 +465,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				}
 
 			default:
-				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+				return nil, nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
 			}
 
 		case etcdserverpb.Compare_LEASE:
@@ -392,7 +478,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 
 			targetValue, ok := cond.GetTargetUnion().(*etcdserverpb.Compare_Lease)
 			if !ok {
-				return nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
+				return nil, nil, fmt.Errorf("unsupported target: %T", cond.GetTargetUnion())
 			}
 
 			switch cond.GetResult() {
@@ -403,11 +489,11 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 				}
 
 			default:
-				return nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
+				return nil, nil, fmt.Errorf("unsupported compare result: %s", cond.GetResult())
 			}
 
 		default:
-			return nil, fmt.Errorf("unsupported compare target: %s", cond.GetTarget())
+			return nil, nil, fmt.Errorf("unsupported compare target: %s", cond.GetTarget())
 		}
 	}
 
@@ -427,7 +513,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			putRequest := op.GetRequestPut()
 			putResp, err := txn.put(ctx, putRequest)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: putResp},
@@ -436,7 +522,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 		case *etcdserverpb.RequestOp_RequestDeleteRange:
 			deleteResp, err := txn.delete(ctx, op.GetRequestDeleteRange())
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			resp.Responses = append(resp.Responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: deleteResp},
@@ -447,7 +533,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			if op.GetRequestRange().GetRangeEnd() == nil {
 				rangeResp, err = txn.get(ctx, op.GetRequestRange())
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				rangeKey := op.GetRequestRange().Key
 				readRevision := Revision(0)
@@ -458,7 +544,7 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			} else {
 				rangeResp, err = txn.list(ctx, op.GetRequestRange())
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				txn.meta.AddList(op.GetRequestRange())
 			}
@@ -468,15 +554,11 @@ func (m *MemoryStorage) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (
 			})
 
 		default:
-			return nil, fmt.Errorf("unsupported operation: %T", op.Request)
+			return nil, nil, fmt.Errorf("unsupported operation: %T", op.Request)
 		}
 	}
 
-	if err := txn.commit(ctx, resp); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+	return resp, txn, nil
 }
 
 type txn struct {
@@ -521,15 +603,9 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 		return nil, fmt.Errorf("range end is not supported by Get")
 	}
 
-	snapshotTimestamp := Revision(0)
+	snapshotTimestamp := t.snapshotTimestamp
 	if req.Revision > 0 {
 		snapshotTimestamp = Revision(req.Revision)
-	} else {
-		currentRevision, err := m.log.GetCurrentRevision(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current revision: %w", err)
-		}
-		snapshotTimestamp = currentRevision
 	}
 
 	if req.CountOnly {
@@ -776,15 +852,9 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 		return nil, fmt.Errorf("range end is required by List")
 	}
 
-	snapshotTimestamp := Revision(0)
+	snapshotTimestamp := t.snapshotTimestamp
 	if req.Revision > 0 {
 		snapshotTimestamp = Revision(req.Revision)
-	} else {
-		currentRevision, err := m.log.GetCurrentRevision(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current revision: %w", err)
-		}
-		snapshotTimestamp = currentRevision
 	}
 
 	resp := &etcdserverpb.RangeResponse{
@@ -883,6 +953,7 @@ func (m *MemoryStorage) ForceReplayLog(ctx context.Context) error {
 	// Clear current state
 	m.mu.Lock()
 	m.revisions = bptree.BPTree{}
+	m.applied = 0
 	m.mu.Unlock()
 
 	// Replay the log

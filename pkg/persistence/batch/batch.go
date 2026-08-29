@@ -164,11 +164,17 @@ func (b *TxnBatch) flush(ctx context.Context, lastLogPosition Revision) (int, er
 		}
 
 		revision++
+		// Transactions stamp their events with snapshot+1; with several
+		// transactions per batch (or concurrent batches) the committed
+		// revision differs, so re-stamp every event here.
 		for _, event := range txn.LogRecord.Events {
-			if event.Type == mvccpb.PUT {
+			switch event.Type {
+			case mvccpb.PUT:
 				if event.Kv.CreateRevision == event.Kv.ModRevision {
 					event.Kv.CreateRevision = int64(revision)
 				}
+				event.Kv.ModRevision = int64(revision)
+			case mvccpb.DELETE:
 				event.Kv.ModRevision = int64(revision)
 			}
 		}

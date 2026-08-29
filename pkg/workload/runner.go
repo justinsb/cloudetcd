@@ -292,10 +292,9 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 	if c.ConsistentReadsPerSecond > 0 {
 		interval := time.Duration(float64(time.Second) / c.ConsistentReadsPerSecond)
 		loop(func() {
-			var n int
+			var n atomic.Int64 // jobs run on several workers
 			p.every(interval, func(ctx context.Context) {
-				res := readResources[n%len(readResources)]
-				n++
+				res := readResources[int(n.Add(1)-1)%len(readResources)]
 				_ = r.exec.get(ctx, OpConsistentRead, c.resourceKey(res))
 			})
 		})
