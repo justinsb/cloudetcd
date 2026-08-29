@@ -18,6 +18,7 @@
 //	cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
 //	cloud-etcd-bench run -nodes 100 -log 'memory://?commitLatency=50ms' -phases populate,steady,list-storm
 //	cloud-etcd-bench run -endpoint 127.0.0.1:2379 -nodes 100
+//	cloud-etcd-bench run -nodes 100 -node-images 50 -pod-containers 3
 //	cloud-etcd-bench analyze recording.jsonl
 //	cloud-etcd-bench extract-blobs recording.jsonl pkg/workload/blobs
 //
@@ -41,6 +42,7 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/workload"
 	"justinsb.com/cloudetcd/pkg/workload/inprocess"
+	"justinsb.com/cloudetcd/pkg/workload/kubeblobs"
 )
 
 func main() {
@@ -94,7 +96,9 @@ func runBench(ctx context.Context, args []string) error {
 	logURI := fs.String("log", "memory://", "Log URI for the in-process server (e.g. memory://?commitLatency=50ms, filesystem:///tmp/log)")
 	endpoint := fs.String("endpoint", "", "Run against this etcd endpoint instead of starting an in-process server")
 	workers := fs.Int("workers", 64, "Concurrent requests in flight")
-	blobsDir := fs.String("blobs", "", "Directory of captured value blobs (see extract-blobs); synthetic blobs if empty")
+	blobs := fs.String("blobs", "kube", "Values to write: 'kube' (generated Kubernetes objects encoded as the apiserver stores them), 'synthetic' (random bytes of captured sizes), or a directory of captured blobs (see extract-blobs)")
+	nodeImages := fs.Int("node-images", kubeblobs.DefaultOptions().Images, "Images reported by each generated Node (sizes the Node object; -blobs kube)")
+	podContainers := fs.Int("pod-containers", kubeblobs.DefaultOptions().Containers, "Containers in each generated Pod (-blobs kube)")
 	output := fs.String("o", "text", "Output format: text or json")
 	stormConcurrency := fs.Int("list-storm-concurrency", 10, "Concurrent listers in the list-storm phase")
 	stormRounds := fs.Int("list-storm-rounds", 1, "Full lists per lister in the list-storm phase")
@@ -105,8 +109,17 @@ func runBench(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *blobsDir != "" {
-		b, err := workload.LoadBlobs(*blobsDir)
+	switch *blobs {
+	case "kube":
+		b, err := kubeblobs.GenerateWithOptions(kubeblobs.Options{Images: *nodeImages, Containers: *podContainers})
+		if err != nil {
+			return err
+		}
+		cfg.Blobs = b
+	case "synthetic":
+		cfg.Blobs = workload.SyntheticBlobs()
+	default:
+		b, err := workload.LoadBlobs(*blobs)
 		if err != nil {
 			return err
 		}

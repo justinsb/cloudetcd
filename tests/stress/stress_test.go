@@ -29,6 +29,7 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/workload"
 	"justinsb.com/cloudetcd/pkg/workload/inprocess"
+	"justinsb.com/cloudetcd/pkg/workload/kubeblobs"
 )
 
 func envInt(t *testing.T, name string, def int) int {
@@ -72,8 +73,16 @@ func TestClusterWorkload(t *testing.T) {
 	if logURI == "" {
 		logURI = "memory://"
 	}
+	// Values are generated Kubernetes objects encoded as the apiserver stores
+	// them; STRESS_BLOBS points at a directory of captured values instead.
 	if dir := os.Getenv("STRESS_BLOBS"); dir != "" {
 		b, err := workload.LoadBlobs(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Blobs = b
+	} else {
+		b, err := kubeblobs.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
