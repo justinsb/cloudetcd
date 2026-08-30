@@ -99,6 +99,14 @@ type logFile struct {
 	opened time.Time
 	// archived is whether the archive holds this (closed) file.
 	archived bool
+	// mapped is the read-only memory mapping of a closed file, made on first
+	// read; records read from it alias its bytes (see
+	// logcodec.DecodeMessageAlias), so old records live in the page cache
+	// rather than on the heap.
+	mapped []byte
+	// reader is the file opened for positioned reads (the active file, or
+	// any file where mapping is unavailable), opened on first read and kept.
+	reader *os.File
 }
 
 func (f *logFile) last() Revision { return f.first + Revision(f.count) - 1 }
@@ -130,6 +138,9 @@ type FilesystemLog struct {
 
 	// cache holds recently written and read records.
 	cache *recordcache.Cache
+
+	// mapMu serializes creating mappings.
+	mapMu sync.Mutex
 
 	// uploads carries closed files to the uploader goroutine.
 	uploads      chan string
@@ -530,39 +541,139 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	if record, ok := l.cache.Get(revision); ok {
 		return record, nil
 	}
-
-	l.mu.RLock()
-	f, ok := l.findFile(revision)
-	l.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
-	}
-	spans, err := l.fileSpans(f)
+	m, aliased, err := l.recordBytes(revision)
 	if err != nil {
 		return nil, err
 	}
-	pos := int(revision - f.first)
-	if pos < 0 || pos >= len(spans) {
-		return nil, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+	if aliased {
+		// Decode in place, aliasing the key and value bytes rather than
+		// copying them. Not cached: the cache is for the write-recent set,
+		// and a cached alias would pin the mapping.
+		record, err := logcodec.DecodeMessageAlias(m)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
+		}
+		return record, nil
 	}
-
-	// One positioned read of exactly this record's bytes.
-	span := spans[pos]
-	file, err := os.Open(filepath.Join(l.dir, f.name))
+	record, err := logcodec.DecodeMessage(m)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open log file %s: %w", f.name, err)
-	}
-	defer file.Close()
-	buf := make([]byte, span.Length)
-	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
-		return nil, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
-	}
-	record, err := logcodec.DecodeMessage(buf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, f.name, err)
+		return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
 	}
 	l.cache.Put(revision, record)
 	return record, nil
+}
+
+// recordBytes returns the encoded bytes of revision's record. For a closed
+// file they alias its memory mapping (aliased is true) and must not be
+// retained; for the active file, or where mapping is unavailable, they are
+// one positioned read into a fresh buffer.
+func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, err error) {
+	l.mu.RLock()
+	f, ok := l.findFile(revision)
+	active := ok && f == l.files[len(l.files)-1]
+	l.mu.RUnlock()
+	if !ok {
+		return nil, false, fmt.Errorf("log entry for revision %d not found in any file", revision)
+	}
+	pos := int(revision - f.first)
+
+	if !active {
+		m, err := l.mapping(f)
+		if err != nil {
+			return nil, false, err
+		}
+		if m != nil {
+			spans, err := l.fileSpansFrom(f, m)
+			if err != nil {
+				return nil, false, err
+			}
+			if pos < 0 || pos >= len(spans) {
+				return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+			}
+			span := spans[pos]
+			return m[span.Offset : span.Offset+span.Length], true, nil
+		}
+	}
+
+	spans, err := l.fileSpans(f)
+	if err != nil {
+		return nil, false, err
+	}
+	if pos < 0 || pos >= len(spans) {
+		return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+	}
+	span := spans[pos]
+	file, err := l.reader(f)
+	if err != nil {
+		return nil, false, err
+	}
+	buf := make([]byte, span.Length)
+	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
+		return nil, false, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
+	}
+	return buf, false, nil
+}
+
+// mapping returns a closed file's memory mapping, creating it on first use
+// from the file's read handle, or nil where the platform has no memory
+// mapping. A mapping that fails where it should work is fatal: the
+// alternative would be a positioned read per record, a large and silent
+// change in how the server performs.
+func (l *FilesystemLog) mapping(f *logFile) ([]byte, error) {
+	l.mapMu.Lock()
+	defer l.mapMu.Unlock()
+	if f.mapped == nil {
+		file, err := l.readerLocked(f)
+		if err != nil {
+			return nil, err
+		}
+		m, err := mmapFile(file, f.size)
+		if errors.Is(err, errNoMmap) {
+			return nil, nil
+		}
+		if err != nil {
+			panic(fmt.Sprintf("memory-mapping log file %s (%d bytes): %v", f.name, f.size, err))
+		}
+		f.mapped = m
+	}
+	return f.mapped, nil
+}
+
+// reader returns a file's handle for positioned reads, opening it on first
+// use and keeping it open.
+func (l *FilesystemLog) reader(f *logFile) (*os.File, error) {
+	l.mapMu.Lock()
+	defer l.mapMu.Unlock()
+	return l.readerLocked(f)
+}
+
+func (l *FilesystemLog) readerLocked(f *logFile) (*os.File, error) {
+	if f.reader == nil {
+		file, err := os.Open(filepath.Join(l.dir, f.name))
+		if err != nil {
+			return nil, fmt.Errorf("failed to open log file %s: %w", f.name, err)
+		}
+		f.reader = file
+	}
+	return f.reader, nil
+}
+
+// fileSpansFrom is fileSpans for a file whose bytes are already at hand.
+func (l *FilesystemLog) fileSpansFrom(f *logFile, data []byte) ([]logcodec.Span, error) {
+	l.spansMu.Lock()
+	spans, ok := l.spans[f.first]
+	l.spansMu.Unlock()
+	if ok {
+		return spans, nil
+	}
+	spans, err := logcodec.Offsets(data)
+	if err != nil {
+		return nil, fmt.Errorf("indexing log file %s: %w", f.name, err)
+	}
+	l.spansMu.Lock()
+	l.spans[f.first] = spans
+	l.spansMu.Unlock()
+	return spans, nil
 }
 
 // fileSpans returns the record spans of a file, scanning its length
@@ -645,20 +756,22 @@ func (l *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 // Close flushes queued transactions, rotates the active file so that
 // everything committed is archived, waits for uploads, and releases the log.
 func (l *FilesystemLog) Close() error {
+	var errs []error
 	if err := l.batching.Close(); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 	close(l.stop)
 	<-l.rotatorDone
 
 	l.writeMu.Lock()
 	l.mu.Lock()
-	var err error
 	if l.opts.Archive != nil {
-		err = l.rotateLocked()
+		if err := l.rotateLocked(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if cerr := l.active.Close(); err == nil {
-		err = cerr
+	if err := l.active.Close(); err != nil {
+		errs = append(errs, err)
 	}
 	l.mu.Unlock()
 	l.writeMu.Unlock()
@@ -670,12 +783,27 @@ func (l *FilesystemLog) Close() error {
 		klog.Warningf("log closed with uploads still pending; they will resume on the next start")
 	}
 
-	if l.removeOnClose {
-		if rerr := os.RemoveAll(l.dir); err == nil {
-			err = rerr
+	l.mapMu.Lock()
+	for _, f := range l.files {
+		if err := munmapFile(f.mapped); err != nil {
+			errs = append(errs, err)
+		}
+		f.mapped = nil
+		if f.reader != nil {
+			if err := f.reader.Close(); err != nil {
+				errs = append(errs, err)
+			}
+			f.reader = nil
 		}
 	}
-	return err
+	l.mapMu.Unlock()
+
+	if l.removeOnClose {
+		if err := os.RemoveAll(l.dir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // SetListener sets the log listener

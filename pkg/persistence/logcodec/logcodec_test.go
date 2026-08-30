@@ -17,6 +17,7 @@ package logcodec
 import (
 	"fmt"
 	"testing"
+	"unsafe"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"google.golang.org/protobuf/proto"
@@ -134,6 +135,68 @@ func TestOffsets(t *testing.T) {
 	}
 	if _, err := Offsets(data[:len(data)-5]); err == nil {
 		t.Error("offsets of a truncated batch succeeded")
+	}
+}
+
+func TestDecodeMessageAlias(t *testing.T) {
+	in := batch(50)
+	data, err := Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans, err := Offsets(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, sp := range spans {
+		m := data[sp.Offset : sp.Offset+sp.Length]
+		got, err := DecodeMessageAlias(m)
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		want, _ := DecodeMessage(m)
+		if len(got.Events) != len(want.Events) {
+			t.Fatalf("record %d: %d events, want %d", i, len(got.Events), len(want.Events))
+		}
+		for j := range want.Events {
+			if !proto.Equal(got.Events[j], want.Events[j]) {
+				t.Fatalf("record %d event %d:\n got %v\nwant %v", i, j, got.Events[j], want.Events[j])
+			}
+		}
+		// The alias decoder shares the input buffer rather than copying.
+		if len(got.Events) > 0 && got.Events[0].Kv != nil && len(got.Events[0].Kv.Value) > 0 {
+			v := got.Events[0].Kv.Value
+			start, end := uintptr(unsafe.Pointer(&m[0])), uintptr(unsafe.Pointer(&m[len(m)-1]))
+			if p := uintptr(unsafe.Pointer(&v[0])); p < start || p > end {
+				t.Fatalf("record %d: value was copied instead of aliased", i)
+			}
+		}
+	}
+}
+
+func BenchmarkDecodeMessageAlias(b *testing.B) {
+	data, _ := Encode(batch(500))
+	spans, _ := Offsets(data)
+	sp := spans[250]
+	m := data[sp.Offset : sp.Offset+sp.Length]
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := DecodeMessageAlias(m); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeMessage(b *testing.B) {
+	data, _ := Encode(batch(500))
+	spans, _ := Offsets(data)
+	sp := spans[250]
+	m := data[sp.Offset : sp.Offset+sp.Length]
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := DecodeMessage(m); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
