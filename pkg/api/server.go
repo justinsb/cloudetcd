@@ -16,6 +16,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -277,7 +278,7 @@ func (s *Server) handleSingleKey(ctx context.Context, req *etcdserverpb.RangeReq
 	// Query for single key
 	resp, err := s.storage.Get(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, toGRPCError(err)
 	}
 	return resp, err
 }
@@ -286,7 +287,7 @@ func (s *Server) handleRangeWithEnd(ctx context.Context, req *etcdserverpb.Range
 	// Use the storage layer's efficient range query
 	resp, err := s.storage.List(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, toGRPCError(err)
 	}
 	return resp, err
 }
@@ -316,9 +317,22 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 	result, err := s.storage.Txn(ctx, req)
 	if err != nil {
 		log.Error(err, "failed to execute Txn request", "request", req)
-		return nil, err
+		return nil, toGRPCError(err)
 	}
 	return result, nil
+}
+
+// toGRPCError maps storage errors to their etcd equivalents, so that
+// clients see the errors they are coded to handle (kube-apiserver relists
+// on ErrGRPCCompacted); anything else passes through.
+func toGRPCError(err error) error {
+	switch {
+	case errors.Is(err, storage.ErrCompacted):
+		return rpctypes.ErrGRPCCompacted
+	case errors.Is(err, storage.ErrFutureRev):
+		return rpctypes.ErrGRPCFutureRev
+	}
+	return err
 }
 
 // Compact implements the Compact RPC method
@@ -438,6 +452,28 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 	// Create storage watcher
 	watch, logPosition, err := ws.server.storage.Watch(ctx, req, callback)
 	if err != nil {
+		if errors.Is(err, storage.ErrCompacted) {
+			// As in etcd: the watch is created and at once canceled, with
+			// CompactRevision (the compacted revision, which Watch returned
+			// in the revision slot) telling the client where to relist. The
+			// stream itself stays up for its other watches.
+			current, cerr := ws.server.storage.GetCurrentRevision(ctx)
+			if cerr != nil {
+				current = logPosition
+			}
+			ws.stream.Send(&etcdserverpb.WatchResponse{
+				Header:  ws.server.createHeader(current),
+				WatchId: watchID,
+				Created: true,
+			})
+			ws.stream.Send(&etcdserverpb.WatchResponse{
+				Header:          ws.server.createHeader(current),
+				WatchId:         watchID,
+				Canceled:        true,
+				CompactRevision: int64(logPosition),
+			})
+			return nil
+		}
 		// Send error response
 		resp := &etcdserverpb.WatchResponse{
 			Header: ws.server.createHeader(logPosition),

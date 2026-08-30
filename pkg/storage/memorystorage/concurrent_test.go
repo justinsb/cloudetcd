@@ -15,6 +15,7 @@
 package memorystorage
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
+	"justinsb.com/cloudetcd/pkg/storage"
 )
 
 // TestConcurrentConditionalUpdatesSerialize races N compare-and-put
@@ -360,4 +362,57 @@ func TestCompactKeepsStateAtPoint(t *testing.T) {
 	if got := snapshot(store, head); got != atHead {
 		t.Fatalf("state at head after restart:\n before %s\n after  %s", atHead, got)
 	}
+}
+
+// TestCompactedReadsAndWatches checks the compaction-point semantics at the
+// storage API: reads at or above the point (and no further than head) work,
+// reads below it are ErrCompacted, reads beyond head are ErrFutureRev, and a
+// watch may only start above the point (a refused watch reports the point).
+func TestCompactedReadsAndWatches(t *testing.T) {
+	ctx := t.Context()
+	lg, err := filesystemlog.NewFilesystemLogWithOptions(t.TempDir(), filesystemlog.Options{CacheBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewMemoryStorage(lg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.log.Close()
+
+	var putRev []Revision
+	for i := 0; i < 10; i++ {
+		resp, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("/k"), Value: []byte(fmt.Sprintf("v%d", i))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		putRev = append(putRev, Revision(resp.Header.Revision))
+	}
+	point := putRev[5]
+	if compacted, err := store.Compact(ctx, point); err != nil || compacted != point {
+		t.Fatalf("Compact = %d, %v; want %d", compacted, err, point)
+	}
+
+	if resp, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k"), Revision: int64(point)}); err != nil || string(resp.Kvs[0].Value) != "v5" {
+		t.Fatalf("read at the compaction point: %v, %v", resp.GetKvs(), err)
+	}
+	if _, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k"), Revision: int64(point - 1)}); !errors.Is(err, storage.ErrCompacted) {
+		t.Fatalf("read below the compaction point: got %v, want ErrCompacted", err)
+	}
+	if _, err := store.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/"), RangeEnd: []byte("0"), Revision: int64(point - 1)}); !errors.Is(err, storage.ErrCompacted) {
+		t.Fatalf("list below the compaction point: got %v, want ErrCompacted", err)
+	}
+	if _, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k"), Revision: 99}); !errors.Is(err, storage.ErrFutureRev) {
+		t.Fatalf("read beyond head: got %v, want ErrFutureRev", err)
+	}
+
+	cb := func(*etcdserverpb.WatchResponse) error { return nil }
+	if _, rev, err := store.Watch(ctx, &etcdserverpb.WatchCreateRequest{WatchId: 1, Key: []byte("/k"), StartRevision: int64(point)}, cb); !errors.Is(err, storage.ErrCompacted) || rev != point {
+		t.Fatalf("watch from the compaction point: got rev %d, %v; want ErrCompacted with rev %d", rev, err, point)
+	}
+	w, _, err := store.Watch(ctx, &etcdserverpb.WatchCreateRequest{WatchId: 2, Key: []byte("/k"), StartRevision: int64(point + 1)}, cb)
+	if err != nil {
+		t.Fatalf("watch from above the compaction point: %v", err)
+	}
+	w.Close()
 }

@@ -16,12 +16,14 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 	"justinsb.com/cloudetcd/pkg/storage/memorystorage"
@@ -552,4 +554,63 @@ func TestRangeWithRangeEnd(t *testing.T) {
 	require.Contains(t, keys, "b")
 	require.NotContains(t, keys, "c")
 	require.NotContains(t, keys, "d")
+}
+
+// TestCompactedErrors checks what an etcd client sees around the compaction
+// point: ErrCompacted for a range below it, ErrFutureRev beyond head, and
+// for a watch starting at or below it a canceled watch carrying
+// CompactRevision (kube-apiserver relists on exactly these).
+func TestCompactedErrors(t *testing.T) {
+	ctx := t.Context()
+
+	store, err := memorystorage.NewMemoryStorage(memorylog.New())
+	require.NoError(t, err)
+	server := NewServer(store)
+	defer server.GracefulStop()
+	go func() {
+		if err := server.Start(ctx, ":21390"); err != nil {
+			t.Errorf("Failed to start server: %v", err)
+		}
+	}()
+	time.Sleep(500 * time.Millisecond)
+
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{"localhost:21390"}, DialTimeout: 5 * time.Second})
+	require.NoError(t, err)
+	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var putRev []int64
+	for i := 0; i < 10; i++ {
+		resp, err := cli.Put(ctx, "compact-key", fmt.Sprintf("v%d", i))
+		require.NoError(t, err)
+		putRev = append(putRev, resp.Header.Revision)
+	}
+	point := putRev[5]
+	_, err = cli.Compact(ctx, point)
+	require.NoError(t, err)
+
+	// Reads at the point work; below it and beyond head fail as in etcd.
+	resp, err := cli.Get(ctx, "compact-key", clientv3.WithRev(point))
+	require.NoError(t, err)
+	require.Equal(t, "v5", string(resp.Kvs[0].Value))
+	_, err = cli.Get(ctx, "compact-key", clientv3.WithRev(point-1))
+	require.ErrorIs(t, err, rpctypes.ErrCompacted)
+	_, err = cli.Get(ctx, "compact-key", clientv3.WithPrefix(), clientv3.WithRev(point-1))
+	require.ErrorIs(t, err, rpctypes.ErrCompacted)
+	_, err = cli.Get(ctx, "compact-key", clientv3.WithRev(99))
+	require.ErrorIs(t, err, rpctypes.ErrFutureRev)
+
+	// A watch from at or below the point is canceled with CompactRevision.
+	wresp := <-cli.Watch(ctx, "compact-key", clientv3.WithRev(point-1))
+	require.True(t, wresp.Canceled)
+	require.Equal(t, int64(point), wresp.CompactRevision)
+	require.ErrorIs(t, wresp.Err(), rpctypes.ErrCompacted)
+
+	// A watch from above the point replays from there.
+	wresp = <-cli.Watch(ctx, "compact-key", clientv3.WithRev(point+1))
+	require.NoError(t, wresp.Err())
+	require.NotEmpty(t, wresp.Events)
+	require.Equal(t, int64(point+1), wresp.Events[0].Kv.ModRevision)
 }
