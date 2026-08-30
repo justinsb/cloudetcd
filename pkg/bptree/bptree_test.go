@@ -23,9 +23,9 @@ import (
 
 // func TestBPTree_AddRevision(t *testing.T) {
 // 	tree := New()
-// 	tree.AddRevision([]byte("key1"), 1)
-// 	tree.AddRevision([]byte("key2"), 2)
-// 	tree.AddRevision([]byte("key1"), 3)
+// 	tree.AddRevision([]byte("key1"), 1, false)
+// 	tree.AddRevision([]byte("key2"), 2, false)
+// 	tree.AddRevision([]byte("key1"), 3, false)
 
 // 	if len(tree.root.keys) != 2 {
 // 		t.Errorf("expected 2 keys, got %d", len(tree.root.keys))
@@ -55,11 +55,11 @@ import (
 
 func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
 	var tree BPTree
-	tree.AddRevision([]byte("key1"), 1)
-	tree.AddRevision([]byte("key3"), 2)
-	tree.AddRevision([]byte("key5"), 3)
-	tree.AddRevision([]byte("key1"), 4)
-	tree.AddRevision([]byte("key3"), 5)
+	tree.AddRevision([]byte("key1"), 1, false)
+	tree.AddRevision([]byte("key3"), 2, false)
+	tree.AddRevision([]byte("key5"), 3, false)
+	tree.AddRevision([]byte("key1"), 4, false)
+	tree.AddRevision([]byte("key3"), 5, false)
 
 	scenarios := []struct {
 		key          []byte
@@ -98,11 +98,11 @@ func TestBPTree_GetLatestRevisionByKey(t *testing.T) {
 
 func TestBPTree_ListRevisionsByKeyRange(t *testing.T) {
 	var tree BPTree
-	tree.AddRevision([]byte("key1"), 1)
-	tree.AddRevision([]byte("key3"), 2)
-	tree.AddRevision([]byte("key5"), 3)
-	tree.AddRevision([]byte("key1"), 4)
-	tree.AddRevision([]byte("key3"), 5)
+	tree.AddRevision([]byte("key1"), 1, false)
+	tree.AddRevision([]byte("key3"), 2, false)
+	tree.AddRevision([]byte("key5"), 3, false)
+	tree.AddRevision([]byte("key1"), 4, false)
+	tree.AddRevision([]byte("key3"), 5, false)
 
 	{
 		got := make(map[string][]Revision)

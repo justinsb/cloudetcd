@@ -89,12 +89,12 @@ func TestRadixSplitting(t *testing.T) {
 		var tree BPTree
 		var ref reference
 		for i, k := range order {
-			tree.AddRevision([]byte(k), Revision(i+1))
+			tree.AddRevision([]byte(k), Revision(i+1), false)
 			ref.add(k, Revision(i+1))
 		}
 		// Second revisions, in a different order.
 		for i, k := range reverse(order) {
-			tree.AddRevision([]byte(k), Revision(100+i))
+			tree.AddRevision([]byte(k), Revision(100+i), false)
 			ref.add(k, Revision(100+i))
 		}
 		checkAgainst(t, &tree, &ref, starts)
@@ -115,7 +115,7 @@ func TestRadixRandom(t *testing.T) {
 			b[j] = "abc/"[rng.Intn(4)]
 		}
 		k := string(b)
-		tree.AddRevision([]byte(k), Revision(i+1))
+		tree.AddRevision([]byte(k), Revision(i+1), false)
 		ref.add(k, Revision(i+1))
 		if i%100 == 0 {
 			starts = append(starts, k, k+"a", k[:len(k)/2])
@@ -129,7 +129,7 @@ func TestRadixRandom(t *testing.T) {
 func TestKeysAreNotAliased(t *testing.T) {
 	var tree BPTree
 	buf := []byte("/registry/minions/node-1")
-	tree.AddRevision(buf, 1)
+	tree.AddRevision(buf, 1, false)
 	copy(buf, "/registry/minions/node-2")
 	if _, ok := tree.GetLatestRevisionByKey([]byte("/registry/minions/node-1"), 1); !ok {
 		t.Fatal("key changed after the caller reused its buffer")
@@ -157,10 +157,10 @@ func TestBPTree_ManyKeys(t *testing.T) {
 
 	var tree BPTree
 	for rev, i := range perm {
-		tree.AddRevision(keys[i], Revision(rev+1))
+		tree.AddRevision(keys[i], Revision(rev+1), false)
 	}
 	for rev, i := range perm {
-		tree.AddRevision(keys[i], Revision(n+rev+1))
+		tree.AddRevision(keys[i], Revision(n+rev+1), false)
 	}
 	if tree.Len() != n {
 		t.Fatalf("Len = %d, want %d", tree.Len(), n)
@@ -198,7 +198,7 @@ func TestBPTree_ManyKeys(t *testing.T) {
 func BenchmarkAddRevision(b *testing.B) {
 	var tree BPTree
 	for i := 0; i < b.N; i++ {
-		tree.AddRevision([]byte(fmt.Sprintf("/registry/minions/node-%08d", i)), Revision(i+1))
+		tree.AddRevision([]byte(fmt.Sprintf("/registry/minions/node-%08d", i)), Revision(i+1), false)
 	}
 }
 
@@ -206,7 +206,7 @@ func BenchmarkGetLatestRevisionByKey(b *testing.B) {
 	var tree BPTree
 	const n = 200_000
 	for i := 0; i < n; i++ {
-		tree.AddRevision([]byte(fmt.Sprintf("/registry/minions/node-%08d", i)), Revision(i+1))
+		tree.AddRevision([]byte(fmt.Sprintf("/registry/minions/node-%08d", i)), Revision(i+1), false)
 	}
 	keys := make([][]byte, 1024)
 	for i := range keys {
@@ -237,15 +237,15 @@ func shuffled(s []string, seed int64) []string {
 // latest revision is a delete below it.
 func TestCompact(t *testing.T) {
 	var tree BPTree
-	tree.AddRevision([]byte("a"), 1)
-	tree.AddRevision([]byte("a"), 5)
-	tree.AddRevision([]byte("a"), 9)
-	tree.AddRevision([]byte("b"), 2)
-	tree.AddTombstone([]byte("b"), 6)
-	tree.AddRevision([]byte("c"), 3)
-	tree.AddTombstone([]byte("c"), 12)
-	tree.AddRevision([]byte("d"), 4)
-	tree.AddRevision([]byte("d"), 11)
+	tree.AddRevision([]byte("a"), 1, false)
+	tree.AddRevision([]byte("a"), 5, false)
+	tree.AddRevision([]byte("a"), 9, false)
+	tree.AddRevision([]byte("b"), 2, false)
+	tree.AddRevision([]byte("b"), 6, true)
+	tree.AddRevision([]byte("c"), 3, false)
+	tree.AddRevision([]byte("c"), 12, true)
+	tree.AddRevision([]byte("d"), 4, false)
+	tree.AddRevision([]byte("d"), 11, false)
 
 	removed, dropped := tree.Compact(8)
 	// b is gone (2 revisions); a drops 1; c and d keep their latest below 8.

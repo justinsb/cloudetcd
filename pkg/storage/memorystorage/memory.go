@@ -117,11 +117,11 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 			switch event.Type {
 			case mvccpb.PUT:
 				// Replay PUT operation
-				m.revisions.AddRevision(event.Kv.Key, revision)
+				m.revisions.AddRevision(event.Kv.Key, revision, false)
 
 			case mvccpb.DELETE:
 				// Replay DELETE operation
-				m.revisions.AddTombstone(event.Kv.Key, revision)
+				m.revisions.AddRevision(event.Kv.Key, revision, true)
 
 			default:
 				// Skip unknown operations
@@ -168,9 +168,9 @@ func (m *MemoryStorage) applyUpTo(ctx context.Context, rev Revision) error {
 		for _, event := range record.Events {
 			switch event.Type {
 			case mvccpb.PUT:
-				m.revisions.AddRevision(event.Kv.Key, r)
+				m.revisions.AddRevision(event.Kv.Key, r, false)
 			case mvccpb.DELETE:
-				m.revisions.AddTombstone(event.Kv.Key, r)
+				m.revisions.AddRevision(event.Kv.Key, r, true)
 			default:
 				klog.Fatalf("unknown operation: %s", event.Type)
 			}
@@ -979,8 +979,9 @@ func createHeader(revision Revision) *etcdserverpb.ResponseHeader {
 // Compact discards history at or below revision. The revision is lowered if
 // an open watcher has not yet delivered past it, so that watchers are not
 // cut off; it is then applied to the index (each key keeps its latest
-// version at or below the point, and deleted keys go) and to the log (files
-// below the point are rewritten with only the live records).
+// write at or below the point, and keys whose latest write is a delete go)
+// and to the log (files below the point are rewritten with only the
+// records the index still refers to).
 func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revision, error) {
 	m.mu.Lock()
 	through := revision
@@ -1012,10 +1013,14 @@ func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revisio
 	// The log rewrite runs in the background: it reads closed files and
 	// takes seconds at scale, and nothing waits on it. The log serializes
 	// compactions, so overlapping requests queue.
+	// A record is live if it is a key's state as of the compaction point:
+	// its latest put or delete at or below through, which is what the index
+	// kept. Not simply the key's latest revision: a read at a revision
+	// between the point and a later write of the key still needs it.
 	live := func(key []byte, rev Revision) bool {
 		m.mu.RLock()
 		defer m.mu.RUnlock()
-		latest, ok := m.revisions.GetLatestRevisionByKey(key, storage.MAX_REVISION)
+		latest, ok := m.revisions.GetLatestRevisionByKey(key, through)
 		return ok && latest == rev
 	}
 	m.compactWG.Add(1)

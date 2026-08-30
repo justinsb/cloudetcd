@@ -125,7 +125,7 @@ func TestOffsets(t *testing.T) {
 		}
 	}
 	for i, sp := range spans {
-		got, err := DecodeMessage(data[sp.Offset : sp.Offset+sp.Length])
+		got, err := sp.Bytes(data).Decode()
 		if err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
@@ -164,11 +164,11 @@ func TestDecodeMessageAlias(t *testing.T) {
 	}
 	for i, sp := range spans {
 		m := data[sp.Offset : sp.Offset+sp.Length]
-		got, err := DecodeMessageAlias(m)
+		got, err := EncodedRecord(m).DecodeAlias()
 		if err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
-		want, _ := DecodeMessage(m)
+		want, _ := EncodedRecord(m).Decode()
 		if len(got.Events) != len(want.Events) {
 			t.Fatalf("record %d: %d events, want %d", i, len(got.Events), len(want.Events))
 		}
@@ -195,7 +195,7 @@ func BenchmarkDecodeMessageAlias(b *testing.B) {
 	m := data[sp.Offset : sp.Offset+sp.Length]
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := DecodeMessageAlias(m); err != nil {
+		if _, err := EncodedRecord(m).DecodeAlias(); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -208,7 +208,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 	m := data[sp.Offset : sp.Offset+sp.Length]
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := DecodeMessage(m); err != nil {
+		if _, err := EncodedRecord(m).Decode(); err != nil {
 			b.Fatal(err)
 		}
 	}

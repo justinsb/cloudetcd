@@ -61,13 +61,17 @@ func AppendRecords(buf []byte, first persistence.Revision, records []*persistenc
 	return AppendRecordsAt(buf, revisions, records)
 }
 
-// AppendRaw appends one already-encoded record (the bytes of a Span) to buf,
-// returning its Span relative to the start of buf. Compaction copies records
-// between files this way, without decoding them.
-func AppendRaw(buf []byte, m []byte) ([]byte, Span) {
-	buf = protowire.AppendVarint(buf, uint64(len(m)))
-	span := Span{Offset: len(buf), Length: len(m)}
-	return append(buf, m...), span
+// WriteRecord writes one already-encoded record to w with its length
+// prefix, as AppendRecords would, and returns the number of bytes written
+// (the record's Span starts len(m) bytes before the end of them).
+func WriteRecord(w io.Writer, m EncodedRecord) (int, error) {
+	prefix := protowire.AppendVarint(nil, uint64(len(m)))
+	n, err := w.Write(prefix)
+	if err != nil {
+		return n, err
+	}
+	k, err := w.Write(m)
+	return n + k, err
 }
 
 // AppendRecordsAt is AppendRecords with an explicit revision per record, for
@@ -125,6 +129,15 @@ type Span struct {
 	Length int
 }
 
+// Bytes returns the record the span locates in data.
+func (s Span) Bytes(data []byte) EncodedRecord {
+	return EncodedRecord(data[s.Offset : s.Offset+s.Length])
+}
+
+// EncodedRecord is one record as stored: the bytes of its WatchResponse
+// message, without the length prefix. It is what Span locates.
+type EncodedRecord []byte
+
 // Offsets returns the span and revision of every record in a file without
 // decoding the records: it reads the length prefixes and each record's
 // header. With a span, a record can be read from storage by itself (see
@@ -164,7 +177,7 @@ func Scan(data []byte) (spans []Span, revisions []persistence.Revision, complete
 			return spans, revisions, pos, nil
 		}
 		m := data[pos+k : pos+k+int(n)]
-		rev, err := recordRevision(m)
+		rev, err := EncodedRecord(m).Revision()
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("decoding record %d: %w", len(spans), err)
 		}
@@ -175,9 +188,9 @@ func Scan(data []byte) (spans []Span, revisions []persistence.Revision, complete
 	return spans, revisions, pos, nil
 }
 
-// recordRevision reads the revision from a record's header without decoding
-// the rest (WatchResponse field 1, ResponseHeader field 3).
-func recordRevision(m []byte) (persistence.Revision, error) {
+// Revision reads the record's revision from its header without decoding the
+// rest (WatchResponse field 1, ResponseHeader field 3).
+func (m EncodedRecord) Revision() (persistence.Revision, error) {
 	for len(m) > 0 {
 		num, typ, n := protowire.ConsumeTag(m)
 		if n < 0 {
@@ -219,9 +232,8 @@ func recordRevision(m []byte) (persistence.Revision, error) {
 	return 0, fmt.Errorf("record has no header")
 }
 
-// DecodeMessage decodes one record from its message bytes (the Span returned
-// by Offsets).
-func DecodeMessage(m []byte) (*persistence.LogRecord, error) {
+// Decode decodes the record.
+func (m EncodedRecord) Decode() (*persistence.LogRecord, error) {
 	wr := &etcdserverpb.WatchResponse{}
 	if err := proto.Unmarshal(m, wr); err != nil {
 		return nil, err
@@ -251,12 +263,12 @@ func Decode(data []byte) ([]*persistence.LogRecord, error) {
 	return records, nil
 }
 
-// DecodeMessageAlias is DecodeMessage without copying: the returned record's
-// keys and values alias m, so m must stay valid and unmodified for as long as
-// the record is in use (a read-only mapping of a closed log file is). It
-// parses exactly the fields of etcdserverpb.WatchResponse, mvccpb.Event and
+// DecodeAlias is Decode without copying: the returned record's keys and
+// values alias m, so m must stay valid and unmodified for as long as the
+// record is in use (a read-only mapping of a closed log file is). It parses
+// exactly the fields of etcdserverpb.WatchResponse, mvccpb.Event and
 // mvccpb.KeyValue that the log writes, and skips any others.
-func DecodeMessageAlias(m []byte) (*persistence.LogRecord, error) {
+func (m EncodedRecord) DecodeAlias() (*persistence.LogRecord, error) {
 	record := &persistence.LogRecord{}
 	for len(m) > 0 {
 		num, typ, n := protowire.ConsumeTag(m)
