@@ -541,82 +541,102 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	if record, ok := l.cache.Get(revision); ok {
 		return record, nil
 	}
-
-	l.mu.RLock()
-	f, ok := l.findFile(revision)
-	closed := ok && f != l.files[len(l.files)-1]
-	l.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
+	m, aliased, err := l.recordBytes(revision)
+	if err != nil {
+		return nil, err
 	}
-	pos := int(revision - f.first)
-
-	var record *LogRecord
-	if m := l.mapping(f, closed); m != nil {
-		// A closed file: decode straight out of its mapping, aliasing the
-		// key and value bytes rather than copying them.
-		spans, err := l.fileSpansFrom(f, m)
+	if aliased {
+		// Decode in place, aliasing the key and value bytes rather than
+		// copying them. Not cached: the cache is for the write-recent set,
+		// and a cached alias would pin the mapping.
+		record, err := logcodec.DecodeMessageAlias(m)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
 		}
-		if pos < 0 || pos >= len(spans) {
-			return nil, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
-		}
-		span := spans[pos]
-		record, err = logcodec.DecodeMessageAlias(m[span.Offset : span.Offset+span.Length])
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, f.name, err)
-		}
-	} else {
-		// The active file (or a platform without mmap): one positioned read
-		// of exactly this record's bytes.
-		spans, err := l.fileSpans(f)
-		if err != nil {
-			return nil, err
-		}
-		if pos < 0 || pos >= len(spans) {
-			return nil, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
-		}
-		span := spans[pos]
-		file, err := l.reader(f)
-		if err != nil {
-			return nil, err
-		}
-		buf := make([]byte, span.Length)
-		if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
-			return nil, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
-		}
-		record, err = logcodec.DecodeMessage(buf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode log record %d from file %s: %w", revision, f.name, err)
-		}
+		return record, nil
+	}
+	record, err := logcodec.DecodeMessage(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
 	}
 	l.cache.Put(revision, record)
 	return record, nil
 }
 
-// mapping returns the memory mapping of a closed file, creating it on first
-// use, or nil if the file is active (still growing) or the platform has no
-// memory mapping. A mapping that fails where it should work is fatal: the
-// fallback would be a positioned read per record, a large and silent change
-// in how the server performs.
-func (l *FilesystemLog) mapping(f *logFile, closed bool) []byte {
-	if !closed {
-		return nil
+// recordBytes returns the encoded bytes of revision's record. For a closed
+// file they alias its memory mapping (aliased is true) and must not be
+// retained; for the active file, or where mapping is unavailable, they are
+// one positioned read into a fresh buffer.
+func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, err error) {
+	l.mu.RLock()
+	f, ok := l.findFile(revision)
+	active := ok && f == l.files[len(l.files)-1]
+	l.mu.RUnlock()
+	if !ok {
+		return nil, false, fmt.Errorf("log entry for revision %d not found in any file", revision)
 	}
+	pos := int(revision - f.first)
+
+	if !active {
+		m, err := l.mapping(f)
+		if err != nil {
+			return nil, false, err
+		}
+		if m != nil {
+			spans, err := l.fileSpansFrom(f, m)
+			if err != nil {
+				return nil, false, err
+			}
+			if pos < 0 || pos >= len(spans) {
+				return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+			}
+			span := spans[pos]
+			return m[span.Offset : span.Offset+span.Length], true, nil
+		}
+	}
+
+	spans, err := l.fileSpans(f)
+	if err != nil {
+		return nil, false, err
+	}
+	if pos < 0 || pos >= len(spans) {
+		return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+	}
+	span := spans[pos]
+	file, err := l.reader(f)
+	if err != nil {
+		return nil, false, err
+	}
+	buf := make([]byte, span.Length)
+	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
+		return nil, false, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
+	}
+	return buf, false, nil
+}
+
+// mapping returns a closed file's memory mapping, creating it on first use
+// from the file's read handle, or nil where the platform has no memory
+// mapping. A mapping that fails where it should work is fatal: the
+// alternative would be a positioned read per record, a large and silent
+// change in how the server performs.
+func (l *FilesystemLog) mapping(f *logFile) ([]byte, error) {
 	l.mapMu.Lock()
 	defer l.mapMu.Unlock()
 	if f.mapped == nil {
-		m, err := mapFile(filepath.Join(l.dir, f.name), f.size)
+		file, err := l.readerLocked(f)
+		if err != nil {
+			return nil, err
+		}
+		m, err := mmapFile(file, f.size)
 		if errors.Is(err, errNoMmap) {
-			return nil
+			return nil, nil
 		}
 		if err != nil {
 			panic(fmt.Sprintf("memory-mapping log file %s (%d bytes): %v", f.name, f.size, err))
 		}
 		f.mapped = m
 	}
-	return f.mapped
+	return f.mapped, nil
 }
 
 // reader returns a file's handle for positioned reads, opening it on first
@@ -624,6 +644,10 @@ func (l *FilesystemLog) mapping(f *logFile, closed bool) []byte {
 func (l *FilesystemLog) reader(f *logFile) (*os.File, error) {
 	l.mapMu.Lock()
 	defer l.mapMu.Unlock()
+	return l.readerLocked(f)
+}
+
+func (l *FilesystemLog) readerLocked(f *logFile) (*os.File, error) {
 	if f.reader == nil {
 		file, err := os.Open(filepath.Join(l.dir, f.name))
 		if err != nil {
@@ -732,20 +756,22 @@ func (l *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 // Close flushes queued transactions, rotates the active file so that
 // everything committed is archived, waits for uploads, and releases the log.
 func (l *FilesystemLog) Close() error {
+	var errs []error
 	if err := l.batching.Close(); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 	close(l.stop)
 	<-l.rotatorDone
 
 	l.writeMu.Lock()
 	l.mu.Lock()
-	var err error
 	if l.opts.Archive != nil {
-		err = l.rotateLocked()
+		if err := l.rotateLocked(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if cerr := l.active.Close(); err == nil {
-		err = cerr
+	if err := l.active.Close(); err != nil {
+		errs = append(errs, err)
 	}
 	l.mu.Unlock()
 	l.writeMu.Unlock()
@@ -759,13 +785,13 @@ func (l *FilesystemLog) Close() error {
 
 	l.mapMu.Lock()
 	for _, f := range l.files {
-		if uerr := unmapFile(f.mapped); uerr != nil && err == nil {
-			err = uerr
+		if err := munmapFile(f.mapped); err != nil {
+			errs = append(errs, err)
 		}
 		f.mapped = nil
 		if f.reader != nil {
-			if cerr := f.reader.Close(); cerr != nil && err == nil {
-				err = cerr
+			if err := f.reader.Close(); err != nil {
+				errs = append(errs, err)
 			}
 			f.reader = nil
 		}
@@ -773,11 +799,11 @@ func (l *FilesystemLog) Close() error {
 	l.mapMu.Unlock()
 
 	if l.removeOnClose {
-		if rerr := os.RemoveAll(l.dir); err == nil {
-			err = rerr
+		if err := os.RemoveAll(l.dir); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
 // SetListener sets the log listener

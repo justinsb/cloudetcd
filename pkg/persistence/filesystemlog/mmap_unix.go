@@ -22,26 +22,21 @@ import (
 	"syscall"
 )
 
-// errNoMmap is returned by mapFile on platforms without memory mapping;
+// errNoMmap is returned by mmapFile on platforms without memory mapping;
 // never on this one.
 var errNoMmap = errors.New("memory mapping is not supported on this platform")
 
-// mapFile maps a whole file read-only. The mapping is backed by the page
-// cache: pages are read on first touch and evicted by the OS under memory
-// pressure, so old records cost no heap.
-func mapFile(path string, size int64) ([]byte, error) {
+// mmapFile maps the first size bytes of f read-only. The mapping is backed
+// by the page cache: pages are read on first touch and evicted by the OS
+// under memory pressure, so old records cost no heap.
+func mmapFile(f *os.File, size int64) ([]byte, error) {
 	if size == 0 {
 		return nil, nil
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 	return syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 }
 
-func unmapFile(m []byte) error {
+func munmapFile(m []byte) error {
 	if m == nil {
 		return nil
 	}

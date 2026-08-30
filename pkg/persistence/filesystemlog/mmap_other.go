@@ -16,10 +16,13 @@
 
 package filesystemlog
 
-import "errors"
+import (
+	"errors"
+	"os"
+)
 
 var errNoMmap = errors.New("memory mapping is not supported on this platform")
 
-func mapFile(path string, size int64) ([]byte, error) { return nil, errNoMmap }
+func mmapFile(f *os.File, size int64) ([]byte, error) { return nil, errNoMmap }
 
-func unmapFile(m []byte) error { return nil }
+func munmapFile(m []byte) error { return nil }
