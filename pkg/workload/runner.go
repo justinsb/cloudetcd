@@ -22,6 +22,8 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"justinsb.com/cloudetcd/pkg/storage"
 )
 
 // Runner drives a cluster's worth of traffic at an etcd endpoint. Its phases
@@ -43,6 +45,10 @@ type Runner struct {
 	// (hundreds), all multiplexed on one connection, which is what this
 	// reproduces.
 	Workers int
+	// WatcherStatus, if set, reports the server's watchers; the steady phase
+	// samples it to report how far behind the log head the server-side
+	// watchers get, separately from what the client receives.
+	WatcherStatus func() []storage.WatcherStatus
 
 	exec   *executor
 	state  *stateMap
@@ -217,6 +223,14 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 		}()
 	}
 
+	if r.WatcherStatus != nil {
+		watchers.Add(1)
+		go func() {
+			defer watchers.Done()
+			r.sampleWatchers(watchCtx, stats)
+		}()
+	}
+
 	p := newPool(schedCtx, ctx, r.Workers, stats)
 	var loops sync.WaitGroup
 	loop := func(fn func()) {
@@ -330,4 +344,25 @@ func (r *Runner) ListStorm(ctx context.Context, concurrency, rounds int) (*Repor
 	}
 	wg.Wait()
 	return r.report("list-storm", stats, nil), ctx.Err()
+}
+
+// sampleWatchers records, twice a second, how far behind the log head each
+// server-side watcher is.
+func (r *Runner) sampleWatchers(ctx context.Context, stats *Stats) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for _, w := range r.WatcherStatus() {
+			lag := int64(w.Head) - int64(w.Delivered)
+			if lag < 0 {
+				lag = 0
+			}
+			stats.ServerWatchLag.Observe(time.Duration(lag)) // in revisions, not time
+		}
+	}
 }

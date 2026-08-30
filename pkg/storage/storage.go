@@ -47,6 +47,14 @@ type Watcher interface {
 	Run(ctx context.Context) error
 }
 
+// WatcherStatus describes how far a watcher has got: Delivered is the last
+// revision it has sent to its client, Head the log revision it knows about.
+type WatcherStatus struct {
+	ID        int64
+	Delivered Revision
+	Head      Revision
+}
+
 // Storage is the interface for the underlying storage layer.
 type Storage interface {
 	// GetCurrentRevision returns the current revision of the log.

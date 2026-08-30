@@ -33,6 +33,8 @@ import (
 type Server struct {
 	// Addr is the host:port the server listens on.
 	Addr string
+	// Store is the server's storage, for diagnostics.
+	Store *memorystorage.MemoryStorage
 
 	server *api.Server
 	cancel context.CancelFunc
@@ -61,6 +63,7 @@ func Start(ctx context.Context, logURI string, opts ...api.Option) (*Server, err
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
 		Addr:   addr,
+		Store:  store,
 		server: api.NewServer(store, opts...),
 		cancel: cancel,
 		done:   make(chan error, 1),

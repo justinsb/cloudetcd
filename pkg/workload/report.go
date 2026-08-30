@@ -44,6 +44,10 @@ type Report struct {
 
 	// Watches is keyed by resource prefix.
 	Watches map[string]*WatchReport `json:"watches,omitempty"`
+	// ServerWatchLagRevisions is how far behind the log head the server-side
+	// watchers were, in revisions, sampled twice a second (in-process
+	// servers only).
+	ServerWatchLagRevisions *LatencyReport `json:"serverWatchLagRevisions,omitempty"`
 
 	// ErrorSamples lists distinct errors seen and how often.
 	ErrorSamples map[string]int64 `json:"errorSamples,omitempty"`
@@ -135,6 +139,10 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 		lr := latencyReport(&stats.SchedulingLag)
 		rep.SchedulingLag = &lr
 	}
+	if stats.ServerWatchLag.Count() > 0 {
+		lr := latencyReport(&stats.ServerWatchLag)
+		rep.ServerWatchLagRevisions = &lr
+	}
 	for label, ws := range stats.watches {
 		rep.Watches[label] = &WatchReport{
 			Events:           ws.Events.Load(),
@@ -183,6 +191,10 @@ func (r *Report) Text() string {
 		l := r.SchedulingLag
 		fmt.Fprintf(&sb, "scheduling lag: p50 %s  p90 %s  p99 %s  max %s (ops started this long after they were due)\n",
 			fmtDur(l.P50), fmtDur(l.P90), fmtDur(l.P99), fmtDur(l.Max))
+	}
+	if l := r.ServerWatchLagRevisions; l != nil {
+		fmt.Fprintf(&sb, "server watch lag: p50 %d  p90 %d  p99 %d  max %d revisions behind the log head (sampled twice a second)\n",
+			int64(l.P50), int64(l.P90), int64(l.P99), int64(l.Max))
 	}
 	if len(r.Watches) > 0 {
 		tw = tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
