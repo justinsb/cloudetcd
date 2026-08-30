@@ -43,6 +43,7 @@ The project is in early development. Currently implemented:
   - `filesystem:///path` — batches are appended to an active file and fsynced; the file is rotated by size or age
   - `filesystem:///path?archive=gs://bucket/prefix` — every rotated file is uploaded to GCS (with a conditional write, so two writers are detected), and a machine with no local files restores from it
   - `memory://` — a temporary directory removed on exit, for tests and benchmarks
+- **Compaction**: the `Compact` RPC (which kube-apiserver issues every 5 minutes) discards history below the requested revision, keeping the latest version of every key; closed log files are rewritten in the background with only their live records and merged, so disk is bounded by the live data plus recent history
 
 ## Building and Testing
 

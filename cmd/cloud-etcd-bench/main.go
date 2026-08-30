@@ -176,6 +176,7 @@ func runBench(ctx context.Context, args []string) error {
 	}
 	if srv != nil {
 		runner.WatcherStatus = srv.Store.Watchers
+		runner.LogBytes = func() int64 { return dirBytes(srv.LogDir) }
 	}
 
 	fmt.Fprintf(os.Stderr, "model: %d nodes, %d pods, %d keys; blobs %v\n", cfg.Nodes, cfg.Pods(), cfg.Keys(), cfg.Blobs.Sizes())
@@ -260,4 +261,19 @@ func runExtractBlobs(args []string) error {
 	}
 	fmt.Printf("wrote blobs to %s: %v\n", args[1], b.Sizes())
 	return nil
+}
+
+// dirBytes is the total size of the files in dir.
+func dirBytes(dir string) int64 {
+	var total int64
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && !e.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total
 }

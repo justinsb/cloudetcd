@@ -20,9 +20,14 @@
 // closed file is uploaded to the Archive (if there is one) in the
 // background. Local files are the read store: the log keeps in memory only
 // its file index, each record's byte span within its file, and a bounded
-// cache of recently written or read records; anything else is a positioned
-// read of one record. On a machine with no local files, the archive is
-// downloaded first.
+// cache of recently written records; a closed file is memory-mapped on
+// first read and its records decoded in place. On a machine with no local
+// files, the archive is downloaded first.
+//
+// Compaction rewrites closed files keeping only the records that are still
+// live (the latest put of each key), so a compacted file is sparse in
+// revision: every record carries its revision, and a compacted file's name
+// carries the revision range it covers.
 package filesystemlog
 
 import (
@@ -33,11 +38,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"k8s.io/klog/v2"
 
 	"justinsb.com/cloudetcd/pkg/persistence"
@@ -64,14 +71,18 @@ type Archive interface {
 	Upload(ctx context.Context, name string, path string) error
 	// Download copies the archived file name to path.
 	Download(ctx context.Context, name string, path string) error
+	// Delete removes an archived file (one superseded by compaction). A
+	// missing file is not an error.
+	Delete(ctx context.Context, name string) error
 }
 
 // Options configures a FilesystemLog.
 type Options struct {
-	// CacheBytes bounds the in-memory cache of decoded records; records not
-	// in it are read from disk on demand. <= 0 means unbounded.
+	// CacheBytes bounds the in-memory cache of recently written records;
+	// everything else is read from disk on demand. <= 0 means unbounded.
 	CacheBytes int64
-	// RotateBytes rotates the active file once it is this large.
+	// RotateBytes rotates the active file once it is this large; it is also
+	// the size compaction aims for when it merges files.
 	RotateBytes int64
 	// RotateAfter rotates the active file once it is this old and has any
 	// records. So a busy log rotates by size every few seconds and an idle
@@ -86,13 +97,25 @@ const (
 	DefaultCacheBytes  = 256 << 20
 	DefaultRotateBytes = 64 << 20
 	DefaultRotateAfter = 5 * time.Minute
+
+	// unmapAfter is how long a mapping of a file removed by compaction is
+	// kept before it is unmapped: records decoded from it alias its bytes,
+	// and a reader may still be using one.
+	unmapAfter = time.Minute
 )
 
 // logFile is one file of the log. All but the last are closed.
 type logFile struct {
-	name  string
-	first Revision
-	count int
+	name string
+	// first and last bound the revisions the file covers. A dense file (one
+	// the log appended to) holds every revision in [first, last]; a
+	// compacted file holds only the live ones.
+	first, last Revision
+	sparse      bool
+	// revisions lists a sparse file's records' revisions, parallel to its
+	// spans; nil for dense files, whose record i has revision first+i.
+	revisions []Revision
+	count     int
 	// size is the file's length in bytes, header included.
 	size int64
 	// opened is when the file was created, for age-based rotation.
@@ -105,11 +128,17 @@ type logFile struct {
 	// rather than on the heap.
 	mapped []byte
 	// reader is the file opened for positioned reads (the active file, or
-	// any file where mapping is unavailable), opened on first read and kept.
+	// any file where mapping is unavailable) and for mapping, opened on
+	// first use and kept.
 	reader *os.File
 }
 
-func (f *logFile) last() Revision { return f.first + Revision(f.count) - 1 }
+// archiveOp is work for the uploader: copy a closed file to the archive, or
+// remove one that compaction superseded.
+type archiveOp struct {
+	name   string
+	remove bool
+}
 
 // FilesystemLog is the log; see the package comment.
 type FilesystemLog struct {
@@ -136,19 +165,30 @@ type FilesystemLog struct {
 	spansMu sync.Mutex
 	spans   map[Revision][]logcodec.Span
 
-	// cache holds recently written and read records.
+	// cache holds recently written records (reads of the active file).
 	cache *recordcache.Cache
 
-	// mapMu serializes creating mappings.
+	// mapMu serializes creating mappings and guards retired.
 	mapMu sync.Mutex
+	// retired holds mappings of files removed by compaction until it is
+	// safe to unmap them.
+	retired []retiredMapping
 
-	// uploads carries closed files to the uploader goroutine.
-	uploads      chan string
+	// compactMu serializes compactions.
+	compactMu sync.Mutex
+
+	// archiveOps carries work to the uploader goroutine.
+	archiveOps   chan archiveOp
 	uploaderDone chan struct{}
 	stop         chan struct{}
 	rotatorDone  chan struct{}
 
 	removeOnClose bool
+}
+
+type retiredMapping struct {
+	mapped []byte
+	at     time.Time
 }
 
 var _ persistence.Log = &FilesystemLog{}
@@ -195,7 +235,7 @@ func NewFilesystemLogWithOptions(dir string, opts Options) (*FilesystemLog, erro
 		opts:         opts,
 		spans:        map[Revision][]logcodec.Span{},
 		cache:        recordcache.New(opts.CacheBytes),
-		uploads:      make(chan string, 1024),
+		archiveOps:   make(chan archiveOp, 4096),
 		uploaderDone: make(chan struct{}),
 		stop:         make(chan struct{}),
 		rotatorDone:  make(chan struct{}),
@@ -211,6 +251,9 @@ func NewFilesystemLogWithOptions(dir string, opts Options) (*FilesystemLog, erro
 	go l.rotator()
 	return l, nil
 }
+
+// Dir returns the log's directory.
+func (l *FilesystemLog) Dir() string { return l.dir }
 
 // open builds the index from the files in the directory (and the archive),
 // repairs a torn tail on the last file, and opens it for appending.
@@ -231,13 +274,13 @@ func (l *FilesystemLog) open(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to read log file %s: %w", f.name, err)
 		}
-		spans, complete, err := logcodec.Scan(data)
+		spans, revisions, complete, err := logcodec.Scan(data)
 		if err != nil {
 			return fmt.Errorf("log file %s: %w", f.name, err)
 		}
 		if complete < len(data) {
-			if i < len(files)-1 {
-				return fmt.Errorf("log file %s is truncated at byte %d but is not the last file; recovery needed", f.name, complete)
+			if i < len(files)-1 || f.sparse {
+				return fmt.Errorf("log file %s is truncated at byte %d but is not the active file; recovery needed", f.name, complete)
 			}
 			// A write cut short by a crash: nothing past it was acknowledged.
 			klog.Warningf("log file %s ends in a torn record; truncating from %d to %d bytes", f.name, len(data), complete)
@@ -247,15 +290,30 @@ func (l *FilesystemLog) open(ctx context.Context) error {
 		}
 		f.count = len(spans)
 		f.size = int64(complete)
+		if f.sparse {
+			for j, r := range revisions {
+				if r < f.first || r > f.last || (j > 0 && r <= revisions[j-1]) {
+					return fmt.Errorf("log file %s: record %d has revision %d, outside or out of order for %d-%d; recovery needed", f.name, j, r, f.first, f.last)
+				}
+			}
+			f.revisions = revisions
+		} else {
+			for j, r := range revisions {
+				if r != f.first+Revision(j) {
+					return fmt.Errorf("log file %s: record %d has revision %d, want %d; recovery needed", f.name, j, r, f.first+Revision(j))
+				}
+			}
+			f.last = f.first + Revision(f.count) - 1
+		}
 		if i > 0 {
 			prev := files[i-1]
-			if f.first != prev.first+Revision(prev.count) {
-				return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed", prev.name, prev.last(), f.name, f.first)
+			if f.first != prev.last+1 {
+				return fmt.Errorf("log has a gap: %s ends at revision %d but %s starts at %d; recovery needed", prev.name, prev.last, f.name, f.first)
 			}
 		} else if f.first != 1 {
 			return fmt.Errorf("log starts at revision %d, not 1; recovery needed", f.first)
 		}
-		if i == len(files)-1 {
+		if i == len(files)-1 && !f.sparse {
 			l.spans[f.first] = spans
 		}
 	}
@@ -265,21 +323,24 @@ func (l *FilesystemLog) open(ctx context.Context) error {
 		return l.newActiveFile()
 	}
 	last := files[len(files)-1]
-	l.lastRevision = last.last()
+	l.lastRevision = last.last
 
 	// Closed files that never made it to the archive (a crash after
 	// rotating, before the upload finished).
 	if l.opts.Archive != nil {
 		for _, f := range files[:len(files)-1] {
 			if !f.archived {
-				l.uploads <- f.name
+				l.archiveOps <- archiveOp{name: f.name}
 			}
 		}
 	}
 
-	if last.archived {
+	if last.archived || last.sparse {
 		// An archived file is never appended to again (its object would no
-		// longer match); start the next one.
+		// longer match), nor is a compacted one; start the next file.
+		if !last.archived && l.opts.Archive != nil {
+			l.archiveOps <- archiveOp{name: last.name}
+		}
 		return l.newActiveFile()
 	}
 	l.active, err = os.OpenFile(filepath.Join(l.dir, last.name), os.O_WRONLY|os.O_APPEND, 0644)
@@ -290,7 +351,9 @@ func (l *FilesystemLog) open(ctx context.Context) error {
 	return nil
 }
 
-// listFiles returns the log files in the directory, sorted.
+// listFiles returns the log files in the directory, sorted, with files
+// superseded by a compacted file removed (a crash between writing the
+// compacted file and removing the originals leaves both).
 func (l *FilesystemLog) listFiles() ([]*logFile, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
@@ -301,29 +364,50 @@ func (l *FilesystemLog) listFiles() ([]*logFile, error) {
 		if e.IsDir() {
 			continue
 		}
-		first, err := filenameToRevision(e.Name())
+		first, last, sparse, err := parseFilename(e.Name())
 		if err != nil {
 			klog.Warningf("ignoring file with unexpected name %q: %v", e.Name(), err)
 			continue
 		}
-		files = append(files, &logFile{name: e.Name(), first: first})
+		files = append(files, &logFile{name: e.Name(), first: first, last: last, sparse: sparse})
 	}
-	slices.SortFunc(files, func(a, b *logFile) int { return int(a.first) - int(b.first) })
-	return files, nil
+	slices.SortFunc(files, func(a, b *logFile) int {
+		if a.first != b.first {
+			return int(a.first) - int(b.first)
+		}
+		// A compacted file sorts before the dense file it replaced.
+		if a.sparse != b.sparse {
+			if a.sparse {
+				return -1
+			}
+			return 1
+		}
+		return 0
+	})
+
+	var kept []*logFile
+	for _, f := range files {
+		if n := len(kept); n > 0 && kept[n-1].sparse && f.first >= kept[n-1].first && f.first <= kept[n-1].last {
+			klog.Infof("removing log file %s, superseded by compacted %s", f.name, kept[n-1].name)
+			if err := os.Remove(filepath.Join(l.dir, f.name)); err != nil {
+				return nil, fmt.Errorf("removing superseded log file %s: %w", f.name, err)
+			}
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept, nil
 }
 
 // reconcileArchive brings the directory and the archive into agreement: a
 // directory with no files is restored from the archive; otherwise every
-// archived file must be present locally (the archive is written only by
-// this log), and closed local files missing from the archive are uploaded.
+// archived file must be present locally or superseded by a local compacted
+// file (the archive is written only by this log), and closed local files
+// missing from the archive are uploaded.
 func (l *FilesystemLog) reconcileArchive(ctx context.Context, files []*logFile) ([]*logFile, error) {
 	names, err := l.opts.Archive.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing archive: %w", err)
-	}
-	archived := map[string]bool{}
-	for _, name := range names {
-		archived[name] = true
 	}
 
 	if len(files) == 0 && len(names) > 0 {
@@ -343,13 +427,29 @@ func (l *FilesystemLog) reconcileArchive(ctx context.Context, files []*logFile) 
 		local[f.name] = f
 	}
 	for _, name := range names {
-		f, ok := local[name]
-		if !ok {
-			return nil, fmt.Errorf("archive holds %s, which this log does not have; is another instance writing to the archive?", name)
+		if f, ok := local[name]; ok {
+			f.archived = true
+			continue
 		}
-		f.archived = true
+		first, _, _, err := parseFilename(name)
+		if err == nil && l.superseded(files, first) {
+			// Compaction replaced it locally but had not yet removed it.
+			l.archiveOps <- archiveOp{name: name, remove: true}
+			continue
+		}
+		return nil, fmt.Errorf("archive holds %s, which this log does not have; is another instance writing to the archive?", name)
 	}
 	return files, nil
+}
+
+// superseded reports whether a compacted file in files covers first.
+func (l *FilesystemLog) superseded(files []*logFile, first Revision) bool {
+	for _, f := range files {
+		if f.sparse && first >= f.first && first <= f.last {
+			return true
+		}
+	}
+	return false
 }
 
 // newActiveFile starts the file for revision lastRevision+1. Called with
@@ -374,7 +474,7 @@ func (l *FilesystemLog) newActiveFile() error {
 		f.Close()
 		return err
 	}
-	l.files = append(l.files, &logFile{name: name, first: first, size: int64(len(header)), opened: time.Now()})
+	l.files = append(l.files, &logFile{name: name, first: first, last: first - 1, size: int64(len(header)), opened: time.Now()})
 	l.spansMu.Lock()
 	l.spans[first] = nil
 	l.spansMu.Unlock()
@@ -387,10 +487,6 @@ func (l *FilesystemLog) Append(ctx context.Context, logRecord *LogRecord, txnMet
 	return l.batching.Add(ctx, logRecord, txnMeta)
 }
 
-type persistedBatch struct {
-	Records []*persistence.LogRecord
-}
-
 // commitBatch appends a batch to the active file, fsyncs it, and publishes
 // it. This is the commit point.
 func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revision, bc *batch.BatchCommit) error {
@@ -401,7 +497,7 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 	for i, txn := range bc.Transactions {
 		records[i] = txn.LogRecord
 	}
-	buf, spans, err := logcodec.AppendRecords(nil, records)
+	buf, spans, err := logcodec.AppendRecords(nil, lastLogPosition+1, records)
 	if err != nil {
 		return fmt.Errorf("failed to encode log records: %w", err)
 	}
@@ -436,6 +532,7 @@ func (l *FilesystemLog) commitBatch(ctx context.Context, lastLogPosition Revisio
 	active.count += len(records)
 	active.size += int64(len(buf))
 	l.lastRevision += Revision(len(records))
+	active.last = l.lastRevision
 	if l.listener != nil {
 		l.listener.OnLogEntry(l.lastRevision)
 	}
@@ -466,12 +563,12 @@ func (l *FilesystemLog) rotateLocked() error {
 	}
 	klog.V(2).Infof("rotated log file %s (%d records, %d bytes)", old.name, old.count, old.size)
 	if l.opts.Archive != nil {
-		l.uploads <- old.name
+		l.archiveOps <- archiveOp{name: old.name}
 	}
 	return nil
 }
 
-// rotator rotates the active file by age.
+// rotator rotates the active file by age, and unmaps retired mappings.
 func (l *FilesystemLog) rotator() {
 	defer close(l.rotatorDone)
 	ticker := time.NewTicker(time.Second)
@@ -492,35 +589,44 @@ func (l *FilesystemLog) rotator() {
 		}
 		l.mu.Unlock()
 		l.writeMu.Unlock()
+		l.unmapRetired(false)
 	}
 }
 
-// uploader copies closed files to the archive, retrying until each succeeds.
-// A conflict means another writer is using the archive, which is fatal.
+// uploader copies closed files to the archive and removes superseded ones,
+// retrying until each succeeds. A conflict means another writer is using
+// the archive, which is fatal.
 func (l *FilesystemLog) uploader(ctx context.Context) {
 	defer close(l.uploaderDone)
 	if l.opts.Archive == nil {
 		return
 	}
-	for name := range l.uploads {
+	for op := range l.archiveOps {
 		backoff := time.Second
 		for {
-			err := l.opts.Archive.Upload(ctx, name, filepath.Join(l.dir, name))
+			var err error
+			if op.remove {
+				err = l.opts.Archive.Delete(ctx, op.name)
+			} else {
+				err = l.opts.Archive.Upload(ctx, op.name, filepath.Join(l.dir, op.name))
+			}
 			if err == nil {
-				klog.V(2).Infof("archived log file %s", name)
-				l.mu.Lock()
-				for _, f := range l.files {
-					if f.name == name {
-						f.archived = true
+				if !op.remove {
+					klog.V(2).Infof("archived log file %s", op.name)
+					l.mu.Lock()
+					for _, f := range l.files {
+						if f.name == op.name {
+							f.archived = true
+						}
 					}
+					l.mu.Unlock()
 				}
-				l.mu.Unlock()
 				break
 			}
 			if errors.Is(err, persistence.ErrRevisionConflict) {
-				panic(fmt.Sprintf("archiving log file %s: %v", name, err))
+				panic(fmt.Sprintf("archiving log file %s: %v", op.name, err))
 			}
-			klog.Errorf("archiving log file %s (retrying in %s): %v", name, backoff, err)
+			klog.Errorf("archive operation on %s (retrying in %s): %v", op.name, backoff, err)
 			time.Sleep(backoff)
 			if backoff < 30*time.Second {
 				backoff *= 2
@@ -548,7 +654,7 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	if aliased {
 		// Decode in place, aliasing the key and value bytes rather than
 		// copying them. Not cached: the cache is for the write-recent set,
-		// and a cached alias would pin the mapping.
+		// and a cached alias would pin the mapping past compaction.
 		record, err := logcodec.DecodeMessageAlias(m)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
@@ -575,7 +681,6 @@ func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, 
 	if !ok {
 		return nil, false, fmt.Errorf("log entry for revision %d not found in any file", revision)
 	}
-	pos := int(revision - f.first)
 
 	if !active {
 		m, err := l.mapping(f)
@@ -587,8 +692,9 @@ func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, 
 			if err != nil {
 				return nil, false, err
 			}
-			if pos < 0 || pos >= len(spans) {
-				return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+			pos, err := f.position(revision, len(spans))
+			if err != nil {
+				return nil, false, err
 			}
 			span := spans[pos]
 			return m[span.Offset : span.Offset+span.Length], true, nil
@@ -599,8 +705,9 @@ func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, 
 	if err != nil {
 		return nil, false, err
 	}
-	if pos < 0 || pos >= len(spans) {
-		return nil, false, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
+	pos, err := f.position(revision, len(spans))
+	if err != nil {
+		return nil, false, err
 	}
 	span := spans[pos]
 	file, err := l.reader(f)
@@ -612,6 +719,23 @@ func (l *FilesystemLog) recordBytes(revision Revision) (m []byte, aliased bool, 
 		return nil, false, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
 	}
 	return buf, false, nil
+}
+
+// position returns the index of revision's record in the file, or
+// ErrCompacted if the file is sparse and compaction dropped it.
+func (f *logFile) position(revision Revision, count int) (int, error) {
+	if !f.sparse {
+		pos := int(revision - f.first)
+		if pos < 0 || pos >= count {
+			return 0, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, count)
+		}
+		return pos, nil
+	}
+	pos := sort.Search(len(f.revisions), func(i int) bool { return f.revisions[i] >= revision })
+	if pos >= len(f.revisions) || f.revisions[pos] != revision {
+		return 0, fmt.Errorf("revision %d: %w", revision, persistence.ErrCompacted)
+	}
+	return pos, nil
 }
 
 // mapping returns a closed file's memory mapping, creating it on first use
@@ -658,24 +782,6 @@ func (l *FilesystemLog) readerLocked(f *logFile) (*os.File, error) {
 	return f.reader, nil
 }
 
-// fileSpansFrom is fileSpans for a file whose bytes are already at hand.
-func (l *FilesystemLog) fileSpansFrom(f *logFile, data []byte) ([]logcodec.Span, error) {
-	l.spansMu.Lock()
-	spans, ok := l.spans[f.first]
-	l.spansMu.Unlock()
-	if ok {
-		return spans, nil
-	}
-	spans, err := logcodec.Offsets(data)
-	if err != nil {
-		return nil, fmt.Errorf("indexing log file %s: %w", f.name, err)
-	}
-	l.spansMu.Lock()
-	l.spans[f.first] = spans
-	l.spansMu.Unlock()
-	return spans, nil
-}
-
 // fileSpans returns the record spans of a file, scanning its length
 // prefixes on first use for closed files.
 func (l *FilesystemLog) fileSpans(f *logFile) ([]logcodec.Span, error) {
@@ -689,7 +795,18 @@ func (l *FilesystemLog) fileSpans(f *logFile) ([]logcodec.Span, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read log file %s: %w", f.name, err)
 	}
-	spans, err = logcodec.Offsets(data)
+	return l.fileSpansFrom(f, data)
+}
+
+// fileSpansFrom is fileSpans for a file whose bytes are already at hand.
+func (l *FilesystemLog) fileSpansFrom(f *logFile, data []byte) ([]logcodec.Span, error) {
+	l.spansMu.Lock()
+	spans, ok := l.spans[f.first]
+	l.spansMu.Unlock()
+	if ok {
+		return spans, nil
+	}
+	spans, _, err := logcodec.Offsets(data)
 	if err != nil {
 		return nil, fmt.Errorf("indexing log file %s: %w", f.name, err)
 	}
@@ -699,13 +816,13 @@ func (l *FilesystemLog) fileSpans(f *logFile) ([]logcodec.Span, error) {
 	return spans, nil
 }
 
-// findFile finds the file containing revision. Called with mu held.
+// findFile finds the file covering revision. Called with mu held.
 func (l *FilesystemLog) findFile(revision Revision) (*logFile, bool) {
 	// Recent revisions are the most requested; search from the end.
 	for i := len(l.files) - 1; i >= 0; i-- {
 		f := l.files[i]
 		if f.first <= revision {
-			return f, revision <= f.last()
+			return f, revision <= f.last
 		}
 	}
 	return nil, false
@@ -722,7 +839,7 @@ func (l *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 	l.mu.RUnlock()
 
 	for i, f := range files {
-		if f.count == 0 || f.last() < fromRevision {
+		if f.count == 0 || f.last < fromRevision {
 			continue
 		}
 		// Read only what was published; the active file may be growing.
@@ -736,21 +853,227 @@ func (l *FilesystemLog) Read(ctx context.Context, fromRevision Revision, callbac
 		if err != nil {
 			return fmt.Errorf("failed to read log file %s: %w", f.name, err)
 		}
-		records, err := logcodec.Decode(data)
+		spans, revisions, err := logcodec.Offsets(data)
 		if err != nil {
 			return fmt.Errorf("failed to decode log file %s: %w", f.name, err)
 		}
-		for j, record := range records {
-			revision := f.first + Revision(j)
-			if revision < fromRevision {
+		for j, span := range spans {
+			if revisions[j] < fromRevision {
 				continue
 			}
-			if !callback(revision, record) {
+			record, err := logcodec.DecodeMessage(data[span.Offset : span.Offset+span.Length])
+			if err != nil {
+				return fmt.Errorf("failed to decode log record %d from file %s: %w", revisions[j], f.name, err)
+			}
+			if !callback(revisions[j], record) {
 				return nil
 			}
 		}
 	}
 	return nil
+}
+
+// Compact rewrites the closed files at or below through, keeping only their
+// live records: puts that live(key, revision) confirms are still the latest
+// for their key. Deletes and superseded puts are dropped. Files are merged
+// while the result stays under RotateBytes; a compacted file that is still
+// mostly live is left alone. The originals are removed (from the archive
+// too) once the replacement is durable.
+func (l *FilesystemLog) Compact(ctx context.Context, through Revision, live func(key []byte, revision Revision) bool) error {
+	l.compactMu.Lock()
+	defer l.compactMu.Unlock()
+
+	l.mu.RLock()
+	var eligible []*logFile
+	for _, f := range l.files[:len(l.files)-1] {
+		if f.last <= through {
+			eligible = append(eligible, f)
+		}
+	}
+	l.mu.RUnlock()
+
+	// Group consecutive files by their live bytes so that each output stays
+	// under RotateBytes: a dense file that is mostly dead merges with its
+	// neighbours; a mostly live one stays on its own.
+	var group []*logFile
+	var groupBytes int64
+	flush := func() error {
+		if len(group) == 0 {
+			return nil
+		}
+		err := l.compactGroup(ctx, group, live)
+		group, groupBytes = nil, 0
+		return err
+	}
+	for _, f := range eligible {
+		var liveBytes int64
+		if _, err := l.liveRecords(f, live, func(m []byte, rev Revision) { liveBytes += int64(len(m)) + 4 }); err != nil {
+			return err
+		}
+		if groupBytes > 0 && groupBytes+liveBytes > l.opts.RotateBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		group = append(group, f)
+		groupBytes += liveBytes
+	}
+	return flush()
+}
+
+// compactGroup replaces a run of consecutive closed files with one file
+// holding their live records.
+func (l *FilesystemLog) compactGroup(ctx context.Context, group []*logFile, live func(key []byte, revision Revision) bool) error {
+	first, last := group[0].first, group[len(group)-1].last
+	name := rangeToFilename(first, last)
+	if len(group) == 1 && group[0].name == name {
+		// Already compacted into this exact file; see whether it has rotted.
+		if dead, err := l.liveRecords(group[0], live, nil); err != nil {
+			return err
+		} else if dead*10 < group[0].count {
+			return nil
+		}
+	}
+
+	buf := append([]byte(nil), logcodec.Header()...)
+	var revisions []Revision
+	var spans []logcodec.Span
+	var kept int
+	for _, f := range group {
+		if _, err := l.liveRecords(f, live, func(m []byte, rev Revision) {
+			var span logcodec.Span
+			buf, span = logcodec.AppendRaw(buf, m)
+			spans = append(spans, span)
+			revisions = append(revisions, rev)
+			kept++
+		}); err != nil {
+			return err
+		}
+	}
+
+	tmp := filepath.Join(l.dir, name+".tmp")
+	if err := os.WriteFile(tmp, buf, 0644); err != nil {
+		return fmt.Errorf("writing compacted log file %s: %w", name, err)
+	}
+	if err := syncFile(tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(l.dir, name)); err != nil {
+		return fmt.Errorf("renaming compacted log file %s: %w", name, err)
+	}
+	if err := syncDir(l.dir); err != nil {
+		return err
+	}
+	compacted := &logFile{name: name, first: first, last: last, sparse: true, revisions: revisions, count: kept, size: int64(len(buf)), opened: time.Now(), archived: false}
+
+	// Swap it into the index, retire the originals' mappings, and remove
+	// the originals.
+	l.mu.Lock()
+	i := slices.Index(l.files, group[0])
+	l.files = slices.Replace(l.files, i, i+len(group), compacted)
+	l.spansMu.Lock()
+	for _, f := range group {
+		delete(l.spans, f.first)
+	}
+	l.spans[first] = spans
+	l.spansMu.Unlock()
+	l.mu.Unlock()
+
+	l.mapMu.Lock()
+	for _, f := range group {
+		if f.mapped != nil {
+			l.retired = append(l.retired, retiredMapping{mapped: f.mapped, at: time.Now()})
+			f.mapped = nil
+		}
+		if f.reader != nil && f.name != name {
+			f.reader.Close()
+			f.reader = nil
+		}
+	}
+	l.mapMu.Unlock()
+
+	var oldBytes int64
+	for _, f := range group {
+		oldBytes += f.size
+		if f.name == name {
+			continue
+		}
+		if err := os.Remove(filepath.Join(l.dir, f.name)); err != nil {
+			klog.Errorf("removing compacted-away log file %s: %v", f.name, err)
+		}
+	}
+	klog.V(1).Infof("compacted %d file(s) covering revisions %d-%d into %s: %d records kept, %d MB -> %d MB",
+		len(group), first, last, name, kept, oldBytes>>20, compacted.size>>20)
+
+	if l.opts.Archive != nil {
+		l.archiveOps <- archiveOp{name: name}
+		for _, f := range group {
+			if f.name != name {
+				l.archiveOps <- archiveOp{name: f.name, remove: true}
+			}
+		}
+	}
+	return nil
+}
+
+// liveRecords scans a closed file, calling keep for each live record with
+// its raw bytes and revision, and returns the number of records dropped. A
+// record is live if any of its puts is still the latest for its key;
+// deletes are never live.
+func (l *FilesystemLog) liveRecords(f *logFile, live func(key []byte, revision Revision) bool, keep func(m []byte, rev Revision)) (int, error) {
+	data, err := l.mapping(f)
+	if err != nil {
+		return 0, err
+	}
+	if data == nil {
+		if data, err = os.ReadFile(filepath.Join(l.dir, f.name)); err != nil {
+			return 0, fmt.Errorf("failed to read log file %s: %w", f.name, err)
+		}
+	}
+	spans, revisions, err := logcodec.Offsets(data)
+	if err != nil {
+		return 0, fmt.Errorf("indexing log file %s: %w", f.name, err)
+	}
+	dropped := 0
+	for i, span := range spans {
+		m := data[span.Offset : span.Offset+span.Length]
+		record, err := logcodec.DecodeMessageAlias(m)
+		if err != nil {
+			return 0, fmt.Errorf("failed to decode log record %d from file %s: %w", revisions[i], f.name, err)
+		}
+		isLive := false
+		for _, ev := range record.Events {
+			if ev.Type == mvccpb.PUT && live(ev.Kv.Key, revisions[i]) {
+				isLive = true
+				break
+			}
+		}
+		if !isLive {
+			dropped++
+			continue
+		}
+		if keep != nil {
+			keep(m, revisions[i])
+		}
+	}
+	return dropped, nil
+}
+
+// unmapRetired unmaps mappings retired long enough ago (or all of them).
+func (l *FilesystemLog) unmapRetired(all bool) {
+	l.mapMu.Lock()
+	defer l.mapMu.Unlock()
+	kept := l.retired[:0]
+	for _, r := range l.retired {
+		if all || time.Since(r.at) >= unmapAfter {
+			if err := munmapFile(r.mapped); err != nil {
+				klog.Errorf("unmapping retired log file: %v", err)
+			}
+			continue
+		}
+		kept = append(kept, r)
+	}
+	l.retired = kept
 }
 
 // Close flushes queued transactions, rotates the active file so that
@@ -776,13 +1099,14 @@ func (l *FilesystemLog) Close() error {
 	l.mu.Unlock()
 	l.writeMu.Unlock()
 
-	close(l.uploads)
+	close(l.archiveOps)
 	select {
 	case <-l.uploaderDone:
 	case <-time.After(30 * time.Second):
-		klog.Warningf("log closed with uploads still pending; they will resume on the next start")
+		klog.Warningf("log closed with archive operations still pending; they will resume on the next start")
 	}
 
+	l.unmapRetired(true)
 	l.mapMu.Lock()
 	for _, f := range l.files {
 		if err := munmapFile(f.mapped); err != nil {
@@ -813,6 +1137,16 @@ func (l *FilesystemLog) SetListener(listener LogListener) {
 	l.listener = listener
 }
 
+// syncFile fsyncs a file.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // syncDir fsyncs a directory so that new directory entries are durable.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
@@ -823,19 +1157,35 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
-// revisionToFilename names the file whose first record has this revision.
+// revisionToFilename names a dense file by its first revision.
 func revisionToFilename(first Revision) string {
 	return fmt.Sprintf("%016x.log", uint64(first))
 }
 
-// filenameToRevision is the inverse of revisionToFilename.
-func filenameToRevision(filename string) (Revision, error) {
+// rangeToFilename names a compacted file by the revision range it covers.
+func rangeToFilename(first, last Revision) string {
+	return fmt.Sprintf("%016x-%016x.log", uint64(first), uint64(last))
+}
+
+// parseFilename is the inverse of revisionToFilename and rangeToFilename.
+// A dense file's last revision is not in its name (it is derived from its
+// record count) and is returned as 0.
+func parseFilename(filename string) (first, last Revision, sparse bool, err error) {
 	if !strings.HasSuffix(filename, ".log") {
-		return 0, fmt.Errorf("invalid filename format: %s", filename)
+		return 0, 0, false, fmt.Errorf("invalid filename format: %s", filename)
 	}
-	n, err := strconv.ParseUint(strings.TrimSuffix(filename, ".log"), 16, 64)
+	base := strings.TrimSuffix(filename, ".log")
+	parts := strings.SplitN(base, "-", 2)
+	f, err := strconv.ParseUint(parts[0], 16, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid filename format: %s", filename)
+		return 0, 0, false, fmt.Errorf("invalid filename format: %s", filename)
 	}
-	return Revision(n), nil
+	if len(parts) == 1 {
+		return Revision(f), 0, false, nil
+	}
+	l, err := strconv.ParseUint(parts[1], 16, 64)
+	if err != nil || l < f {
+		return 0, 0, false, fmt.Errorf("invalid filename format: %s", filename)
+	}
+	return Revision(f), Revision(l), true, nil
 }

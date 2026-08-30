@@ -231,3 +231,48 @@ func shuffled(s []string, seed int64) []string {
 	rand.New(rand.NewSource(seed)).Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
 	return out
 }
+
+// TestCompact checks that compaction keeps what a read at or after the
+// compaction revision can observe, drops the rest, and removes keys whose
+// latest revision is a delete below it.
+func TestCompact(t *testing.T) {
+	var tree BPTree
+	tree.AddRevision([]byte("a"), 1)
+	tree.AddRevision([]byte("a"), 5)
+	tree.AddRevision([]byte("a"), 9)
+	tree.AddRevision([]byte("b"), 2)
+	tree.AddTombstone([]byte("b"), 6)
+	tree.AddRevision([]byte("c"), 3)
+	tree.AddTombstone([]byte("c"), 12)
+	tree.AddRevision([]byte("d"), 4)
+	tree.AddRevision([]byte("d"), 11)
+
+	removed, dropped := tree.Compact(8)
+	// b is gone (2 revisions); a drops 1; c and d keep their latest below 8.
+	if removed != 1 || dropped != 3 {
+		t.Fatalf("Compact(8) removed %d keys, dropped %d revisions; want 1, 3", removed, dropped)
+	}
+	if tree.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", tree.Len())
+	}
+	if got, ok := tree.GetLatestRevisionByKey([]byte("a"), 8); !ok || got != 5 {
+		t.Errorf("a at 8 = %d,%v want 5", got, ok)
+	}
+	if _, ok := tree.GetLatestRevisionByKey([]byte("a"), 1); ok {
+		t.Errorf("a at 1 should be gone (compacted)")
+	}
+	if _, ok := tree.GetLatestRevisionByKey([]byte("b"), 100); ok {
+		t.Errorf("b was deleted below the compaction revision and should be gone")
+	}
+	if got, ok := tree.GetLatestRevisionByKey([]byte("c"), 100); !ok || got != 12 {
+		t.Errorf("c = %d,%v want tombstone at 12", got, ok)
+	}
+	var keys []string
+	tree.ListRevisionsByKeyRange(nil, 100, func(key []byte, revisions []Revision) bool {
+		keys = append(keys, string(key)+fmt.Sprint(revisions))
+		return true
+	})
+	if fmt.Sprint(keys) != "[a[5 9] c[3 12] d[4 11]]" {
+		t.Errorf("after compaction: %v", keys)
+	}
+}

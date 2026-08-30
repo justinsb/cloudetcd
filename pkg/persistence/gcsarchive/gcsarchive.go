@@ -135,6 +135,15 @@ func (a *Archive) explainWriteError(ctx context.Context, obj *storage.ObjectHand
 		name, attrs.Size, attrs.CRC32C, size, crc, persistence.ErrRevisionConflict)
 }
 
+// Delete removes object name; a missing object is not an error.
+func (a *Archive) Delete(ctx context.Context, name string) error {
+	err := a.bucket.Object(a.prefix + name).Delete(ctx)
+	if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
+		return nil
+	}
+	return fmt.Errorf("deleting %s from GCS: %w", name, err)
+}
+
 // Download copies object name to the file at path.
 func (a *Archive) Download(ctx context.Context, name string, path string) error {
 	r, err := a.bucket.Object(a.prefix + name).NewReader(ctx)

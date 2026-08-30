@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -322,10 +323,18 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 
 // Compact implements the Compact RPC method
 func (s *Server) Compact(ctx context.Context, req *etcdserverpb.CompactionRequest) (*etcdserverpb.CompactionResponse, error) {
-	// For now, return success without actual compaction
-	// In a full implementation, we'd need to implement actual compaction logic
+	current, err := s.storage.GetCurrentRevision(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if storage.Revision(req.Revision) > current {
+		return nil, rpctypes.ErrGRPCFutureRev
+	}
+	if _, err := s.storage.Compact(ctx, storage.Revision(req.Revision)); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
 	return &etcdserverpb.CompactionResponse{
-		Header: s.createHeader(storage.Revision(req.Revision)),
+		Header: s.createHeader(current),
 	}, nil
 }
 

@@ -109,6 +109,19 @@ func TestArchive(t *testing.T) {
 		t.Fatalf("upload of a different file under an existing name: got %v, want ErrRevisionConflict", err)
 	}
 
+	if err := a.Delete(ctx, "0000000000000002.log"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Delete(ctx, "0000000000000002.log"); err != nil {
+		t.Fatalf("deleting a missing object should succeed: %v", err)
+	}
+	if names, _ := a.List(ctx); fmt.Sprint(names) != "[0000000000000001.log]" {
+		t.Fatalf("after delete: %v", names)
+	}
+	if err := a.Upload(ctx, "0000000000000002.log", two); err != nil {
+		t.Fatal(err)
+	}
+
 	got := filepath.Join(dir, "restored.log")
 	if err := a.Download(ctx, "0000000000000002.log", got); err != nil {
 		t.Fatal(err)
@@ -214,4 +227,83 @@ func TestLogArchivesAndRestores(t *testing.T) {
 		t.Fatal("a log with its own files opened against an archive holding other files")
 	}
 	_ = time.Second
+}
+
+// TestCompactionReplacesArchivedFiles checks that compacting a log with an
+// archive uploads the compacted file and removes the originals from the
+// archive, and that a fresh directory restores from the compacted archive.
+func TestCompactionReplacesArchivedFiles(t *testing.T) {
+	startEmulator(t, "cloudetcd-test")
+	ctx := t.Context()
+	a, err := New(ctx, "cloudetcd-test", "logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	opts := filesystemlog.Options{Archive: a, RotateBytes: 300, CacheBytes: 1}
+	log1, err := filesystemlog.NewFilesystemLogWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := map[string]persistence.Revision{}
+	for round := 0; round < 10; round++ {
+		for k := 0; k < 5; k++ {
+			key := fmt.Sprintf("k%d", k)
+			snapshot, _ := log1.GetCurrentRevision(ctx)
+			meta := persistence.NewTxnMeta(snapshot)
+			meta.AddWrite(key)
+			rev, ok, err := log1.Append(ctx, put(key), meta)
+			if err != nil || !ok {
+				t.Fatalf("append %s round %d: ok=%v err=%v", key, round, ok, err)
+			}
+			latest[key] = rev
+		}
+	}
+	head, _ := log1.GetCurrentRevision(ctx)
+	// Rotate so everything is closed and archived before compacting.
+	if err := log1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := log1.Dir()
+	log1, err = filesystemlog.NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := a.List(ctx)
+	if err := log1.Compact(ctx, head, func(key []byte, rev persistence.Revision) bool { return latest[string(key)] == rev }); err != nil {
+		t.Fatal(err)
+	}
+	if err := log1.Close(); err != nil { // waits for archive operations
+		t.Fatal(err)
+	}
+	after, _ := a.List(ctx)
+	if len(after) >= len(before) {
+		t.Fatalf("archive has %d files after compaction (was %d); expected the originals replaced", len(after), len(before))
+	}
+	var sparse int
+	for _, n := range after {
+		if strings.Contains(n, "-") {
+			sparse++
+		}
+	}
+	if sparse == 0 {
+		t.Fatalf("no compacted file in the archive: %v", after)
+	}
+
+	// A fresh directory restores the compacted archive and has the live state.
+	log2, err := filesystemlog.NewFilesystemLogWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatalf("restoring a compacted archive: %v", err)
+	}
+	defer log2.Close()
+	if rev, _ := log2.GetCurrentRevision(ctx); rev != head {
+		t.Fatalf("restored log at revision %d, want %d", rev, head)
+	}
+	for key, rev := range latest {
+		rec, err := log2.GetLogEntry(rev)
+		if err != nil || string(rec.Events[0].Kv.Key) != key {
+			t.Fatalf("GetLogEntry(%d) for %s after restore: %v, %v", rev, key, rec, err)
+		}
+	}
 }

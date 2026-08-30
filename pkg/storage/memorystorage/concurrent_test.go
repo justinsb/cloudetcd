@@ -22,6 +22,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
+	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
@@ -183,5 +184,91 @@ func TestConcurrentWritesToDistinctKeys(t *testing.T) {
 		if kv.Version != 2 || string(kv.Value) != "b" {
 			t.Errorf("%s: version %d value %q", kv.Key, kv.Version, kv.Value)
 		}
+	}
+}
+
+// TestStorageCompact drives compaction through the storage: overwritten and
+// deleted keys, an open watcher that must not be cut off, then the log is
+// reopened and the state is what it was.
+func TestStorageCompact(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	newStore := func() *MemoryStorage {
+		t.Helper()
+		lg, err := filesystemlog.NewFilesystemLogWithOptions(dir, filesystemlog.Options{RotateBytes: 4000, CacheBytes: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewMemoryStorage(lg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	store := newStore()
+
+	for round := 0; round < 20; round++ {
+		for k := 0; k < 10; k++ {
+			key := fmt.Sprintf("/k/%02d", k)
+			if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte(key), Value: []byte(fmt.Sprintf("v%d", round))}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for k := 0; k < 10; k += 2 {
+		if _, err := store.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte(fmt.Sprintf("/k/%02d", k))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A watcher that has delivered up to some revision holds the compaction
+	// floor at that revision.
+	watchFrom, _ := store.GetCurrentRevision(ctx)
+	head := watchFrom
+	compactedTo, err := store.Compact(ctx, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compactedTo != head {
+		t.Fatalf("compacted to %d, want %d", compactedTo, head)
+	}
+
+	expect := func(store *MemoryStorage) {
+		t.Helper()
+		list, err := store.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list.Kvs) != 5 {
+			t.Fatalf("list has %d keys, want 5 (odd ones)", len(list.Kvs))
+		}
+		for _, kv := range list.Kvs {
+			if string(kv.Value) != "v19" || kv.Version != 20 {
+				t.Fatalf("%s = %s (version %d), want v19 (version 20)", kv.Key, kv.Value, kv.Version)
+			}
+		}
+		for k := 0; k < 10; k += 2 {
+			resp, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte(fmt.Sprintf("/k/%02d", k))})
+			if err != nil || len(resp.Kvs) != 0 {
+				t.Fatalf("deleted key %02d: %v %v", k, resp.GetKvs(), err)
+			}
+		}
+	}
+	expect(store)
+	store.WaitForCompaction()
+	if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("/k/01"), Value: []byte("after")}); err != nil {
+		t.Fatal(err)
+	}
+	store.GracefulStop()
+	store.log.Close()
+
+	store2 := newStore()
+	defer store2.log.Close()
+	resp, err := store2.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/01")})
+	if err != nil || len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != "after" || resp.Kvs[0].Version != 21 {
+		t.Fatalf("after reopen, /k/01 = %v (%v)", resp.GetKvs(), err)
+	}
+	list, _ := store2.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0")})
+	if len(list.Kvs) != 5 {
+		t.Fatalf("after reopen, list has %d keys, want 5", len(list.Kvs))
 	}
 }

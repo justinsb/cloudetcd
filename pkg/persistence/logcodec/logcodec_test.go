@@ -46,7 +46,7 @@ func batch(n int) []*persistence.LogRecord {
 
 func TestRoundTrip(t *testing.T) {
 	in := batch(50)
-	data, err := Encode(in)
+	data, err := Encode(1, in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestRoundTrip(t *testing.T) {
 	if _, err := Decode([]byte(`{"Records":[]}`)); err == nil {
 		t.Error("decoded a JSON batch as valid")
 	}
-	if _, err := Decode(data[:len(data)-5]); err == nil {
+	if _, err := Decode(data[:len(data)-3]); err == nil {
 		t.Error("decoded a truncated batch as valid")
 	}
 	if out, err := Decode(data[:len(magic)]); err != nil || len(out) != 0 {
@@ -80,7 +80,7 @@ func TestRoundTrip(t *testing.T) {
 
 func TestDecodeRecord(t *testing.T) {
 	in := batch(50)
-	data, err := Encode(in)
+	data, err := Encode(1, in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,23 +101,28 @@ func TestDecodeRecord(t *testing.T) {
 	if _, err := DecodeRecord(data, len(in)); err == nil {
 		t.Error("decoded a record past the end of the batch")
 	}
-	if _, err := DecodeRecord(data[:len(data)-5], len(in)-1); err == nil {
+	if _, err := DecodeRecord(data[:len(data)-3], len(in)-1); err == nil {
 		t.Error("decoded the last record of a truncated batch")
 	}
 }
 
 func TestOffsets(t *testing.T) {
 	in := batch(50)
-	data, err := Encode(in)
+	data, err := Encode(1, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	spans, err := Offsets(data)
+	spans, revisions, err := Offsets(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(spans) != len(in) {
 		t.Fatalf("%d spans, want %d", len(spans), len(in))
+	}
+	for i, r := range revisions {
+		if r != persistence.Revision(i+1) {
+			t.Fatalf("record %d has revision %d, want %d", i, r, i+1)
+		}
 	}
 	for i, sp := range spans {
 		got, err := DecodeMessage(data[sp.Offset : sp.Offset+sp.Length])
@@ -133,18 +138,27 @@ func TestOffsets(t *testing.T) {
 			}
 		}
 	}
-	if _, err := Offsets(data[:len(data)-5]); err == nil {
+	if _, _, err := Offsets(data[:len(data)-3]); err == nil {
 		t.Error("offsets of a truncated batch succeeded")
+	}
+
+	// A sparse file: explicit revisions survive a scan.
+	sparse, _, err := AppendRecordsAt(append([]byte(nil), Header()...), []persistence.Revision{3, 7, 500}, in[:3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, revs, err := Offsets(sparse); err != nil || fmt.Sprint(revs) != "[3 7 500]" {
+		t.Fatalf("sparse revisions = %v, %v", revs, err)
 	}
 }
 
 func TestDecodeMessageAlias(t *testing.T) {
 	in := batch(50)
-	data, err := Encode(in)
+	data, err := Encode(1, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	spans, err := Offsets(data)
+	spans, _, err := Offsets(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,8 +189,8 @@ func TestDecodeMessageAlias(t *testing.T) {
 }
 
 func BenchmarkDecodeMessageAlias(b *testing.B) {
-	data, _ := Encode(batch(500))
-	spans, _ := Offsets(data)
+	data, _ := Encode(1, batch(500))
+	spans, _, _ := Offsets(data)
 	sp := spans[250]
 	m := data[sp.Offset : sp.Offset+sp.Length]
 	b.ReportAllocs()
@@ -188,8 +202,8 @@ func BenchmarkDecodeMessageAlias(b *testing.B) {
 }
 
 func BenchmarkDecodeMessage(b *testing.B) {
-	data, _ := Encode(batch(500))
-	spans, _ := Offsets(data)
+	data, _ := Encode(1, batch(500))
+	spans, _, _ := Offsets(data)
 	sp := spans[250]
 	m := data[sp.Offset : sp.Offset+sp.Length]
 	b.ReportAllocs()
@@ -201,7 +215,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 }
 
 func BenchmarkDecodeRecord(b *testing.B) {
-	data, _ := Encode(batch(500))
+	data, _ := Encode(1, batch(500))
 	for i := 0; i < b.N; i++ {
 		if _, err := DecodeRecord(data, 250); err != nil {
 			b.Fatal(err)
@@ -212,14 +226,14 @@ func BenchmarkDecodeRecord(b *testing.B) {
 func BenchmarkEncode(b *testing.B) {
 	records := batch(500)
 	for i := 0; i < b.N; i++ {
-		if _, err := Encode(records); err != nil {
+		if _, err := Encode(1, records); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkDecode(b *testing.B) {
-	data, _ := Encode(batch(500))
+	data, _ := Encode(1, batch(500))
 	b.SetBytes(int64(len(data)))
 	for i := 0; i < b.N; i++ {
 		if _, err := Decode(data); err != nil {

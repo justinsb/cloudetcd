@@ -25,6 +25,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"justinsb.com/cloudetcd/pkg/api"
+	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/logfactory"
 	"justinsb.com/cloudetcd/pkg/storage/memorystorage"
 )
@@ -35,6 +36,8 @@ type Server struct {
 	Addr string
 	// Store is the server's storage, for diagnostics.
 	Store *memorystorage.MemoryStorage
+	// LogDir is the log's directory, for measuring what it uses on disk.
+	LogDir string
 
 	server *api.Server
 	cancel context.CancelFunc
@@ -64,6 +67,7 @@ func Start(ctx context.Context, logURI string, opts ...api.Option) (*Server, err
 	s := &Server{
 		Addr:   addr,
 		Store:  store,
+		LogDir: lg.(*filesystemlog.FilesystemLog).Dir(),
 		server: api.NewServer(store, opts...),
 		cancel: cancel,
 		done:   make(chan error, 1),

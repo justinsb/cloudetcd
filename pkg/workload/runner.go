@@ -49,6 +49,9 @@ type Runner struct {
 	// samples it to report how far behind the log head the server-side
 	// watchers get, separately from what the client receives.
 	WatcherStatus func() []storage.WatcherStatus
+	// LogBytes, if set, reports what the log uses on disk; reported per
+	// phase.
+	LogBytes func() int64
 
 	exec   *executor
 	state  *stateMap

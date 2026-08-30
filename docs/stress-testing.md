@@ -96,6 +96,10 @@ The last row matters: 100k nodes is not 100k watches. It is a handful of
 prefix watches each receiving 10k events/s. So the interesting numbers are
 write throughput, watch event throughput and watch lag — not watcher count.
 
+### Compaction
+
+The model issues `Compact` every 5 minutes as the apiserver does (`-compact-interval` shortens that). The server prunes its index to each key's latest version at or below the compaction point, drops deleted keys, and rewrites closed log files in the background keeping only live records (a compacted file is sparse in revision and named by the range it covers). The report's `log … MB on disk` per phase is how to see it: with compaction the log settles at the live set plus one interval's tail; without it the log grows at the write rate.
+
 ## The gated stress test
 
 `tests/stress` runs the same phases against an in-process server and fails
