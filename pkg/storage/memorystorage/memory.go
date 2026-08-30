@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -38,6 +39,10 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	revisions bptree.BPTree
+
+	// compacted is the revision history has been discarded through.
+	compacted Revision
+	compactWG sync.WaitGroup
 
 	// applied is the highest log revision whose events have been applied to
 	// revisions (and the lease manager). Records are committed by the log's
@@ -112,11 +117,11 @@ func (m *MemoryStorage) ReplayLog(ctx context.Context) error {
 			switch event.Type {
 			case mvccpb.PUT:
 				// Replay PUT operation
-				m.revisions.AddRevision(event.Kv.Key, revision)
+				m.revisions.AddRevision(event.Kv.Key, revision, false)
 
 			case mvccpb.DELETE:
 				// Replay DELETE operation
-				m.revisions.AddRevision(event.Kv.Key, revision)
+				m.revisions.AddRevision(event.Kv.Key, revision, true)
 
 			default:
 				// Skip unknown operations
@@ -162,8 +167,10 @@ func (m *MemoryStorage) applyUpTo(ctx context.Context, rev Revision) error {
 		}
 		for _, event := range record.Events {
 			switch event.Type {
-			case mvccpb.PUT, mvccpb.DELETE:
-				m.revisions.AddRevision(event.Kv.Key, r)
+			case mvccpb.PUT:
+				m.revisions.AddRevision(event.Kv.Key, r, false)
+			case mvccpb.DELETE:
+				m.revisions.AddRevision(event.Kv.Key, r, true)
 			default:
 				klog.Fatalf("unknown operation: %s", event.Type)
 			}
@@ -967,6 +974,72 @@ func createHeader(revision Revision) *etcdserverpb.ResponseHeader {
 		Revision:  int64(revision),
 		RaftTerm:  1, // Simple term
 	}
+}
+
+// Compact discards history at or below revision. The revision is lowered if
+// an open watcher has not yet delivered past it, so that watchers are not
+// cut off; it is then applied to the index (each key keeps its latest
+// write at or below the point, and keys whose latest write is a delete go)
+// and to the log (files below the point are rewritten with only the
+// records the index still refers to).
+func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revision, error) {
+	m.mu.Lock()
+	through := revision
+	if through > m.applied {
+		through = m.applied
+	}
+	m.watcherMu.RLock()
+	for _, w := range m.watchers {
+		w.stateMutex.Lock()
+		closed := w.closed
+		w.stateMutex.Unlock()
+		if closed {
+			continue
+		}
+		if delivered := Revision(w.delivered.Load()); delivered < through {
+			through = delivered
+		}
+	}
+	m.watcherMu.RUnlock()
+	if through <= m.compacted {
+		m.mu.Unlock()
+		return m.compacted, nil
+	}
+	keysRemoved, revisionsDropped := m.revisions.Compact(through)
+	m.compacted = through
+	m.mu.Unlock()
+	klog.V(1).Infof("compacted index through revision %d: %d keys removed, %d revisions dropped", through, keysRemoved, revisionsDropped)
+
+	// The log rewrite runs in the background: it reads closed files and
+	// takes seconds at scale, and nothing waits on it. The log serializes
+	// compactions, so overlapping requests queue.
+	// A record is live if it is a key's state as of the compaction point:
+	// its latest put or delete at or below through, which is what the index
+	// kept. Not simply the key's latest revision: a read at a revision
+	// between the point and a later write of the key still needs it.
+	live := func(key []byte, rev Revision) bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		latest, ok := m.revisions.GetLatestRevisionByKey(key, through)
+		return ok && latest == rev
+	}
+	m.compactWG.Add(1)
+	go func() {
+		defer m.compactWG.Done()
+		start := time.Now()
+		if err := m.log.Compact(context.Background(), through, live); err != nil {
+			klog.Errorf("compacting log through revision %d: %v", through, err)
+			return
+		}
+		klog.V(1).Infof("compacted log through revision %d in %s", through, time.Since(start).Round(time.Millisecond))
+	}()
+	return through, nil
+}
+
+// WaitForCompaction blocks until background log compactions have finished,
+// for tests.
+func (m *MemoryStorage) WaitForCompaction() {
+	m.compactWG.Wait()
 }
 
 // GracefulStop stops the storage gracefully.

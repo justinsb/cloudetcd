@@ -17,11 +17,13 @@ package memorystorage
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
+	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/memorylog"
 )
 
@@ -183,5 +185,179 @@ func TestConcurrentWritesToDistinctKeys(t *testing.T) {
 		if kv.Version != 2 || string(kv.Value) != "b" {
 			t.Errorf("%s: version %d value %q", kv.Key, kv.Version, kv.Value)
 		}
+	}
+}
+
+// TestStorageCompact drives compaction through the storage: overwritten and
+// deleted keys, an open watcher that must not be cut off, then the log is
+// reopened and the state is what it was.
+func TestStorageCompact(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	newStore := func() *MemoryStorage {
+		t.Helper()
+		lg, err := filesystemlog.NewFilesystemLogWithOptions(dir, filesystemlog.Options{RotateBytes: 4000, CacheBytes: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewMemoryStorage(lg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	store := newStore()
+
+	for round := 0; round < 20; round++ {
+		for k := 0; k < 10; k++ {
+			key := fmt.Sprintf("/k/%02d", k)
+			if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte(key), Value: []byte(fmt.Sprintf("v%d", round))}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for k := 0; k < 10; k += 2 {
+		if _, err := store.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: []byte(fmt.Sprintf("/k/%02d", k))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A watcher that has delivered up to some revision holds the compaction
+	// floor at that revision.
+	watchFrom, _ := store.GetCurrentRevision(ctx)
+	head := watchFrom
+	compactedTo, err := store.Compact(ctx, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compactedTo != head {
+		t.Fatalf("compacted to %d, want %d", compactedTo, head)
+	}
+
+	expect := func(store *MemoryStorage) {
+		t.Helper()
+		list, err := store.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list.Kvs) != 5 {
+			t.Fatalf("list has %d keys, want 5 (odd ones)", len(list.Kvs))
+		}
+		for _, kv := range list.Kvs {
+			if string(kv.Value) != "v19" || kv.Version != 20 {
+				t.Fatalf("%s = %s (version %d), want v19 (version 20)", kv.Key, kv.Value, kv.Version)
+			}
+		}
+		for k := 0; k < 10; k += 2 {
+			resp, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte(fmt.Sprintf("/k/%02d", k))})
+			if err != nil || len(resp.Kvs) != 0 {
+				t.Fatalf("deleted key %02d: %v %v", k, resp.GetKvs(), err)
+			}
+		}
+	}
+	expect(store)
+	store.WaitForCompaction()
+	if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("/k/01"), Value: []byte("after")}); err != nil {
+		t.Fatal(err)
+	}
+	store.GracefulStop()
+	store.log.Close()
+
+	store2 := newStore()
+	defer store2.log.Close()
+	resp, err := store2.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/01")})
+	if err != nil || len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != "after" || resp.Kvs[0].Version != 21 {
+		t.Fatalf("after reopen, /k/01 = %v (%v)", resp.GetKvs(), err)
+	}
+	list, _ := store2.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0")})
+	if len(list.Kvs) != 5 {
+		t.Fatalf("after reopen, list has %d keys, want 5", len(list.Kvs))
+	}
+}
+
+// TestCompactKeepsStateAtPoint checks that reads at the compaction point see
+// the same state after the log is compacted as before. Two histories matter:
+// a key written again above the point (its write at the point must survive,
+// though it is no longer the key's latest), and a key deleted below the
+// point and recreated above it (the delete must survive, so that the key
+// reads as absent at the point rather than failing).
+func TestCompactKeepsStateAtPoint(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	open := func() *MemoryStorage {
+		t.Helper()
+		lg, err := filesystemlog.NewFilesystemLogWithOptions(dir, filesystemlog.Options{RotateBytes: 2000, CacheBytes: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewMemoryStorage(lg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	store := open()
+
+	var point Revision
+	for round := 0; round < 12; round++ {
+		for k := 0; k < 10; k++ {
+			key := []byte(fmt.Sprintf("/k/%02d", k))
+			if k%3 == 0 && round >= 4 && round < 8 {
+				// Deleted in round 4, absent through round 7, recreated in
+				// round 8.
+				if round == 4 {
+					if _, err := store.Delete(ctx, &etcdserverpb.DeleteRangeRequest{Key: key}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				continue
+			}
+			if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: key, Value: []byte(fmt.Sprintf("v%d", round))}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if round == 6 {
+			point, _ = store.GetCurrentRevision(ctx)
+		}
+	}
+
+	snapshot := func(store *MemoryStorage, at Revision) string {
+		t.Helper()
+		list, err := store.List(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0"), Revision: int64(at)})
+		if err != nil {
+			t.Fatalf("list at %d: %v", at, err)
+		}
+		var s []string
+		for _, kv := range list.Kvs {
+			s = append(s, fmt.Sprintf("%s=%s@%d", kv.Key, kv.Value, kv.ModRevision))
+		}
+		return fmt.Sprint(s)
+	}
+	head, _ := store.GetCurrentRevision(ctx)
+	atPoint, atHead := snapshot(store, point), snapshot(store, head)
+	if !strings.Contains(atPoint, "/k/01=v6@") || strings.Contains(atPoint, "/k/00=") {
+		t.Fatalf("unexpected state at the point: %s", atPoint)
+	}
+
+	if compacted, err := store.Compact(ctx, point); err != nil || compacted != point {
+		t.Fatalf("Compact = %d, %v; want %d", compacted, err, point)
+	}
+	store.WaitForCompaction()
+	if got := snapshot(store, point); got != atPoint {
+		t.Fatalf("state at the compaction point changed:\n before %s\n after  %s", atPoint, got)
+	}
+	if got := snapshot(store, head); got != atHead {
+		t.Fatalf("state at head changed:\n before %s\n after  %s", atHead, got)
+	}
+
+	// The compacted files are what a restart rebuilds from.
+	store.GracefulStop()
+	store.log.Close()
+	store = open()
+	defer store.log.Close()
+	if got := snapshot(store, point); got != atPoint {
+		t.Fatalf("state at the compaction point after restart:\n before %s\n after  %s", atPoint, got)
+	}
+	if got := snapshot(store, head); got != atHead {
+		t.Fatalf("state at head after restart:\n before %s\n after  %s", atHead, got)
 	}
 }

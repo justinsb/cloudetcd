@@ -80,6 +80,12 @@ type Storage interface {
 	// Txn executes a transaction against the storage.
 	Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error)
 
+	// Compact discards history at or below revision, as etcd's Compact does:
+	// reads at older revisions fail, the latest version of every key is
+	// kept. It returns the revision actually compacted to, which may be
+	// lower to keep open watchers readable.
+	Compact(ctx context.Context, revision Revision) (Revision, error)
+
 	// GracefulStop stops the storage gracefully.
 	GracefulStop()
 

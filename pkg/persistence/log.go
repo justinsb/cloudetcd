@@ -30,6 +30,10 @@ type Revision uint64
 // it can append again.
 var ErrRevisionConflict = errors.New("log revision already claimed by another writer")
 
+// ErrCompacted is returned when a revision below the compaction point is
+// requested: its history has been discarded.
+var ErrCompacted = errors.New("revision has been compacted")
+
 // LogRecord represents a single entry in the log
 type LogRecord struct {
 	// Events are the events that occurred as a result of this record
@@ -65,6 +69,12 @@ type Log interface {
 
 	// SetListener sets the log listener
 	SetListener(listener LogListener)
+
+	// Compact discards records at or below through that are no longer live:
+	// deletes, and puts that live(key, revision) reports have been
+	// superseded. Records above through, and the latest put of every key,
+	// are kept. Reads of discarded revisions fail with ErrCompacted.
+	Compact(ctx context.Context, through Revision, live func(key []byte, revision Revision) bool) error
 }
 
 // LogListener is the interface for the persistence log

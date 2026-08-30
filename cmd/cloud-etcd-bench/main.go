@@ -176,6 +176,7 @@ func runBench(ctx context.Context, args []string) error {
 	}
 	if srv != nil {
 		runner.WatcherStatus = srv.Store.Watchers
+		runner.LogBytes = func() int64 { return dirBytes(srv.LogDir) }
 	}
 
 	fmt.Fprintf(os.Stderr, "model: %d nodes, %d pods, %d keys; blobs %v\n", cfg.Nodes, cfg.Pods(), cfg.Keys(), cfg.Blobs.Sizes())
@@ -260,4 +261,31 @@ func runExtractBlobs(args []string) error {
 	}
 	fmt.Printf("wrote blobs to %s: %v\n", args[1], b.Sizes())
 	return nil
+}
+
+// dirBytes is the total size of the files in dir.
+func dirBytes(dir string) int64 {
+	var total int64
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// The log directory should always be readable; a size of 0 in the
+		// report would be quietly wrong.
+		klog.Warningf("reading log directory %s: %v", dir, err)
+		return 0
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			// The log keeps a flat directory of files; a subdirectory is
+			// not ours and is not counted.
+			klog.Warningf("unexpected directory %s in log directory %s", e.Name(), dir)
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			klog.Warningf("sizing log file %s: %v", e.Name(), err)
+			continue
+		}
+		total += info.Size()
+	}
+	return total
 }

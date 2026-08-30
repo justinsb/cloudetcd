@@ -47,9 +47,9 @@ type Revision = persistence.Revision
 type BPTree struct {
 	mu   sync.RWMutex
 	root node
-	// emptyKey holds the revisions of the empty key, which has no first byte
-	// to place it in a node.
-	emptyKey []Revision
+	// emptyKey is the entry for the empty key, which has no first byte to
+	// place it in a node. Its prefix is nil.
+	emptyKey nodeEntry
 	// keys is the number of distinct keys in the index.
 	keys int
 }
@@ -67,14 +67,37 @@ type nodeEntry struct {
 	prefix    []byte
 	revisions []Revision
 	child     *node
+	// tombstone is whether the latest revision is a delete. Only the latest
+	// one needs marking: Compact removes a key whose latest write at or
+	// below the compaction point is a delete, and otherwise keeps an
+	// earlier delete like any other revision (the log keeps the delete
+	// record for as long as the index refers to it), so a put, delete, put
+	// sequence needs nothing more than the latest flag.
+	tombstone bool
+}
+
+// compact trims the entry's revisions for Compact, and reports how many it
+// dropped and whether the key is gone.
+func (e *nodeEntry) compact(through Revision) (dropped int, gone bool) {
+	if e.revisions == nil {
+		return 0, false
+	}
+	kept, dropped, gone := compactRevisions(e.revisions, e.tombstone, through)
+	if gone {
+		e.revisions = nil
+		e.tombstone = false
+	} else {
+		e.revisions = kept
+	}
+	return dropped, gone
 }
 
 // Dump prints the index, for debugging.
 func (t *BPTree) Dump() {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if t.emptyKey != nil {
-		fmt.Printf("key: (empty), revisions: %v\n", t.emptyKey)
+	if t.emptyKey.revisions != nil {
+		fmt.Printf("key: (empty), revisions: %v\n", t.emptyKey.revisions)
 	}
 	t.root.dump(nil)
 }
@@ -116,31 +139,87 @@ func commonPrefixLen(a, b []byte) int {
 	return n
 }
 
-// AddRevision records that key was written at revision. Revisions for a key
-// are expected to be added in increasing order.
-func (t *BPTree) AddRevision(key []byte, revision Revision) {
+// AddRevision records that key was written at revision: a put, or a delete
+// if tombstone is set. Revisions for a key are expected to be added in
+// increasing order.
+func (t *BPTree) AddRevision(key []byte, revision Revision, tombstone bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(key) == 0 {
-		if t.emptyKey == nil {
+		e := &t.emptyKey
+		if e.revisions == nil {
 			t.keys++
 		}
-		t.emptyKey = append(t.emptyKey, revision)
+		e.revisions = append(e.revisions, revision)
+		e.tombstone = tombstone
 		return
 	}
-	if t.root.addRevision(key, revision) {
+	if t.root.addRevision(key, revision, tombstone) {
 		t.keys++
 	}
 }
 
+// Compact discards history below through: each key keeps its revisions >=
+// through and the latest one below, which is all a read at or after through
+// can observe. A key whose latest revision is a delete at or below through is
+// removed. It returns the number of keys removed and revisions dropped.
+func (t *BPTree) Compact(through Revision) (keysRemoved, revisionsDropped int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dropped, gone := t.emptyKey.compact(through)
+	revisionsDropped += dropped
+	if gone {
+		keysRemoved++
+	}
+	k, d := t.root.compact(through)
+	keysRemoved += k
+	revisionsDropped += d
+	t.keys -= keysRemoved
+	return keysRemoved, revisionsDropped
+}
+
+// compactRevisions trims one key's revisions for Compact.
+func compactRevisions(revisions []Revision, tombstone bool, through Revision) (kept []Revision, dropped int, gone bool) {
+	latest := revisions[len(revisions)-1]
+	if tombstone && latest <= through {
+		return nil, len(revisions), true
+	}
+	// Revisions are ascending: keep from the last one <= through onward.
+	i := sort.Search(len(revisions), func(i int) bool { return revisions[i] > through })
+	if i > 0 {
+		i--
+	}
+	if i == 0 {
+		return revisions, 0, false
+	}
+	return append(revisions[:0], revisions[i:]...), i, false
+}
+
+func (n *node) compact(through Revision) (keysRemoved, revisionsDropped int) {
+	for i := range n.entries {
+		e := &n.entries[i]
+		dropped, gone := e.compact(through)
+		revisionsDropped += dropped
+		if gone {
+			keysRemoved++
+		}
+		if e.child != nil {
+			k, d := e.child.compact(through)
+			keysRemoved += k
+			revisionsDropped += d
+		}
+	}
+	return keysRemoved, revisionsDropped
+}
+
 // addRevision adds revision for the key that continues with key from this
 // node. It returns true if the key is new.
-func (n *node) addRevision(key []byte, revision Revision) bool {
+func (n *node) addRevision(key []byte, revision Revision, tombstone bool) bool {
 	pos, found := n.find(key[0])
 	if !found {
 		// No entry shares a first byte with the key: a new leaf edge. Clone
 		// the key; callers pass buffers owned by request messages.
-		n.entries = slices.Insert(n.entries, pos, nodeEntry{prefix: bytes.Clone(key), revisions: []Revision{revision}})
+		n.entries = slices.Insert(n.entries, pos, nodeEntry{prefix: bytes.Clone(key), revisions: []Revision{revision}, tombstone: tombstone})
 		return true
 	}
 
@@ -151,13 +230,14 @@ func (n *node) addRevision(key []byte, revision Revision) bool {
 			// The key ends exactly at this entry.
 			isNew := e.revisions == nil
 			e.revisions = append(e.revisions, revision)
+			e.tombstone = tombstone
 			return isNew
 		}
 		// The entry's prefix is a prefix of the key: continue below it.
 		if e.child == nil {
 			e.child = &node{}
 		}
-		return e.child.addRevision(key[common:], revision)
+		return e.child.addRevision(key[common:], revision, tombstone)
 	}
 
 	// The key diverges inside the entry's prefix: split the entry at the
@@ -167,18 +247,21 @@ func (n *node) addRevision(key []byte, revision Revision) bool {
 		prefix:    e.prefix[common:],
 		revisions: e.revisions,
 		child:     e.child,
+		tombstone: e.tombstone,
 	}}}
 	e.prefix = e.prefix[:common:common]
 	e.revisions = nil
+	e.tombstone = false
 	e.child = child
 	if common == len(key) {
 		// The key ends exactly at the split point.
 		e.revisions = []Revision{revision}
+		e.tombstone = tombstone
 		return true
 	}
 	// The key's remainder differs from the old remainder in its first byte,
 	// so it becomes a second edge of the new child.
-	return child.addRevision(key[common:], revision)
+	return child.addRevision(key[common:], revision, tombstone)
 }
 
 // GetLatestRevisionByKey returns the latest revision at which key was
@@ -188,7 +271,7 @@ func (t *BPTree) GetLatestRevisionByKey(key []byte, atRevision Revision) (Revisi
 	defer t.mu.RUnlock()
 	var revisions []Revision
 	if len(key) == 0 {
-		revisions = t.emptyKey
+		revisions = t.emptyKey.revisions
 	} else {
 		revisions = t.root.lookup(key)
 	}
@@ -232,8 +315,8 @@ func (n *node) lookup(key []byte) []Revision {
 func (t *BPTree) ListRevisionsByKeyRange(startKey []byte, atRevision Revision, callback func(key []byte, revisions []Revision) bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if len(startKey) == 0 && t.emptyKey != nil {
-		if !callback(nil, t.emptyKey) {
+	if len(startKey) == 0 && t.emptyKey.revisions != nil {
+		if !callback(nil, t.emptyKey.revisions) {
 			return
 		}
 	}

@@ -15,9 +15,11 @@
 package filesystemlog
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -444,5 +446,161 @@ func TestTornTail(t *testing.T) {
 		if _, err := log2.GetLogEntry(r); err != nil {
 			t.Fatalf("GetLogEntry(%d) after repair: %v", r, err)
 		}
+	}
+}
+
+func putRec(key string, size int) *persistence.LogRecord {
+	return &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.PUT, Kv: &mvccpb.KeyValue{Key: []byte(key), Value: make([]byte, size)}}}}
+}
+
+func delRec(key string) *persistence.LogRecord {
+	return &persistence.LogRecord{Events: []*mvccpb.Event{{Type: mvccpb.DELETE, Kv: &mvccpb.KeyValue{Key: []byte(key)}}}}
+}
+
+// TestCompaction writes keys that are overwritten and deleted across many
+// small files, compacts, and checks that files shrink to their live records,
+// that every live revision still reads, that compacted-away revisions fail
+// with ErrCompacted, and that a reopened log has exactly the same live state
+// and continues at the right revision.
+func TestCompaction(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	opts := Options{RotateBytes: 2000, CacheBytes: 1}
+	log, err := NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// latest[key] is the revision of the key's latest put, or 0 if deleted.
+	latest := map[string]persistence.Revision{}
+	add := func(rec *persistence.LogRecord) persistence.Revision {
+		t.Helper()
+		rev, ok, err := log.Append(ctx, rec, persistence.NewTxnMeta(0))
+		if err != nil || !ok {
+			t.Fatalf("append: ok=%v err=%v", ok, err)
+		}
+		return rev
+	}
+	// 20 keys, each overwritten 10 times; every third key deleted at the end.
+	for round := 0; round < 10; round++ {
+		for k := 0; k < 20; k++ {
+			key := fmt.Sprintf("k%02d", k)
+			latest[key] = add(putRec(key, 100))
+		}
+	}
+	for k := 0; k < 20; k += 3 {
+		key := fmt.Sprintf("k%02d", k)
+		add(delRec(key))
+		latest[key] = 0
+	}
+	// A few more writes so the deletes are in a closed file.
+	for k := 0; k < 20; k++ {
+		if k%3 != 0 {
+			key := fmt.Sprintf("k%02d", k)
+			latest[key] = add(putRec(key, 100))
+		}
+	}
+	head, _ := log.GetCurrentRevision(ctx)
+	before, _ := os.ReadDir(dir)
+	var beforeBytes int64
+	for _, e := range before {
+		info, _ := e.Info()
+		beforeBytes += info.Size()
+	}
+
+	live := func(key []byte, rev persistence.Revision) bool { return latest[string(key)] == rev }
+	if err := log.Compact(ctx, head, live); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := os.ReadDir(dir)
+	var afterBytes int64
+	for _, e := range after {
+		info, _ := e.Info()
+		afterBytes += info.Size()
+	}
+	if afterBytes*3 > beforeBytes {
+		t.Fatalf("compaction left %d of %d bytes; expected most of the history gone", afterBytes, beforeBytes)
+	}
+	if len(after) >= len(before) {
+		t.Fatalf("compaction left %d files (was %d); expected merging", len(after), len(before))
+	}
+	for _, e := range after {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("temporary file left behind: %s", e.Name())
+		}
+	}
+
+	check := func(log *FilesystemLog) {
+		t.Helper()
+		for key, rev := range latest {
+			if rev == 0 {
+				continue
+			}
+			rec, err := log.GetLogEntry(rev)
+			if err != nil {
+				t.Fatalf("GetLogEntry(%d) for live %s: %v", rev, key, err)
+			}
+			if string(rec.Events[0].Kv.Key) != key {
+				t.Fatalf("GetLogEntry(%d) = %s, want %s", rev, rec.Events[0].Kv.Key, key)
+			}
+		}
+		// The first write of k01 was superseded long ago.
+		if _, err := log.GetLogEntry(2); !errors.Is(err, persistence.ErrCompacted) {
+			t.Fatalf("GetLogEntry(2) = %v, want ErrCompacted", err)
+		}
+		if rev, _ := log.GetCurrentRevision(ctx); rev != head {
+			t.Fatalf("revision %d after compaction, want %d", rev, head)
+		}
+		// Replay yields exactly the live records, in revision order.
+		var seen []persistence.Revision
+		if err := log.Read(ctx, 1, func(r persistence.Revision, rec *persistence.LogRecord) bool {
+			seen = append(seen, r)
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < len(seen); i++ {
+			if seen[i] <= seen[i-1] {
+				t.Fatalf("replay out of order at %v", seen[i-1:i+1])
+			}
+		}
+		liveCount := 0
+		for _, rev := range latest {
+			if rev != 0 {
+				liveCount++
+			}
+		}
+		// Everything in closed files is live; the active file may hold a
+		// few superseded records (it is not compacted).
+		if len(seen) < liveCount {
+			t.Fatalf("replay saw %d records, fewer than the %d live keys", len(seen), liveCount)
+		}
+	}
+	check(log)
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	log2, err := NewFilesystemLogWithOptions(dir, opts)
+	if err != nil {
+		t.Fatalf("reopening a compacted log: %v", err)
+	}
+	defer log2.Close()
+	log = log2
+	check(log2)
+	if rev, ok, err := log2.Append(ctx, putRec("new", 10), persistence.NewTxnMeta(0)); err != nil || !ok || rev != head+1 {
+		t.Fatalf("append after reopen: rev=%d ok=%v err=%v", rev, ok, err)
+	}
+
+	// A second compaction with nothing new to drop is a no-op that keeps the
+	// compacted files as they are.
+	names1, _ := os.ReadDir(dir)
+	if err := log2.Compact(ctx, head, live); err != nil {
+		t.Fatal(err)
+	}
+	names2, _ := os.ReadDir(dir)
+	if len(names1) != len(names2) {
+		t.Fatalf("idempotent compaction changed the files: %d -> %d", len(names1), len(names2))
 	}
 }
