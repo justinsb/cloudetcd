@@ -17,9 +17,14 @@
 package filesystemlog
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
+
+// errNoMmap is returned by mapFile on platforms without memory mapping;
+// never on this one.
+var errNoMmap = errors.New("memory mapping is not supported on this platform")
 
 // mapFile maps a whole file read-only. The mapping is backed by the page
 // cache: pages are read on first touch and evicted by the OS under memory

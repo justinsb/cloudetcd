@@ -104,6 +104,9 @@ type logFile struct {
 	// logcodec.DecodeMessageAlias), so old records live in the page cache
 	// rather than on the heap.
 	mapped []byte
+	// reader is the file opened for positioned reads (the active file, or
+	// any file where mapping is unavailable), opened on first read and kept.
+	reader *os.File
 }
 
 func (f *logFile) last() Revision { return f.first + Revision(f.count) - 1 }
@@ -575,11 +578,10 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 			return nil, fmt.Errorf("log entry for revision %d not found in file %s (%d records)", revision, f.name, len(spans))
 		}
 		span := spans[pos]
-		file, err := os.Open(filepath.Join(l.dir, f.name))
+		file, err := l.reader(f)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open log file %s: %w", f.name, err)
+			return nil, err
 		}
-		defer file.Close()
 		buf := make([]byte, span.Length)
 		if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
 			return nil, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
@@ -594,7 +596,10 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 }
 
 // mapping returns the memory mapping of a closed file, creating it on first
-// use, or nil if the file is active (still growing) or cannot be mapped.
+// use, or nil if the file is active (still growing) or the platform has no
+// memory mapping. A mapping that fails where it should work is fatal: the
+// fallback would be a positioned read per record, a large and silent change
+// in how the server performs.
 func (l *FilesystemLog) mapping(f *logFile, closed bool) []byte {
 	if !closed {
 		return nil
@@ -603,13 +608,30 @@ func (l *FilesystemLog) mapping(f *logFile, closed bool) []byte {
 	defer l.mapMu.Unlock()
 	if f.mapped == nil {
 		m, err := mapFile(filepath.Join(l.dir, f.name), f.size)
-		if err != nil {
-			klog.V(2).Infof("not mapping log file %s (%v); reading it instead", f.name, err)
+		if errors.Is(err, errNoMmap) {
 			return nil
+		}
+		if err != nil {
+			panic(fmt.Sprintf("memory-mapping log file %s (%d bytes): %v", f.name, f.size, err))
 		}
 		f.mapped = m
 	}
 	return f.mapped
+}
+
+// reader returns a file's handle for positioned reads, opening it on first
+// use and keeping it open.
+func (l *FilesystemLog) reader(f *logFile) (*os.File, error) {
+	l.mapMu.Lock()
+	defer l.mapMu.Unlock()
+	if f.reader == nil {
+		file, err := os.Open(filepath.Join(l.dir, f.name))
+		if err != nil {
+			return nil, fmt.Errorf("failed to open log file %s: %w", f.name, err)
+		}
+		f.reader = file
+	}
+	return f.reader, nil
 }
 
 // fileSpansFrom is fileSpans for a file whose bytes are already at hand.
@@ -741,6 +763,12 @@ func (l *FilesystemLog) Close() error {
 			err = uerr
 		}
 		f.mapped = nil
+		if f.reader != nil {
+			if cerr := f.reader.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+			f.reader = nil
+		}
 	}
 	l.mapMu.Unlock()
 
