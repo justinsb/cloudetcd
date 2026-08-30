@@ -268,12 +268,24 @@ func dirBytes(dir string) int64 {
 	var total int64
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		// The log directory should always be readable; a size of 0 in the
+		// report would be quietly wrong.
+		klog.Warningf("reading log directory %s: %v", dir, err)
 		return 0
 	}
 	for _, e := range entries {
-		if info, err := e.Info(); err == nil && !e.IsDir() {
-			total += info.Size()
+		if e.IsDir() {
+			// The log keeps a flat directory of files; a subdirectory is
+			// not ours and is not counted.
+			klog.Warningf("unexpected directory %s in log directory %s", e.Name(), dir)
+			continue
 		}
+		info, err := e.Info()
+		if err != nil {
+			klog.Warningf("sizing log file %s: %v", e.Name(), err)
+			continue
+		}
+		total += info.Size()
 	}
 	return total
 }
