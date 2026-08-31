@@ -37,7 +37,7 @@ The project is in early development. Currently implemented:
   - Key-Value operations (PUT, GET, DELETE, RANGE)
   - Transactions
   - Watch (create/cancel, streaming events)
-  - Lease management (grant, revoke, keepalive, TTL expiry)
+  - Lease management (grant, revoke, keepalive, TTL expiry); leases are persisted in the log and survive restarts
   - Compatible with official etcd client library
 - **Persistence Log**: an append-only log of files, optionally archived to Google Cloud Storage
   - `filesystem:///path` — batches are appended to an active file and fsynced; the file is rotated by size or age
