@@ -234,6 +234,11 @@ func (w *memoryWatcher) collect(pos Revision) ([]*mvccpb.Event, error) {
 
 	var sendEvents []*mvccpb.Event
 	for _, event := range events {
+		if storage.IsInternalKey(event.Kv.Key) {
+			// cloudetcd's own records (lease grants) are not part of the
+			// clients' keyspace.
+			continue
+		}
 		shouldSend := true
 		for _, filter := range w.req.GetFilters() {
 			switch filter {

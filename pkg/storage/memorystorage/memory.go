@@ -897,6 +897,11 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 			// Stop iterating
 			return false
 		}
+		if storage.IsInternalKey(key) {
+			// cloudetcd's own records (lease grants) are not part of the
+			// clients' keyspace.
+			return true
+		}
 
 		latest := Revision(0)
 		found := false
