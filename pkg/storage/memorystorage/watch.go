@@ -41,6 +41,19 @@ type Revision = storage.Revision
 // If rangeEnd is empty, it watches a single key.
 // If rangeEnd is specified, it watches the range [key, rangeEnd).
 func (m *MemoryStorage) Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (storage.Watcher, Revision, error) {
+	// A watch replays every record from its start revision on, and records
+	// at or below the compacted revision are not all there (even at the
+	// point itself a delete may be gone, which is why this is <= where the
+	// read path's check is <). The compacted revision is returned for the
+	// client's CompactRevision: it relists at or above it and watches from
+	// above it. Read before watcherMu: mu comes first in the lock order.
+	m.mu.RLock()
+	compacted := m.compacted
+	m.mu.RUnlock()
+	if start := Revision(req.StartRevision); start > 0 && start <= compacted {
+		return nil, compacted, fmt.Errorf("watch start revision %d is at or below the compacted revision %d: %w", start, compacted, storage.ErrCompacted)
+	}
+
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
 

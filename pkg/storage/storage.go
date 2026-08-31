@@ -19,6 +19,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -27,6 +28,15 @@ type Revision = persistence.Revision
 
 // TODO: Just use zero to mean latest revision?
 const MAX_REVISION = Revision(^uint64(0))
+
+// ErrCompacted is returned for reads of history below the compacted
+// revision (persistence.ErrCompacted re-exported, which is etcd's
+// ErrGRPCCompacted — what kube-apiserver relists on).
+var ErrCompacted = persistence.ErrCompacted
+
+// ErrFutureRev is returned for reads at a revision beyond the current one:
+// etcd's ErrGRPCFutureRev, wrapped with context like ErrCompacted.
+var ErrFutureRev error = rpctypes.ErrGRPCFutureRev
 
 // // KeyValue represents a single key-value pair from the store with MVCC support.
 // type KeyValue struct {
@@ -75,6 +85,9 @@ type Storage interface {
 	// Watch creates a watcher for the given key/range starting from the specified revision
 	// If rangeEnd is empty, it watches a single key.
 	// If rangeEnd is specified, it watches the range [key, rangeEnd).
+	// A start revision at or below the compacted revision is refused with an
+	// error wrapping ErrCompacted; the returned Revision is then the
+	// compacted revision, for the client's WatchResponse.CompactRevision.
 	Watch(ctx context.Context, req *etcdserverpb.WatchCreateRequest, callback func(event *etcdserverpb.WatchResponse) error) (Watcher, Revision, error)
 
 	// Txn executes a transaction against the storage.

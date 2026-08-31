@@ -613,6 +613,9 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 	snapshotTimestamp := t.snapshotTimestamp
 	if req.Revision > 0 {
 		snapshotTimestamp = Revision(req.Revision)
+		if err := m.checkReadRevision(snapshotTimestamp, t.snapshotTimestamp); err != nil {
+			return nil, err
+		}
 	}
 
 	if req.CountOnly {
@@ -666,6 +669,21 @@ func (t *txn) get(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdser
 	default:
 		panic(fmt.Sprintf("unknown operation: %s", event.Type))
 	}
+}
+
+// checkReadRevision rejects a requested read revision outside the readable
+// window: at or below the compacted revision the history is gone (reads at
+// the compacted revision itself still work: compaction keeps each key's
+// state as of that point), and beyond the current revision there is nothing
+// yet. Called with mu held (evaluate holds it for get and list).
+func (m *MemoryStorage) checkReadRevision(requested, current Revision) error {
+	if requested < m.compacted {
+		return fmt.Errorf("requested revision %d is below the compacted revision %d: %w", requested, m.compacted, storage.ErrCompacted)
+	}
+	if requested > current {
+		return fmt.Errorf("requested revision %d is beyond the current revision %d: %w", requested, current, storage.ErrFutureRev)
+	}
+	return nil
 }
 
 func findEvent(logEntry *persistence.LogRecord, key []byte) *mvccpb.Event {
@@ -862,6 +880,9 @@ func (t *txn) list(ctx context.Context, req *etcdserverpb.RangeRequest) (*etcdse
 	snapshotTimestamp := t.snapshotTimestamp
 	if req.Revision > 0 {
 		snapshotTimestamp = Revision(req.Revision)
+		if err := m.checkReadRevision(snapshotTimestamp, t.snapshotTimestamp); err != nil {
+			return nil, err
+		}
 	}
 
 	resp := &etcdserverpb.RangeResponse{
