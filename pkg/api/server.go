@@ -322,15 +322,16 @@ func (s *Server) Txn(ctx context.Context, req *etcdserverpb.TxnRequest) (*etcdse
 	return result, nil
 }
 
-// toGRPCError maps storage errors to their etcd equivalents, so that
-// clients see the errors they are coded to handle (kube-apiserver relists
-// on ErrGRPCCompacted); anything else passes through.
+// toGRPCError reduces an error wrapping one of the etcd rpc sentinels
+// (storage.ErrCompacted, storage.ErrFutureRev — the sentinels are the rpc
+// errors, wrapped with context on the way up) back to the bare sentinel,
+// which is the status error gRPC sends and clients are coded to handle;
+// kube-apiserver relists on ErrGRPCCompacted. Anything else passes through.
 func toGRPCError(err error) error {
-	switch {
-	case errors.Is(err, storage.ErrCompacted):
-		return rpctypes.ErrGRPCCompacted
-	case errors.Is(err, storage.ErrFutureRev):
-		return rpctypes.ErrGRPCFutureRev
+	for _, sentinel := range []error{rpctypes.ErrGRPCCompacted, rpctypes.ErrGRPCFutureRev} {
+		if errors.Is(err, sentinel) {
+			return sentinel
+		}
 	}
 	return err
 }
@@ -459,6 +460,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 			// stream itself stays up for its other watches.
 			current, cerr := ws.server.storage.GetCurrentRevision(ctx)
 			if cerr != nil {
+				log.Error(cerr, "failed to get current revision for compacted-watch cancel; using the compacted revision in the header")
 				current = logPosition
 			}
 			ws.stream.Send(&etcdserverpb.WatchResponse{

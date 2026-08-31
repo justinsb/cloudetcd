@@ -16,10 +16,10 @@ package storage
 
 import (
 	"context"
-	"errors"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"justinsb.com/cloudetcd/pkg/persistence"
 )
 
@@ -29,15 +29,14 @@ type Revision = persistence.Revision
 // TODO: Just use zero to mean latest revision?
 const MAX_REVISION = Revision(^uint64(0))
 
-// ErrCompacted is returned for reads of history at or below the compacted
-// revision (it is persistence.ErrCompacted, re-exported for the layers
-// above storage). The API maps it to etcd's ErrGRPCCompacted, which is what
-// kube-apiserver relists on.
+// ErrCompacted is returned for reads of history below the compacted
+// revision (persistence.ErrCompacted re-exported, which is etcd's
+// ErrGRPCCompacted — what kube-apiserver relists on).
 var ErrCompacted = persistence.ErrCompacted
 
-// ErrFutureRev is returned for reads at a revision beyond the current one.
-// The API maps it to etcd's ErrGRPCFutureRev.
-var ErrFutureRev = errors.New("revision is in the future")
+// ErrFutureRev is returned for reads at a revision beyond the current one:
+// etcd's ErrGRPCFutureRev, wrapped with context like ErrCompacted.
+var ErrFutureRev error = rpctypes.ErrGRPCFutureRev
 
 // // KeyValue represents a single key-value pair from the store with MVCC support.
 // type KeyValue struct {

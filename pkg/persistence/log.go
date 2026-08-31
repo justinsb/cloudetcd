@@ -19,6 +19,7 @@ import (
 	"errors"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 )
 
 type Revision uint64
@@ -31,8 +32,11 @@ type Revision uint64
 var ErrRevisionConflict = errors.New("log revision already claimed by another writer")
 
 // ErrCompacted is returned when a revision below the compaction point is
-// requested: its history has been discarded.
-var ErrCompacted = errors.New("revision has been compacted")
+// requested: its history has been discarded. It is etcd's ErrGRPCCompacted,
+// so the error keeps one identity from the log to the wire: layers add
+// context by wrapping it, and the API strips the wrapping off again before
+// sending (gRPC wants the bare status error).
+var ErrCompacted error = rpctypes.ErrGRPCCompacted
 
 // LogRecord represents a single entry in the log
 type LogRecord struct {
