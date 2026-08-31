@@ -499,7 +499,10 @@ func (m *LeaseManager) OnLogEvent(event *mvccpb.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if newLeaseID != 0 {
+	// A put that keeps the key's existing lease changes nothing: the key
+	// is already on the lease's list, and appending again would grow it
+	// with every refresh of the key.
+	if newLeaseID != 0 && newLeaseID != oldLease {
 		newLease, ok := m.leases[LeaseID(newLeaseID)]
 		if !ok {
 			// A key attached to a lease we have no record of: a log written

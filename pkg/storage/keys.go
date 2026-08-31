@@ -27,5 +27,7 @@ var InternalPrefix = []byte("\x00cloudetcd/")
 
 // IsInternalKey reports whether key is in the reserved internal namespace.
 func IsInternalKey(key []byte) bool {
-	return bytes.HasPrefix(key, InternalPrefix)
+	// Every ordinary key fails on the first byte, before the prefix
+	// comparison; this runs for every listed key and watched event.
+	return len(key) > 0 && key[0] == 0 && bytes.HasPrefix(key, InternalPrefix)
 }

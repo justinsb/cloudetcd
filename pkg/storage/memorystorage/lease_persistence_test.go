@@ -106,6 +106,18 @@ func TestLeasePersistence(t *testing.T) {
 		t.Fatalf("lease after restart: TTL %d of %d granted", ttl.TTL, ttl.GrantedTTL)
 	}
 
+	// Refreshing the key under the same lease must not attach it again.
+	if _, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte("/leased"), Value: []byte("v2"), Lease: grant.ID}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := lm.LeaseTimeToLive(ctx, &etcdserverpb.LeaseTimeToLiveRequest{ID: grant.ID, Keys: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys.Keys) != 1 {
+		t.Fatalf("lease has %d keys after a refresh, want 1: %q", len(keys.Keys), keys.Keys)
+	}
+
 	// Run the expiry loop: the lease is far from expiring, so the key must
 	// stay (the placeholder-lease bug deleted it here).
 	runCtx, stopRun := context.WithCancel(ctx)
