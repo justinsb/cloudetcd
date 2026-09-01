@@ -101,15 +101,6 @@ const (
 	DefaultCacheBytes  = 256 << 20
 	DefaultRotateBytes = 64 << 20
 	DefaultRotateAfter = 5 * time.Minute
-
-	// unmapAfter is how long a mapping of a file removed by compaction is
-	// kept before it is unmapped: records decoded from it alias its bytes,
-	// and a reader may still be using one.
-	//
-	// TODO: a grace period is a guess. Give each request a view that pins
-	// the files it reads, and unmap a retired file when its last view
-	// closes; that also makes long-running requests visible.
-	unmapAfter = time.Minute
 )
 
 // fileInfo is what a log file's name says about it: the revisions it
@@ -177,10 +168,14 @@ type logFile struct {
 	spans     []logcodec.Span
 	revisions []Revision
 	// mapped is the read-only memory mapping of a closed file, made on first
-	// read; records read from it alias its bytes (see
-	// logcodec.EncodedRecord.DecodeAlias), so old records live in the page
-	// cache rather than on the heap. nil where the platform cannot map.
+	// read; records are decoded straight out of it, so old records live in
+	// the page cache rather than on the heap. nil where the platform cannot
+	// map. pins counts the reads decoding from the mapping right now; a
+	// file replaced by compaction while pinned is marked retire, and the
+	// last unpin unmaps it.
 	mapped []byte
+	pins   int
+	retire bool
 	// reader is the file opened for reading, on first use, and kept: it
 	// serves positioned reads of the active file (or of any file where
 	// mapping is unavailable) and is what a closed file is mapped from.
@@ -215,9 +210,6 @@ type FilesystemLog struct {
 	files        []*logFile
 	lastRevision Revision
 	listener     LogListener
-	// retired holds mappings of files removed by compaction until it is
-	// safe to unmap them.
-	retired []retiredMapping
 
 	// cache holds recently written records (reads of the active file).
 	cache *recordcache.Cache
@@ -228,15 +220,10 @@ type FilesystemLog struct {
 	// archiver copies closed files to the archive and removes superseded
 	// ones, in the background.
 	archiver *worker[archiveOp]
-	// rotator rotates the active file by age and unmaps retired mappings.
+	// rotator rotates the active file by age.
 	rotator *ticker
 
 	removeOnClose bool
-}
-
-type retiredMapping struct {
-	mapped []byte
-	at     time.Time
 }
 
 var _ persistence.Log = &FilesystemLog{}
@@ -617,8 +604,7 @@ func (l *FilesystemLog) rotateLocked() error {
 	return nil
 }
 
-// tick rotates the active file once it is RotateAfter old, and unmaps
-// mappings that have been retired for long enough.
+// tick rotates the active file once it is RotateAfter old.
 func (l *FilesystemLog) tick() {
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
@@ -630,7 +616,6 @@ func (l *FilesystemLog) tick() {
 			klog.Errorf("rotating log file: %v", err)
 		}
 	}
-	l.unmapRetiredLocked(false)
 }
 
 // archive carries out one archive operation, retrying until it succeeds. A
@@ -681,15 +666,18 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 	if record, ok := l.cache.Get(revision); ok {
 		return record, nil
 	}
-	m, aliased, err := l.recordBytes(revision)
+	m, release, err := l.recordBytes(revision)
 	if err != nil {
 		return nil, err
 	}
-	if aliased {
-		// Decode in place, aliasing the key and value bytes rather than
-		// copying them. Not cached: the cache is for the write-recent set,
-		// and a cached alias would pin the mapping past compaction.
-		record, err := m.DecodeAlias()
+	if release != nil {
+		// The bytes alias the file's mapping, which stays pinned until
+		// release; the decode copies them out, so the record owns its
+		// memory and nothing outlives the pin. Not cached: the cache is
+		// for the write-recent set, and these reads are already one copy
+		// from the page cache.
+		record, err := m.Decode()
+		release()
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode log record %d: %w", revision, err)
 		}
@@ -704,46 +692,62 @@ func (l *FilesystemLog) GetLogEntry(revision Revision) (*LogRecord, error) {
 }
 
 // recordBytes returns the encoded bytes of revision's record. For a closed
-// file they alias its memory mapping (aliased is true) and must not be
-// retained; for the active file, or where mapping is unavailable, they are
-// one positioned read into a fresh buffer.
-func (l *FilesystemLog) recordBytes(revision Revision) (m logcodec.EncodedRecord, aliased bool, err error) {
+// file they alias its memory mapping, which is pinned until the returned
+// release is called: decode, then release, and let nothing alias the bytes
+// afterwards. For the active file, or where mapping is unavailable, they
+// are one positioned read into a fresh buffer, and release is nil.
+func (l *FilesystemLog) recordBytes(revision Revision) (m logcodec.EncodedRecord, release func(), err error) {
 	l.mu.RLock()
 	f, ok := l.findFile(revision)
 	active := ok && f == l.files[len(l.files)-1]
 	l.mu.RUnlock()
 	if !ok {
-		return nil, false, fmt.Errorf("log entry for revision %d not found in any file", revision)
+		return nil, nil, fmt.Errorf("log entry for revision %d not found in any file", revision)
 	}
 
 	f.mu.Lock()
 	if !active {
 		if err := l.loadLocked(f); err != nil {
 			f.mu.Unlock()
-			return nil, false, err
+			return nil, nil, err
 		}
 	}
 	pos, err := f.position(revision)
 	if err != nil {
 		f.mu.Unlock()
-		return nil, false, err
+		return nil, nil, err
 	}
 	span := f.spans[pos]
 	if f.mapped != nil {
+		f.pins++
 		mapped := f.mapped
 		f.mu.Unlock()
-		return span.Bytes(mapped), true, nil
+		return span.Bytes(mapped), func() { l.unpin(f) }, nil
 	}
 	file, err := l.readerLocked(f)
 	f.mu.Unlock()
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 	buf := make([]byte, span.Length)
 	if _, err := file.ReadAt(buf, int64(span.Offset)); err != nil {
-		return nil, false, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
+		return nil, nil, fmt.Errorf("failed to read record %d from log file %s: %w", revision, f.name, err)
 	}
-	return buf, false, nil
+	return buf, nil, nil
+}
+
+// unpin releases one read's pin on a file's mapping, and unmaps it if
+// compaction retired the file while it was pinned.
+func (l *FilesystemLog) unpin(f *logFile) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pins--
+	if f.pins == 0 && f.retire && f.mapped != nil {
+		if err := munmapFile(f.mapped); err != nil {
+			klog.Errorf("unmapping retired log file %s: %v", f.name, err)
+		}
+		f.mapped = nil
+	}
 }
 
 // loadLocked prepares a closed file for reading: maps it, where the platform
@@ -1014,17 +1018,23 @@ func (l *FilesystemLog) compactGroup(ctx context.Context, group []*logFile, live
 	compacted := &logFile{fileInfo: info, name: name, count: len(spans), size: size, opened: time.Now(), indexed: true, spans: spans, revisions: revisions}
 
 	// Swap it into the index and retire the originals: their mappings are
-	// kept for a while (a reader may hold a record decoded from one), their
-	// read handles closed (a replaced-in-place file's handle is the old
-	// inode), and their files removed.
+	// unmapped now, or by the last unpin if a reader is decoding from one;
+	// their read handles closed (a replaced-in-place file's handle is the
+	// old inode); their files removed.
 	l.mu.Lock()
 	i := slices.Index(l.files, group[0])
 	l.files = slices.Replace(l.files, i, i+len(group), compacted)
 	for _, f := range group {
 		f.mu.Lock()
 		if f.mapped != nil {
-			l.retired = append(l.retired, retiredMapping{mapped: f.mapped, at: time.Now()})
-			f.mapped = nil
+			if f.pins == 0 {
+				if err := munmapFile(f.mapped); err != nil {
+					klog.Errorf("unmapping compacted-away log file %s: %v", f.name, err)
+				}
+				f.mapped = nil
+			} else {
+				f.retire = true
+			}
 		}
 		if f.reader != nil {
 			f.reader.Close()
@@ -1104,22 +1114,6 @@ func (l *FilesystemLog) liveRecords(f *logFile, live liveFunc, keep func(m logco
 	return dead, nil
 }
 
-// unmapRetiredLocked unmaps mappings retired long enough ago (or all of
-// them). Called with mu held.
-func (l *FilesystemLog) unmapRetiredLocked(all bool) {
-	kept := l.retired[:0]
-	for _, r := range l.retired {
-		if all || time.Since(r.at) >= unmapAfter {
-			if err := munmapFile(r.mapped); err != nil {
-				klog.Errorf("unmapping retired log file: %v", err)
-			}
-			continue
-		}
-		kept = append(kept, r)
-	}
-	l.retired = kept
-}
-
 // Close flushes queued transactions, rotates the active file so that
 // everything committed is archived, waits for uploads, and releases the log.
 func (l *FilesystemLog) Close() error {
@@ -1147,7 +1141,6 @@ func (l *FilesystemLog) Close() error {
 	}
 
 	l.mu.Lock()
-	l.unmapRetiredLocked(true)
 	for _, f := range l.files {
 		f.mu.Lock()
 		if err := munmapFile(f.mapped); err != nil {

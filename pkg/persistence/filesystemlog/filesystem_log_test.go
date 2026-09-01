@@ -604,3 +604,82 @@ func TestCompaction(t *testing.T) {
 		t.Fatalf("idempotent compaction changed the files: %d -> %d", len(names1), len(names2))
 	}
 }
+
+// TestPinnedMappingSurvivesCompaction: a read decoding from a mapped file
+// pins the mapping, so compaction replacing the file must leave the mapping
+// readable until the pin is released — and the last release unmaps it. A
+// file with no pins is unmapped by compaction immediately.
+func TestPinnedMappingSurvivesCompaction(t *testing.T) {
+	ctx := t.Context()
+	opts := Options{RotateBytes: 2000, CacheBytes: 1}
+	log, err := NewFilesystemLogWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	latest := map[string]persistence.Revision{}
+	for round := 0; round < 10; round++ {
+		for k := 0; k < 20; k++ {
+			key := fmt.Sprintf("k%02d", k)
+			rev, ok, err := log.Append(ctx, putRec(key, 100), persistence.NewTxnMeta(0))
+			if err != nil || !ok {
+				t.Fatalf("append: ok=%v err=%v", ok, err)
+			}
+			latest[key] = rev
+		}
+	}
+
+	// Map two closed files: one by taking a pinned read, one by a routine
+	// read that releases straight away.
+	m, release, err := log.recordBytes(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release == nil {
+		t.Fatal("read of a closed file was not from its mapping")
+	}
+	log.mu.RLock()
+	pinned, _ := log.findFile(2)
+	log.mu.RUnlock()
+	if _, err := log.GetLogEntry(pinned.last + 1); err != nil {
+		t.Fatal(err)
+	}
+	log.mu.RLock()
+	unpinned, _ := log.findFile(pinned.last + 1)
+	log.mu.RUnlock()
+
+	head, _ := log.GetCurrentRevision(ctx)
+	live := func(key []byte, rev persistence.Revision) bool { return latest[string(key)] == rev }
+	if err := log.Compact(ctx, head, live); err != nil {
+		t.Fatal(err)
+	}
+
+	// The unpinned file's mapping went with the file; the pinned file's
+	// mapping is retired but still readable.
+	unpinned.mu.Lock()
+	if unpinned.mapped != nil || unpinned.retire {
+		t.Fatalf("unpinned file %s still mapped after compaction (retire=%v)", unpinned.name, unpinned.retire)
+	}
+	unpinned.mu.Unlock()
+	pinned.mu.Lock()
+	if pinned.pins != 1 || !pinned.retire || pinned.mapped == nil {
+		t.Fatalf("pinned file %s: pins=%d retire=%v mapped=%v", pinned.name, pinned.pins, pinned.retire, pinned.mapped != nil)
+	}
+	pinned.mu.Unlock()
+
+	rec, err := m.Decode()
+	if err != nil {
+		t.Fatalf("decoding from the pinned mapping after compaction: %v", err)
+	}
+	if got := string(rec.Events[0].Kv.Key); got != "k01" {
+		t.Fatalf("record read through the pinned mapping = key %q, want k01", got)
+	}
+
+	release()
+	pinned.mu.Lock()
+	if pinned.pins != 0 || pinned.mapped != nil {
+		t.Fatalf("after release: pins=%d mapped=%v, want unmapped", pinned.pins, pinned.mapped != nil)
+	}
+	pinned.mu.Unlock()
+}
