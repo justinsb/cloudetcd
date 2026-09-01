@@ -40,9 +40,12 @@ type MemoryStorage struct {
 
 	revisions bptree.BPTree
 
-	// compacted is the revision history has been discarded through.
+	// compacted is the revision history has been discarded through. Set on
+	// open from the log's own floor, so the gate survives a restart.
 	compacted Revision
-	compactWG sync.WaitGroup
+	// compactBgMu serializes the background halves of compactions.
+	compactBgMu sync.Mutex
+	compactWG   sync.WaitGroup
 
 	// applied is the highest log revision whose events have been applied to
 	// revisions (and the lease manager). Records are committed by the log's
@@ -73,6 +76,8 @@ func NewMemoryStorage(log persistence.Log) (*MemoryStorage, error) {
 	if err := ms.ReplayLog(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to replay log on startup: %w", err)
 	}
+	// The compaction gate survives a restart: the log knows its own floor.
+	ms.compacted = log.CompactedFloor()
 
 	return ms, nil
 }
@@ -1031,14 +1036,17 @@ func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revisio
 		m.mu.Unlock()
 		return m.compacted, nil
 	}
-	keysRemoved, revisionsDropped := m.revisions.Compact(through)
 	m.compacted = through
 	m.mu.Unlock()
-	klog.V(1).Infof("compacted index through revision %d: %d keys removed, %d revisions dropped", through, keysRemoved, revisionsDropped)
 
-	// The log rewrite runs in the background: it reads closed files and
-	// takes seconds at scale, and nothing waits on it. The log serializes
-	// compactions, so overlapping requests queue.
+	// Everything else runs in the background; overlapping requests queue on
+	// compactBgMu. The index is not pruned synchronously: reads pick each
+	// key's latest revision at or below their snapshot, and the snapshots
+	// still readable (checkReadRevision now gates on the new point) get the
+	// same answer from a pruned and an unpruned index, so the walk only
+	// reclaims memory — done a chunk of keys at a time, so the index is
+	// never locked for the whole tree. The log rewrite follows the prune,
+	// whose result its liveness test reads.
 	// A record is live if it is a key's state as of the compaction point:
 	// its latest put or delete at or below through, which is what the index
 	// kept. Not simply the key's latest revision: a read at a revision
@@ -1052,7 +1060,22 @@ func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revisio
 	m.compactWG.Add(1)
 	go func() {
 		defer m.compactWG.Done()
+		m.compactBgMu.Lock()
+		defer m.compactBgMu.Unlock()
+
 		start := time.Now()
+		var keysRemoved, revisionsDropped int
+		cursor, first := []byte(nil), true
+		for first || cursor != nil {
+			var k, d int
+			cursor, k, d = m.revisions.CompactFrom(cursor, through, compactIndexChunk)
+			keysRemoved += k
+			revisionsDropped += d
+			first = false
+		}
+		klog.V(1).Infof("pruned index through revision %d in %s: %d keys removed, %d revisions dropped", through, time.Since(start).Round(time.Millisecond), keysRemoved, revisionsDropped)
+
+		start = time.Now()
 		if err := m.log.Compact(context.Background(), through, live); err != nil {
 			klog.Errorf("compacting log through revision %d: %v", through, err)
 			return
@@ -1061,6 +1084,10 @@ func (m *MemoryStorage) Compact(ctx context.Context, revision Revision) (Revisio
 	}()
 	return through, nil
 }
+
+// compactIndexChunk is how many keys one CompactFrom call prunes, bounding
+// how long a background compaction holds the index's lock at a stretch.
+const compactIndexChunk = 4096
 
 // WaitForCompaction blocks until background log compactions have finished,
 // for tests.
