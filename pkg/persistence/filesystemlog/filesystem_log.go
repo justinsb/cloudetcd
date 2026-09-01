@@ -654,6 +654,24 @@ func (l *FilesystemLog) archive(op archiveOp) {
 	}
 }
 
+// CompactedFloor returns a lower bound on the log's compaction point, read
+// from its files: a sparse file holds only the records that were live at a
+// compaction, so history at or below the last revision such a file covers
+// has been discarded. (A dense file that compaction skipped for being
+// nearly all live can sit below the floor; reads into it still work, and
+// erring low only permits reads.)
+func (l *FilesystemLog) CompactedFloor() Revision {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var floor Revision
+	for _, f := range l.files {
+		if f.sparse && f.last > floor {
+			floor = f.last
+		}
+	}
+	return floor
+}
+
 // GetCurrentRevision returns the current revision number
 func (l *FilesystemLog) GetCurrentRevision(ctx context.Context) (Revision, error) {
 	l.mu.RLock()

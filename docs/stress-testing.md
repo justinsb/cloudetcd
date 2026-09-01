@@ -98,7 +98,7 @@ write throughput, watch event throughput and watch lag — not watcher count.
 
 ### Compaction
 
-The model issues `Compact` every 5 minutes as the apiserver does (`-compact-interval` shortens that). The server prunes its index to each key's latest version at or below the compaction point, drops deleted keys, and rewrites closed log files in the background keeping only live records (a compacted file is sparse in revision and named by the range it covers). The report's `log … MB on disk` per phase is how to see it: with compaction the log settles at the live set plus one interval's tail; without it the log grows at the write rate.
+The model issues `Compact` every 5 minutes as the apiserver does (`-compact-interval` shortens that). The server answers at once and does the rest in the background: it prunes its index to each key's latest version at or below the compaction point (a chunk of keys at a time, so the index is never locked long), drops deleted keys, and rewrites closed log files keeping only live records (a compacted file is sparse in revision and named by the range it covers). The report's `log … MB on disk` per phase is how to see it: with compaction the log settles at the live set plus one interval's tail; without it the log grows at the write rate.
 
 ## The gated stress test
 

@@ -276,3 +276,78 @@ func TestCompact(t *testing.T) {
 		t.Errorf("after compaction: %v", keys)
 	}
 }
+
+// TestCompactFrom checks that chunked compaction ends where one-pass
+// compaction does, even with the smallest chunks and with writes landing
+// between chunks.
+func TestCompactFrom(t *testing.T) {
+	build := func() *BPTree {
+		var tree BPTree
+		tree.AddRevision(nil, 1, false)
+		tree.AddRevision(nil, 9, false)
+		for k := 0; k < 50; k++ {
+			key := []byte(fmt.Sprintf("/reg/thing/%02d", k))
+			for r := 0; r < 4; r++ {
+				tree.AddRevision(key, Revision(1+k+50*r), false)
+			}
+			if k%5 == 0 {
+				tree.AddRevision(key, Revision(300+k), true)
+			}
+		}
+		return &tree
+	}
+	dump := func(tree *BPTree) string {
+		var out []string
+		tree.ListRevisionsByKeyRange(nil, 1000, func(key []byte, revisions []Revision) bool {
+			out = append(out, fmt.Sprintf("%s%v", key, revisions))
+			return true
+		})
+		return fmt.Sprintf("len=%d %v", tree.Len(), out)
+	}
+	const through = Revision(150)
+
+	want := build()
+	wantRemoved, wantDropped := want.Compact(through)
+
+	got := build()
+	var removed, dropped int
+	var chunks int
+	cursor, first := []byte(nil), true
+	for first || cursor != nil {
+		var k, d int
+		cursor, k, d = got.CompactFrom(cursor, through, 1)
+		removed += k
+		dropped += d
+		chunks++
+		first = false
+	}
+	if removed != wantRemoved || dropped != wantDropped {
+		t.Fatalf("chunked compaction removed %d/dropped %d, one-pass %d/%d", removed, dropped, wantRemoved, wantDropped)
+	}
+	if dump(got) != dump(want) {
+		t.Fatalf("chunked compaction differs:\n chunked %s\n one-pass %s", dump(got), dump(want))
+	}
+	if chunks < 40 {
+		t.Fatalf("chunk size 1 finished in %d chunks; the walk is not chunking", chunks)
+	}
+
+	// Writes between chunks: new revisions (above through) survive, both on
+	// existing keys and on keys the walk has already passed.
+	live := build()
+	cursor, first = nil, true
+	for first || cursor != nil {
+		cursor, _, _ = live.CompactFrom(cursor, through, 7)
+		live.AddRevision([]byte("/reg/thing/00"), Revision(400+len(cursor)), false)
+		live.AddRevision([]byte(fmt.Sprintf("/new/%02d", len(cursor))), 401, false)
+		first = false
+	}
+	if rev, ok := live.GetLatestRevisionByKey([]byte("/reg/thing/13"), 1000); !ok || rev != Revision(1+13+150) {
+		t.Fatalf("existing key after interleaved compaction: %d, %v", rev, ok)
+	}
+	if _, ok := live.GetLatestRevisionByKey([]byte("/new/00"), 1000); !ok {
+		t.Fatalf("key written between chunks is missing")
+	}
+	if rev, ok := live.GetLatestRevisionByKey([]byte("/reg/thing/00"), 399); !ok || rev != Revision(300) {
+		t.Fatalf("tombstone above through: %d, %v (want kept at 300)", rev, ok)
+	}
+}
