@@ -3,7 +3,7 @@ module justinsb.com/cloudetcd
 go 1.27.0
 
 require (
-	cloud.google.com/go/storage v1.66.0
+	cloud.google.com/go/storage v1.67.1
 	github.com/google/go-cmp v0.7.0
 	github.com/justinsb/identityctl v0.0.0-20260720002141-0234a215890e
 	github.com/justinsb/objectstorage v0.0.0-20260706120203-ecdc610afc00
@@ -12,7 +12,7 @@ require (
 	go.etcd.io/etcd/client/v3 v3.7.1
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
-	google.golang.org/api v0.294.0
+	google.golang.org/api v0.297.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.0
