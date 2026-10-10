@@ -25,6 +25,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"justinsb.com/cloudetcd/pkg/api"
+	"justinsb.com/cloudetcd/pkg/persistence"
 	"justinsb.com/cloudetcd/pkg/persistence/filesystemlog"
 	"justinsb.com/cloudetcd/pkg/persistence/logfactory"
 	"justinsb.com/cloudetcd/pkg/storage/memorystorage"
@@ -39,6 +40,7 @@ type Server struct {
 	// LogDir is the log's directory, for measuring what it uses on disk.
 	LogDir string
 
+	log    persistence.Log
 	server *api.Server
 	cancel context.CancelFunc
 	done   chan error
@@ -68,6 +70,7 @@ func Start(ctx context.Context, logURI string, opts ...api.Option) (*Server, err
 		Addr:   addr,
 		Store:  store,
 		LogDir: lg.(*filesystemlog.FilesystemLog).Dir(),
+		log:    lg,
 		server: api.NewServer(store, opts...),
 		cancel: cancel,
 		done:   make(chan error, 1),
@@ -100,7 +103,9 @@ func Start(ctx context.Context, logURI string, opts ...api.Option) (*Server, err
 	return nil, fmt.Errorf("server did not become ready at %s: %v", addr, lastErr)
 }
 
-// Stop shuts the server down.
+// Stop shuts the server down and closes its log, waiting for background
+// compaction to finish first. A filesystem:// log can then be reopened by a
+// new Start on the same URI, as a restarted server would.
 func (s *Server) Stop() {
 	s.cancel()
 	_ = s.server.GracefulStop()
@@ -108,6 +113,8 @@ func (s *Server) Stop() {
 	case <-s.done:
 	case <-time.After(10 * time.Second):
 	}
+	s.Store.WaitForCompaction()
+	_ = s.log.Close()
 }
 
 // NewClient returns an etcd client connected to the server. Like

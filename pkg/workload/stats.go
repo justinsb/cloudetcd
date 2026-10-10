@@ -72,6 +72,21 @@ func (h *Histogram) Observe(d time.Duration) {
 // Count returns the number of samples.
 func (h *Histogram) Count() int64 { return h.n.Load() }
 
+// merge adds o's samples to h.
+func (h *Histogram) merge(o *Histogram) {
+	for i := range h.counts {
+		h.counts[i].Add(o.counts[i].Load())
+	}
+	h.n.Add(o.n.Load())
+	h.sum.Add(o.sum.Load())
+	for {
+		cur, om := h.max.Load(), o.max.Load()
+		if om <= cur || h.max.CompareAndSwap(cur, om) {
+			return
+		}
+	}
+}
+
 // Max returns the largest sample.
 func (h *Histogram) Max() time.Duration { return time.Duration(h.max.Load()) }
 
@@ -128,6 +143,9 @@ type WatchStats struct {
 // Stats accumulates everything measured in one phase of a run.
 type Stats struct {
 	start time.Time
+	// violationsBefore is the oracle's violation count when the phase
+	// began, so the phase reports only its own.
+	violationsBefore int64
 
 	mu      sync.RWMutex
 	ops     map[string]*OpStats
