@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Dependabot: one grouped pull request per ecosystem rather than one per
+# dependency. gomod covers every go.mod in the repository in a single PR.
 version: 2
 updates:
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "**/*"
     schedule:
       interval: "daily"
     groups:
@@ -27,9 +31,17 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: "docker"
     directories:
       - "**/*"
     schedule:
       interval: "daily"
+    groups:
+      docker-images:
+        patterns:
+          - "*"
