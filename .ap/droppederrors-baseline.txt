@@ -1,0 +1,82 @@
+# Baseline for ap droppederrors ratchet.
+# Entries: <file>:<enclosing-function>[:<category>]:<callee>
+# Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+cmd/cloud-etcd-bench/main.go:runBench:(*go.etcd.io/etcd/client/v3.Client).Close
+cmd/cloud-etcd-bench/main.go:runBench:(*os.File).Close
+pkg/api/server.go:(*Server).Start:(*justinsb.com/cloudetcd/pkg/api.Server).GracefulStop
+pkg/api/server.go:(*watchStream).handleCancelRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
+pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
+pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
+pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
+pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).Read:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).compactGroup:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).compactGroup:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).compactGroup:os.Remove
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).newActiveFile:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).newActiveFile:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).newActiveFile:(*os.File).Close
+pkg/persistence/filesystemlog/filesystem_log.go:NewTempLog:os.RemoveAll
+pkg/persistence/filesystemlog/filesystem_log.go:syncDir:(*os.File).Close
+pkg/persistence/gcsarchive/gcsarchive.go:(*Archive).Download:(*cloud.google.com/go/storage.Reader).Close
+pkg/persistence/gcsarchive/gcsarchive.go:(*Archive).Download:(*os.File).Close
+pkg/persistence/gcsarchive/gcsarchive.go:(*Archive).Download:(*os.File).Close
+pkg/persistence/gcsarchive/gcsarchive.go:(*Archive).Upload:(*cloud.google.com/go/storage.Writer).Close
+pkg/persistence/logtests/basic.go:TestLog_BatchCommit_ReadWriteConflicts:(justinsb.com/cloudetcd/pkg/persistence.Log).Append
+pkg/persistence/logtests/basic.go:TestLog_BatchCommit_ReadWriteConflicts:(justinsb.com/cloudetcd/pkg/persistence.Log).Append
+pkg/recording/recording.go:ReadFile:(*os.File).Close
+pkg/recording/recording.go:encode:encoding/json.Marshal
+pkg/recording/recording.go:encode:encoding/json.Marshal
+pkg/workload/analyze.go:(*Analysis).Text:(*text/tabwriter.Writer).Flush
+pkg/workload/analyze.go:(*Analysis).Text:(*text/tabwriter.Writer).Flush
+pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintf
+pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintf
+pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintln
+pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintln
+pkg/workload/executor.go:(*executor).compact:strconv.ParseInt
+pkg/workload/executor.go:(*executor).updateOrCreate:(*justinsb.com/cloudetcd/pkg/workload.executor).observe
+pkg/workload/inprocess/inprocess.go:(*Server).Stop:(*justinsb.com/cloudetcd/pkg/api.Server).GracefulStop
+pkg/workload/inprocess/inprocess.go:Start:(*go.etcd.io/etcd/client/v3.Client).Close
+pkg/workload/inprocess/inprocess.go:Start:(net.Listener).Close
+pkg/workload/report.go:(*Report).Text:(*text/tabwriter.Writer).Flush
+pkg/workload/report.go:(*Report).Text:(*text/tabwriter.Writer).Flush
+pkg/workload/report.go:(*Report).Text:fmt.Fprintf
+pkg/workload/report.go:(*Report).Text:fmt.Fprintf
+pkg/workload/report.go:(*Report).Text:fmt.Fprintln
+pkg/workload/report.go:(*Report).Text:fmt.Fprintln
+pkg/workload/runner.go:(*Runner).ListStorm:(*justinsb.com/cloudetcd/pkg/workload.executor).list
+pkg/workload/runner.go:(*Runner).ListStorm:(*justinsb.com/cloudetcd/pkg/workload.executor).list
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).compact
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).count
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).listAll
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).observe
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
+pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
+pkg/workload/runner.go:(*Runner).Steady:(go.etcd.io/etcd/client/v3.Watcher).Close
+pkg/workload/runner.go:(*Runner).Steady:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
+pkg/workload/runner.go:(*Runner).Steady:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
+pkg/workload/runner.go:(*Runner).emitEvent:(*justinsb.com/cloudetcd/pkg/workload.executor).create
+pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
+pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
+pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
+pkg/workload/runner.go:(*Runner).seedAPIServer:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
+pkg/workload/runner.go:(*Runner).seedAPIServer:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
+pkg/workload/runner.go:(*Runner).stopPod:(*justinsb.com/cloudetcd/pkg/workload.executor).delete
+tests/e2e/binaries.go:download:(*os.File).Close
+tests/e2e/binaries.go:download:(io.Closer).Close
+tests/e2e/binaries.go:ensureKubeAPIServerFromRelease:os.Remove
+tests/e2e/binaries.go:repoRoot:error-only-checked-for-success:os.Stat
+tests/e2e/harness.go:freePort:(net.Listener).Close
+tests/e2e/harness.go:startCloudetcd:(*go.etcd.io/etcd/client/v3.Client).Close
+tests/e2e/harness.go:startCloudetcd:(*justinsb.com/cloudetcd/pkg/api.Server).GracefulStop
+tests/e2e/harness.go:startKubeAPIServer:(*os.Process).Kill
+tests/e2e/harness.go:startKubeAPIServer:(*os/exec.Cmd).Wait
+tests/e2e/harness.go:waitForAPIServerReady:(io.Closer).Close
+tests/e2e/harness.go:waitForAPIServerReady:io.ReadAll
+tests/e2e/harness.go:waitForAPIServerReady:net/http.NewRequestWithContext
