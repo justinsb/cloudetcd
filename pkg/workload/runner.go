@@ -329,8 +329,7 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 		loop(func() {
 			p.every(interval, func(ctx context.Context) {
 				start := time.Now()
-				err := ws.watcher.RequestProgress(ctx)
-				_ = r.exec.observe(OpProgressRequest, start, err)
+				r.exec.record(OpProgressRequest, start, ws.watcher.RequestProgress(ctx))
 			})
 		})
 	}

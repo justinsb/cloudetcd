@@ -4,11 +4,6 @@
 cmd/cloud-etcd-bench/main.go:runBench:(*go.etcd.io/etcd/client/v3.Client).Close
 cmd/cloud-etcd-bench/main.go:runBench:(*os.File).Close
 pkg/api/server.go:(*Server).Start:(*justinsb.com/cloudetcd/pkg/api.Server).GracefulStop
-pkg/api/server.go:(*watchStream).handleCancelRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
-pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
-pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
-pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
-pkg/api/server.go:(*watchStream).handleCreateRequest:(google.golang.org/grpc.BidiStreamingServer[go.etcd.io/etcd/api/v3/etcdserverpb.WatchRequest, go.etcd.io/etcd/api/v3/etcdserverpb.WatchResponse]).Send
 pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).Read:(*os.File).Close
 pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).compactGroup:(*os.File).Close
 pkg/persistence/filesystemlog/filesystem_log.go:(*FilesystemLog).compactGroup:(*os.File).Close
@@ -34,7 +29,6 @@ pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintf
 pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintln
 pkg/workload/analyze.go:(*Analysis).Text:fmt.Fprintln
 pkg/workload/executor.go:(*executor).compact:strconv.ParseInt
-pkg/workload/executor.go:(*executor).updateOrCreate:(*justinsb.com/cloudetcd/pkg/workload.executor).observe
 pkg/workload/inprocess/inprocess.go:(*Server).Stop:(*justinsb.com/cloudetcd/pkg/api.Server).GracefulStop
 pkg/workload/inprocess/inprocess.go:Start:(*go.etcd.io/etcd/client/v3.Client).Close
 pkg/workload/inprocess/inprocess.go:Start:(net.Listener).Close
@@ -50,24 +44,41 @@ pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.ex
 pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).count
 pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
 pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).get
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).listAll
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).observe
 pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
 pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).update
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
-pkg/workload/runner.go:(*Runner).Steady:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
-pkg/workload/runner.go:(*Runner).Steady:(go.etcd.io/etcd/client/v3.Watcher).Close
-pkg/workload/runner.go:(*Runner).Steady:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
-pkg/workload/runner.go:(*Runner).Steady:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
 pkg/workload/runner.go:(*Runner).emitEvent:(*justinsb.com/cloudetcd/pkg/workload.executor).create
+pkg/workload/runner.go:(*Runner).housekeeping:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/runner.go:(*Runner).housekeeping:(*justinsb.com/cloudetcd/pkg/workload.executor).listAll
+pkg/workload/runner.go:(*Runner).housekeeping:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/runner.go:(*Runner).housekeeping:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
+pkg/workload/runner.go:(*Runner).housekeeping:(*justinsb.com/cloudetcd/pkg/workload.executor).upsertWithLease
+pkg/workload/runner.go:(*Runner).housekeeping:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
+pkg/workload/runner.go:(*Runner).housekeeping:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
 pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
 pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
 pkg/workload/runner.go:(*Runner).seedAPIServer:(*justinsb.com/cloudetcd/pkg/workload.executor).create
 pkg/workload/runner.go:(*Runner).seedAPIServer:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
 pkg/workload/runner.go:(*Runner).seedAPIServer:error-only-checked-for-success:(*justinsb.com/cloudetcd/pkg/workload.executor).leaseGrant
 pkg/workload/runner.go:(*Runner).stopPod:(*justinsb.com/cloudetcd/pkg/workload.executor).delete
+pkg/workload/saturate.go:(*Runner).Saturate:(*justinsb.com/cloudetcd/pkg/workload.executor).compact
+pkg/workload/saturate.go:(*Runner).Saturate:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).contend:(*justinsb.com/cloudetcd/pkg/workload.executor).contendedUpdate
+pkg/workload/saturate.go:(*Runner).contend:(*justinsb.com/cloudetcd/pkg/workload.executor).contendedUpdate
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).count
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).get
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).list
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/saturate.go:(*Runner).saturateOp:(*justinsb.com/cloudetcd/pkg/workload.executor).update
+pkg/workload/verify.go:(*Checker).VerifyHistory:(go.etcd.io/etcd/client/v3.Watcher).Close
+pkg/workload/verify.go:(*watchCheck).drain:(go.etcd.io/etcd/client/v3.Watcher).RequestProgress
+pkg/workload/watch.go:(*watchSet).stop:(go.etcd.io/etcd/client/v3.Watcher).Close
+pkg/workload/watch.go:(*watchSet).stop:(go.etcd.io/etcd/client/v3.Watcher).RequestProgress
 tests/e2e/binaries.go:download:(*os.File).Close
 tests/e2e/binaries.go:download:(io.Closer).Close
 tests/e2e/binaries.go:ensureKubeAPIServerFromRelease:os.Remove

@@ -108,6 +108,15 @@ func (ws *watchStream) send(resp *etcdserverpb.WatchResponse) error {
 	return ws.stream.Send(resp)
 }
 
+// sendControl writes a control response (created, canceled) to the stream.
+// A failure means the stream is going away, which its receive loop reports;
+// here it is only logged.
+func (ws *watchStream) sendControl(ctx context.Context, resp *etcdserverpb.WatchResponse) {
+	if err := ws.send(resp); err != nil {
+		klog.FromContext(ctx).Error(err, "failed to send watch control response", "watchID", resp.WatchId)
+	}
+}
+
 // activeWatch represents a single active watch
 type activeWatch struct {
 	id      int64
@@ -474,12 +483,12 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 				log.Error(cerr, "failed to get current revision for compacted-watch cancel; using the compacted revision in the header")
 				current = logPosition
 			}
-			ws.send(&etcdserverpb.WatchResponse{
+			ws.sendControl(ctx, &etcdserverpb.WatchResponse{
 				Header:  ws.server.createHeader(current),
 				WatchId: watchID,
 				Created: true,
 			})
-			ws.send(&etcdserverpb.WatchResponse{
+			ws.sendControl(ctx, &etcdserverpb.WatchResponse{
 				Header:          ws.server.createHeader(current),
 				WatchId:         watchID,
 				Canceled:        true,
@@ -494,7 +503,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 			Created:  false,
 			Canceled: true,
 		}
-		ws.send(resp)
+		ws.sendControl(ctx, resp)
 		return err
 	}
 
@@ -504,7 +513,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 		WatchId: watchID,
 		Created: true,
 	}
-	ws.send(resp)
+	ws.sendControl(ctx, resp)
 
 	// Create active watch
 	activeWatch := &activeWatch{
@@ -553,7 +562,7 @@ func (ws *watchStream) handleCancelRequest(ctx context.Context, req *etcdserverp
 			WatchId:  watchID,
 			Canceled: true,
 		}
-		ws.send(resp)
+		ws.sendControl(ctx, resp)
 	}
 }
 

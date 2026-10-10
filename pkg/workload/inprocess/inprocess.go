@@ -23,6 +23,7 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"k8s.io/klog/v2"
 
 	"justinsb.com/cloudetcd/pkg/api"
 	"justinsb.com/cloudetcd/pkg/persistence"
@@ -114,7 +115,9 @@ func (s *Server) Stop() {
 	case <-time.After(10 * time.Second):
 	}
 	s.Store.WaitForCompaction()
-	_ = s.log.Close()
+	if err := s.log.Close(); err != nil {
+		klog.Warningf("closing log: %v", err)
+	}
 }
 
 // NewClient returns an etcd client connected to the server. Like

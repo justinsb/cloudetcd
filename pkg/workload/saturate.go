@@ -111,7 +111,7 @@ func (r *Runner) Saturate(ctx context.Context, opts SaturateOptions) (*Report, e
 		loop(func() {
 			bg.every(interval, func(ctx context.Context) {
 				start := time.Now()
-				_ = r.exec.observe(OpProgressRequest, start, ws.watcher.RequestProgress(ctx))
+				r.exec.record(OpProgressRequest, start, ws.watcher.RequestProgress(ctx))
 			})
 		})
 	}

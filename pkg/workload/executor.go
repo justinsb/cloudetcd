@@ -66,7 +66,14 @@ func (e *executor) getStats() *Stats {
 	return e.stats
 }
 
+// observe records an op's outcome and returns err, for callers that return it.
 func (e *executor) observe(op string, start time.Time, err error) error {
+	e.record(op, start, err)
+	return err
+}
+
+// record records an op's outcome.
+func (e *executor) record(op string, start time.Time, err error) {
 	stats := e.getStats()
 	st := stats.Op(op)
 	st.Count.Add(1)
@@ -75,7 +82,6 @@ func (e *executor) observe(op string, start time.Time, err error) error {
 		st.Errors.Add(1)
 		stats.recordError(op, err)
 	}
-	return err
 }
 
 func (e *executor) conflict(op string) {
@@ -254,7 +260,7 @@ func (e *executor) updateFrom(ctx context.Context, op, key string, rev int64, va
 				e.state.delete(key)
 			}
 			if createIfMissing {
-				e.observe(op, start, nil)
+				e.record(op, start, nil)
 				return e.create(ctx, op, key, value[:len(value)-e.stampSize()], leaseID)
 			}
 			if contended {
