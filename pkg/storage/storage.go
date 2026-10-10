@@ -55,6 +55,10 @@ type Watcher interface {
 
 	// Run starts the watcher.
 	Run(ctx context.Context) error
+
+	// Delivered returns the revision through which every event the watch
+	// selects has been handed to its callback.
+	Delivered() Revision
 }
 
 // WatcherStatus describes how far a watcher has got: Delivered is the last

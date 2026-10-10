@@ -20,20 +20,25 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // executor issues etcd RPCs shaped like kube-apiserver's storage layer and
 // records their outcome. It is stateful: like the apiserver, it remembers the
 // mod_revision of every key it wrote so that updates and deletes can be
-// conditional on it.
+// conditional on it. When a Checker is attached, every response is also
+// checked against the oracle.
 type executor struct {
 	cfg   *Config
 	kv    clientv3.KV
 	lease clientv3.Lease
 	state *stateMap
+	// check is the correctness oracle, or nil to only measure.
+	check *Checker
 
 	mu    sync.RWMutex
 	stats *Stats
@@ -42,6 +47,9 @@ type executor struct {
 	compactMu      sync.Mutex
 	compactVersion int64
 	compactRev     int64
+	// lastCompacted is the revision the most recent Compact RPC asked for;
+	// the server's compaction point is at or below it.
+	lastCompacted atomic.Int64
 }
 
 var errNotFound = errors.New("key not found")
@@ -58,7 +66,14 @@ func (e *executor) getStats() *Stats {
 	return e.stats
 }
 
+// observe records an op's outcome and returns err, for callers that return it.
 func (e *executor) observe(op string, start time.Time, err error) error {
+	e.record(op, start, err)
+	return err
+}
+
+// record records an op's outcome.
+func (e *executor) record(op string, start time.Time, err error) {
 	stats := e.getStats()
 	st := stats.Op(op)
 	st.Count.Add(1)
@@ -67,17 +82,56 @@ func (e *executor) observe(op string, start time.Time, err error) error {
 		st.Errors.Add(1)
 		stats.recordError(op, err)
 	}
-	return err
 }
 
 func (e *executor) conflict(op string) {
 	e.getStats().Op(op).Conflicts.Add(1)
 }
 
+// stamp prepares a value for writing: with a checker attached it gets the
+// nonce trailer the oracle matches reads against.
+func (e *executor) stamp(value []byte) ([]byte, uint64) {
+	if e.check == nil {
+		return value, 0
+	}
+	return e.check.stamp(value)
+}
+
+// begin returns the revision floor for a request about to be issued.
+func (e *executor) begin() int64 {
+	if e.check == nil {
+		return 0
+	}
+	return e.check.begin()
+}
+
+// header checks a response header against the floor.
+func (e *executor) header(hdr *etcdserverpb.ResponseHeader, floor int64, op string) {
+	if e.check != nil {
+		e.check.header(hdr, floor, op)
+	}
+}
+
+// writeBegin/writeEnd bracket a write for the oracle's in-flight accounting.
+func (e *executor) writeBegin(key string) {
+	if e.check != nil {
+		e.check.writeBegin(key)
+	}
+}
+
+func (e *executor) writeEnd(key string, ok bool) {
+	if e.check != nil {
+		e.check.writeEnd(key, ok)
+	}
+}
+
 // create is apiserver's Create: Txn(If mod_revision(key)==0 Then Put Else Get).
 func (e *executor) create(ctx context.Context, op, key string, value []byte, leaseID clientv3.LeaseID) error {
 	e.state.beginWrite(key)
+	e.writeBegin(key)
+	value, nonce := e.stamp(value)
 	start := time.Now()
+	floor := e.begin()
 	var opts []clientv3.OpOption
 	if leaseID != 0 {
 		opts = append(opts, clientv3.WithLease(leaseID))
@@ -88,22 +142,33 @@ func (e *executor) create(ctx context.Context, op, key string, value []byte, lea
 		Else(clientv3.OpGet(key)).
 		Commit()
 	if err != nil {
+		e.writeEnd(key, false)
 		return e.observe(op, start, err)
 	}
+	e.header(resp.Header, floor, op)
 	if !resp.Succeeded {
 		// AlreadyExists; adopt the existing revision so later updates work.
 		e.conflict(op)
 		if kvs := resp.Responses[0].GetResponseRange().GetKvs(); len(kvs) > 0 {
 			e.state.endWrite(key, kvs[0].ModRevision)
 		}
+		if e.check != nil {
+			e.check.conflict(key, 0, (*etcdserverpb.TxnResponse)(resp), op)
+		}
+		e.writeEnd(key, true)
 		return e.observe(op, start, fmt.Errorf("create %s: already exists", key))
 	}
 	e.state.endWrite(key, resp.Header.Revision)
+	if e.check != nil {
+		e.check.createOK(key, resp.Header.Revision, nonce, int64(leaseID), op)
+	}
+	e.writeEnd(key, true)
 	return e.observe(op, start, nil)
 }
 
 // update is apiserver's GuaranteedUpdate: Txn(If mod_revision(key)==rev Then
-// Put Else Get); on a conflict it re-reads the revision and retries once.
+// Put Else Get); on a conflict it re-reads the revision and retries, up to
+// Config.UpdateRetries times.
 func (e *executor) update(ctx context.Context, op, key string, value []byte) error {
 	return e.updateWithLease(ctx, op, key, value, 0)
 }
@@ -122,49 +187,116 @@ func (e *executor) upsertWithLease(ctx context.Context, op, key string, value []
 
 func (e *executor) updateOrCreate(ctx context.Context, op, key string, value []byte, leaseID clientv3.LeaseID, createIfMissing bool) error {
 	rev := e.state.beginWrite(key)
+	return e.updateFrom(ctx, op, key, rev, value, leaseID, createIfMissing, false)
+}
+
+// contendedUpdate is GuaranteedUpdate as a second writer does it: read the
+// current mod_revision, then write conditionally on it, retrying on
+// conflict. It is what a controller or the scheduler does to an object a
+// kubelet also writes, and it does not update the owner's remembered
+// revision, so the owner sees the conflict the apiserver would.
+func (e *executor) contendedUpdate(ctx context.Context, op, key string, value []byte) error {
+	start := time.Now()
+	floor := e.begin()
+	getResp, err := e.kv.Get(ctx, key)
+	if err != nil {
+		return e.observe(op, start, err)
+	}
+	e.header(getResp.Header, floor, op)
+	if e.check != nil {
+		e.check.rangeResult(key, (*etcdserverpb.RangeResponse)(getResp), op)
+	}
+	if len(getResp.Kvs) == 0 {
+		// The object is gone (the pod was deleted under us): the apiserver
+		// returns NotFound to its client, which is not a failure here.
+		return e.observe(op, start, nil)
+	}
+	return e.updateFrom(ctx, op, key, getResp.Kvs[0].ModRevision, value, 0, false, true)
+}
+
+// updateFrom issues the conditional put loop from a known revision. If
+// contended is set the owner's remembered revision is left alone.
+func (e *executor) updateFrom(ctx context.Context, op, key string, rev int64, value []byte, leaseID clientv3.LeaseID, createIfMissing, contended bool) error {
+	e.writeBegin(key)
+	value, nonce := e.stamp(value)
 	start := time.Now()
 	var opts []clientv3.OpOption
 	if leaseID != 0 {
 		opts = append(opts, clientv3.WithLease(leaseID))
 	}
+	remember := func(rev int64) {
+		if !contended {
+			e.state.endWrite(key, rev)
+		}
+	}
 	for attempt := 0; ; attempt++ {
+		floor := e.begin()
 		resp, err := e.kv.Txn(ctx).
 			If(clientv3.Compare(clientv3.ModRevision(key), "=", rev)).
 			Then(clientv3.OpPut(key, string(value), opts...)).
 			Else(clientv3.OpGet(key)).
 			Commit()
 		if err != nil {
+			e.writeEnd(key, false)
 			return e.observe(op, start, err)
 		}
+		e.header(resp.Header, floor, op)
 		if resp.Succeeded {
-			e.state.endWrite(key, resp.Header.Revision)
+			remember(resp.Header.Revision)
+			if e.check != nil {
+				e.check.put(key, resp.Header.Revision, nonce, int64(leaseID), op)
+			}
+			e.writeEnd(key, true)
 			return e.observe(op, start, nil)
 		}
 		e.conflict(op)
+		if e.check != nil {
+			e.check.conflict(key, rev, (*etcdserverpb.TxnResponse)(resp), op)
+		}
 		kvs := resp.Responses[0].GetResponseRange().GetKvs()
 		if len(kvs) == 0 {
-			e.state.delete(key)
+			e.writeEnd(key, true)
+			if !contended {
+				e.state.delete(key)
+			}
 			if createIfMissing {
-				e.observe(op, start, nil)
-				return e.create(ctx, op, key, value, leaseID)
+				e.record(op, start, nil)
+				return e.create(ctx, op, key, value[:len(value)-e.stampSize()], leaseID)
+			}
+			if contended {
+				return e.observe(op, start, nil) // deleted under us: NotFound to the client
 			}
 			return e.observe(op, start, fmt.Errorf("update %s: %w", key, errNotFound))
 		}
 		rev = kvs[0].ModRevision
-		if attempt >= 1 {
-			e.state.endWrite(key, rev)
-			return e.observe(op, start, fmt.Errorf("update %s: conflict after retry", key))
+		if attempt >= e.cfg.UpdateRetries {
+			remember(rev)
+			e.writeEnd(key, true)
+			return e.observe(op, start, fmt.Errorf("update %s: conflict after %d retries", key, attempt))
 		}
 	}
+}
+
+// stampSize is the length of the trailer stamp adds.
+func (e *executor) stampSize() int {
+	if e.check == nil {
+		return 0
+	}
+	return nonceSize
 }
 
 // delete is apiserver's Delete: a Get to learn the current state, then
 // Txn(If mod_revision(key)==rev Then DeleteRange Else Get).
 func (e *executor) delete(ctx context.Context, op, key string) error {
 	start := time.Now()
+	floor := e.begin()
 	getResp, err := e.kv.Get(ctx, key)
 	if err != nil {
 		return e.observe(op, start, err)
+	}
+	e.header(getResp.Header, floor, op)
+	if e.check != nil {
+		e.check.rangeResult(key, (*etcdserverpb.RangeResponse)(getResp), op)
 	}
 	if len(getResp.Kvs) == 0 {
 		e.state.delete(key)
@@ -172,28 +304,41 @@ func (e *executor) delete(ctx context.Context, op, key string) error {
 	}
 	rev := getResp.Kvs[0].ModRevision
 	e.state.beginWrite(key)
+	e.writeBegin(key)
 	for attempt := 0; ; attempt++ {
+		floor := e.begin()
 		resp, err := e.kv.Txn(ctx).
 			If(clientv3.Compare(clientv3.ModRevision(key), "=", rev)).
 			Then(clientv3.OpDelete(key)).
 			Else(clientv3.OpGet(key)).
 			Commit()
 		if err != nil {
+			e.writeEnd(key, false)
 			return e.observe(op, start, err)
 		}
+		e.header(resp.Header, floor, op)
 		if resp.Succeeded {
 			e.state.delete(key)
+			if e.check != nil {
+				e.check.del(key, resp.Header.Revision, op)
+			}
+			e.writeEnd(key, true)
 			return e.observe(op, start, nil)
 		}
 		e.conflict(op)
+		if e.check != nil {
+			e.check.conflict(key, rev, (*etcdserverpb.TxnResponse)(resp), op)
+		}
 		kvs := resp.Responses[0].GetResponseRange().GetKvs()
 		if len(kvs) == 0 {
 			e.state.delete(key)
+			e.writeEnd(key, true)
 			return e.observe(op, start, nil)
 		}
 		rev = kvs[0].ModRevision
-		if attempt >= 1 {
-			return e.observe(op, start, fmt.Errorf("delete %s: conflict after retry", key))
+		if attempt >= e.cfg.UpdateRetries {
+			e.writeEnd(key, true)
+			return e.observe(op, start, fmt.Errorf("delete %s: conflict after %d retries", key, attempt))
 		}
 	}
 }
@@ -203,40 +348,71 @@ func (e *executor) delete(ctx context.Context, op, key string) error {
 // from its watch cache, and on /registry/health as its etcd health probe.
 func (e *executor) get(ctx context.Context, op, key string) error {
 	start := time.Now()
-	_, err := e.kv.Get(ctx, key)
-	return e.observe(op, start, err)
+	floor := e.begin()
+	resp, err := e.kv.Get(ctx, key)
+	if err != nil {
+		return e.observe(op, start, err)
+	}
+	e.header(resp.Header, floor, op)
+	if e.check != nil {
+		e.check.rangeResult(key, (*etcdserverpb.RangeResponse)(resp), op)
+	}
+	return e.observe(op, start, nil)
 }
 
 // listAll is an unpaginated list of a small prefix, as the masterlease
 // reconciler does every 10s.
 func (e *executor) listAll(ctx context.Context, op, prefix string) error {
 	start := time.Now()
-	_, err := e.kv.Get(ctx, prefix, clientv3.WithRange(prefixEnd(prefix)))
-	return e.observe(op, start, err)
+	floor := e.begin()
+	resp, err := e.kv.Get(ctx, prefix, clientv3.WithRange(prefixEnd(prefix)))
+	if err != nil {
+		return e.observe(op, start, err)
+	}
+	e.header(resp.Header, floor, op)
+	if e.check != nil {
+		l := e.check.list(prefix, op)
+		l.page((*etcdserverpb.RangeResponse)(resp))
+	}
+	return e.observe(op, start, nil)
 }
 
 // list is a full paginated list of prefix at a consistent revision, as a
-// reflector's initial list does. It returns the number of keys seen.
-func (e *executor) list(ctx context.Context, op, prefix string, pageSize int64) (int, error) {
+// reflector's initial list does. It returns the number of keys seen. With
+// complete set, the oracle also checks that nothing live was left out
+// (which costs a pass over the oracle's keys).
+func (e *executor) list(ctx context.Context, op, prefix string, pageSize int64, complete bool) (int, error) {
 	start := time.Now()
 	end := prefixEnd(prefix)
 	key := prefix
 	var rev int64
 	n := 0
+	var l *listCheck
+	if e.check != nil {
+		l = e.check.list(prefix, op)
+	}
 	for {
 		opts := []clientv3.OpOption{clientv3.WithRange(end), clientv3.WithLimit(pageSize)}
 		if rev != 0 {
 			opts = append(opts, clientv3.WithRev(rev))
 		}
+		floor := e.begin()
 		resp, err := e.kv.Get(ctx, key, opts...)
 		if err != nil {
 			return n, e.observe(op, start, err)
 		}
+		e.header(resp.Header, floor, op)
 		if rev == 0 {
 			rev = resp.Header.Revision
 		}
+		if l != nil {
+			l.page((*etcdserverpb.RangeResponse)(resp))
+		}
 		n += len(resp.Kvs)
 		if !resp.More || len(resp.Kvs) == 0 {
+			if l != nil && complete {
+				l.complete()
+			}
 			return n, e.observe(op, start, nil)
 		}
 		key = string(resp.Kvs[len(resp.Kvs)-1].Key) + "\x00"
@@ -246,8 +422,13 @@ func (e *executor) list(ctx context.Context, op, prefix string, pageSize int64) 
 // count is apiserver's Count: a count-only range over the resource prefix.
 func (e *executor) count(ctx context.Context, op, prefix string) error {
 	start := time.Now()
-	_, err := e.kv.Get(ctx, prefix, clientv3.WithRange(prefixEnd(prefix)), clientv3.WithCountOnly())
-	return e.observe(op, start, err)
+	floor := e.begin()
+	resp, err := e.kv.Get(ctx, prefix, clientv3.WithRange(prefixEnd(prefix)), clientv3.WithCountOnly())
+	if err != nil {
+		return e.observe(op, start, err)
+	}
+	e.header(resp.Header, floor, op)
+	return e.observe(op, start, nil)
 }
 
 // leaseGrant grants a lease with the given TTL.
@@ -256,6 +437,9 @@ func (e *executor) leaseGrant(ctx context.Context, op string, ttl time.Duration)
 	resp, err := e.lease.Grant(ctx, int64(ttl.Seconds()))
 	if err != nil {
 		return 0, e.observe(op, start, err)
+	}
+	if e.check != nil {
+		e.check.lease(int64(resp.ID), time.Duration(resp.TTL)*time.Second, start)
 	}
 	return resp.ID, e.observe(op, start, nil)
 }
@@ -267,6 +451,7 @@ func (e *executor) compact(ctx context.Context, op string) error {
 	defer e.compactMu.Unlock()
 	start := time.Now()
 
+	floor := e.begin()
 	resp, err := e.kv.Txn(ctx).
 		If(clientv3.Compare(clientv3.Version(compactRevKey), "=", e.compactVersion)).
 		Then(clientv3.OpPut(compactRevKey, strconv.FormatInt(e.compactRev, 10))).
@@ -275,6 +460,7 @@ func (e *executor) compact(ctx context.Context, op string) error {
 	if err != nil {
 		return e.observe(op, start, err)
 	}
+	e.header(resp.Header, floor, op)
 	if !resp.Succeeded {
 		// Another apiserver compacted; adopt its state.
 		e.conflict(op)
@@ -291,6 +477,9 @@ func (e *executor) compact(ctx context.Context, op string) error {
 		return e.observe(op, start, nil)
 	}
 	_, err = e.kv.Compact(ctx, prev)
+	if err == nil {
+		e.lastCompacted.Store(prev)
+	}
 	return e.observe(op, start, err)
 }
 
@@ -308,8 +497,8 @@ type leaseCache struct {
 	attached int
 }
 
-func newLeaseCache(ttl time.Duration) *leaseCache {
-	return &leaseCache{ttl: ttl, reuseDuration: time.Minute, maxObjects: 1000}
+func newLeaseCache(ttl, reuse time.Duration) *leaseCache {
+	return &leaseCache{ttl: ttl, reuseDuration: reuse, maxObjects: 1000}
 }
 
 func (l *leaseCache) get(ctx context.Context, e *executor) (clientv3.LeaseID, error) {

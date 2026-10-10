@@ -16,6 +16,7 @@
 // nodes against cloudetcd, without running kube-apiserver or any nodes.
 //
 //	cloud-etcd-bench run -nodes 1000 -pods-per-node 30 -duration 2m
+//	cloud-etcd-bench run -nodes 100 -phases populate,saturate,verify -saturate-duration 1m
 //	cloud-etcd-bench run -nodes 100 -log filesystem:///var/tmp/bench -phases populate,steady,list-storm
 //	cloud-etcd-bench run -endpoint 127.0.0.1:2379 -nodes 100
 //	cloud-etcd-bench run -nodes 100 -node-images 50 -pod-containers 3
@@ -94,7 +95,11 @@ func runBench(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.Prefix, "prefix", cfg.Prefix, "etcd key prefix")
 
 	duration := fs.Duration("duration", time.Minute, "Duration of the steady-state phase")
-	phases := fs.String("phases", "populate,steady", "Comma-separated phases to run: populate, steady, list-storm")
+	saturateDuration := fs.Duration("saturate-duration", 30*time.Second, "Duration of the saturate phase")
+	seed := fs.Uint64("seed", 0, "Seed for the saturate phase's random choices (0: from the clock; the report prints it)")
+	contention := fs.Float64("contention", 0, "Share of saturate-phase operations that contend a key another writer owns (0: default 0.15; negative: none)")
+	verify := fs.Bool("verify", true, "Check every response against the workload's own record of what it wrote, and report violations (costs one record per write in memory)")
+	phases := fs.String("phases", "populate,steady", "Comma-separated phases to run: populate, steady, saturate, list-storm, verify")
 	logURI := fs.String("log", "memory://", "Log URI for the in-process server (memory:// is a temporary directory; filesystem:///path; gs://bucket/prefix)")
 	endpoint := fs.String("endpoint", "", "Run against this etcd endpoint instead of starting an in-process server")
 	workers := fs.Int("workers", 64, "Concurrent requests in flight")
@@ -178,6 +183,7 @@ func runBench(ctx context.Context, args []string) error {
 		runner.WatcherStatus = srv.Store.Watchers
 		runner.LogBytes = func() int64 { return dirBytes(srv.LogDir) }
 	}
+	runner.SetVerify(*verify)
 
 	fmt.Fprintf(os.Stderr, "model: %d nodes, %d pods, %d keys; blobs %v\n", cfg.Nodes, cfg.Pods(), cfg.Keys(), cfg.Blobs.Sizes())
 	var reports []*workload.Report
@@ -198,9 +204,27 @@ func runBench(ctx context.Context, args []string) error {
 		case "steady":
 			fmt.Fprintf(os.Stderr, "phase steady for %s...\n", *duration)
 			rep, err = runner.Steady(ctx, *duration)
+		case "saturate":
+			fmt.Fprintf(os.Stderr, "phase saturate for %s...\n", *saturateDuration)
+			rep, err = runner.Saturate(ctx, workload.SaturateOptions{Duration: *saturateDuration, Seed: *seed, Contention: *contention})
+			if rep != nil && *output != "json" {
+				defer fmt.Println("HEADLINE " + rep.Headline())
+			}
 		case "list-storm":
 			fmt.Fprintf(os.Stderr, "phase list-storm (%d x %d)...\n", *stormConcurrency, *stormRounds)
 			rep, err = runner.ListStorm(ctx, *stormConcurrency, *stormRounds)
+		case "verify":
+			// With nothing in flight, the server's state must be exactly
+			// what was written.
+			if check := runner.Checker(); check != nil {
+				fmt.Fprintf(os.Stderr, "verifying state...\n")
+				n, verr := check.VerifyState(ctx, client, cfg.Prefix, cfg.ListPageSize)
+				if verr != nil {
+					return verr
+				}
+				live, expiring := check.LiveKeys()
+				fmt.Fprintf(os.Stderr, "state: %d keys match the oracle (%d live, %d of them on leases that may have expired)\n", n, live, expiring)
+			}
 		case "":
 			continue
 		default:
@@ -219,6 +243,18 @@ func runBench(ctx context.Context, args []string) error {
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(reports); err != nil {
 			return err
+		}
+	}
+	if check := runner.Checker(); check != nil {
+		if n := check.ViolationCount(); n > 0 {
+			for i, v := range check.Violations() {
+				if i >= 20 {
+					fmt.Fprintf(os.Stderr, "... %d more violations\n", n-int64(i))
+					break
+				}
+				fmt.Fprintf(os.Stderr, "violation: %v\n", v)
+			}
+			return fmt.Errorf("%d correctness violations", n)
 		}
 	}
 	if *memProfile != "" {

@@ -153,6 +153,11 @@ func (w *memoryWatcher) ID() int64 {
 	return w.id
 }
 
+// Delivered returns the revision through which events have been sent.
+func (w *memoryWatcher) Delivered() Revision {
+	return Revision(w.delivered.Load())
+}
+
 func (w *memoryWatcher) Close() {
 	w.stateMutex.Lock()
 	defer w.stateMutex.Unlock()

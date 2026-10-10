@@ -16,7 +16,6 @@ package workload
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,8 +34,15 @@ import (
 //   - Steady: the cluster hums — node lease renewals, node status reports,
 //     pod churn with events, apiserver housekeeping (masterlease, counts,
 //     compaction) and consistent reads, with the apiserver's watches attached.
+//   - Saturate: the same kinds of operations, but closed-loop and in a
+//     seeded random mix with deliberate contention, as fast as the server
+//     will take them. Its throughput is the benchmark's headline.
 //   - ListStorm: many clients relist everything at once, which is what
 //     happens when watch caches fall behind and controllers restart.
+//
+// Every response is checked against a Checker (the correctness oracle)
+// unless verification is turned off; violations are counted in each phase's
+// Report and available from Checker.
 type Runner struct {
 	cfg    Config
 	client *clientv3.Client
@@ -60,9 +66,14 @@ type Runner struct {
 	// podGen is the generation of each pod slot (node*PodsPerNode+slot),
 	// incremented on every churn so that names are never reused.
 	podGen []atomic.Uint64
+	// slotBusy marks pod slots with a lifecycle in progress, so that two
+	// workers do not churn the same slot at once (one pod has one kubelet).
+	slotBusy []atomic.Bool
+	// extraEvents numbers the events Saturate emits outside pod lifecycles.
+	extraEvents atomic.Int64
 }
 
-// NewRunner creates a Runner for cfg against client.
+// NewRunner creates a Runner for cfg against client, with verification on.
 func NewRunner(cfg Config, client *clientv3.Client, workers int) (*Runner, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -72,13 +83,14 @@ func NewRunner(cfg Config, client *clientv3.Client, workers int) (*Runner, error
 	}
 	state := newStateMap()
 	r := &Runner{
-		cfg:     cfg,
-		client:  client,
-		Workers: workers,
-		state:   state,
-		exec:    &executor{cfg: &cfg, kv: client.KV, lease: client.Lease, state: state, stats: NewStats()},
-		events:  newLeaseCache(cfg.EventTTL),
-		podGen:  make([]atomic.Uint64, cfg.Pods()),
+		cfg:      cfg,
+		client:   client,
+		Workers:  workers,
+		state:    state,
+		exec:     &executor{kv: client.KV, lease: client.Lease, state: state, stats: NewStats(), check: NewChecker()},
+		events:   newLeaseCache(cfg.EventTTL, cfg.EventLeaseReuse),
+		podGen:   make([]atomic.Uint64, cfg.Pods()),
+		slotBusy: make([]atomic.Bool, cfg.Pods()),
 	}
 	r.exec.cfg = &r.cfg
 	return r, nil
@@ -87,10 +99,40 @@ func NewRunner(cfg Config, client *clientv3.Client, workers int) (*Runner, error
 // Config returns the runner's configuration.
 func (r *Runner) Config() *Config { return &r.cfg }
 
+// Checker returns the correctness oracle, or nil if verification is off.
+func (r *Runner) Checker() *Checker { return r.exec.check }
+
+// LastCompaction returns the revision the workload most recently asked the
+// server to compact to (0 if it has not). The server's compaction point is
+// at or below it, so history above it must be readable.
+func (r *Runner) LastCompaction() int64 { return r.exec.lastCompacted.Load() }
+
+// SetVerify turns response verification on or off. It must be called before
+// the first phase; turning it off saves the oracle's memory (one record per
+// write) on long benchmark runs.
+func (r *Runner) SetVerify(on bool) {
+	switch {
+	case on && r.exec.check == nil:
+		r.exec.check = NewChecker()
+	case !on:
+		r.exec.check = nil
+	}
+}
+
 func (r *Runner) beginPhase() *Stats {
 	stats := NewStats()
+	if r.exec.check != nil {
+		stats.violationsBefore = r.exec.check.ViolationCount()
+	}
 	r.exec.setStats(stats)
 	return stats
+}
+
+// endPhase settles the oracle's parked checks once no write is in flight.
+func (r *Runner) endPhase() {
+	if r.exec.check != nil {
+		r.exec.check.Drain()
+	}
 }
 
 // Populate brings the cluster up: nodes, node leases and pods are created as
@@ -102,12 +144,12 @@ func (r *Runner) Populate(ctx context.Context) (*Report, error) {
 	p := newPool(ctx, ctx, r.Workers, stats)
 	p.submit(job{fn: r.seedAPIServer})
 	for i := 0; i < r.cfg.Nodes; i++ {
-		i := i
 		if !p.submit(job{fn: func(ctx context.Context) { r.registerNode(ctx, i) }}) {
 			break
 		}
 	}
 	p.close()
+	r.endPhase()
 	return r.report("populate", stats, nil), ctx.Err()
 }
 
@@ -122,6 +164,23 @@ func (r *Runner) seedAPIServer(ctx context.Context) {
 		_ = r.exec.create(ctx, OpPeerServerLease, c.peerServerLeaseKey(), c.Blobs.MasterLease, leaseID)
 	}
 	_ = r.exec.create(ctx, OpAPIServerLease, c.apiserverLeaseKey(), c.Blobs.NodeLease, 0)
+}
+
+// housekeeping is one round of the apiserver's own 10s traffic: the
+// masterlease reconciler reads and lists the masterleases then refreshes its
+// own under a fresh lease; the peer-server lease and the apiserver's identity
+// Lease are refreshed on the same cadence.
+func (r *Runner) housekeeping(ctx context.Context) {
+	c := &r.cfg
+	_ = r.exec.get(ctx, OpMasterLease, c.masterLeaseKey())
+	_ = r.exec.listAll(ctx, OpMasterLease, c.resourcePrefix(resourceMasterLeases))
+	if leaseID, err := r.exec.leaseGrant(ctx, OpLeaseGrant, c.MasterLeaseTTL); err == nil {
+		_ = r.exec.upsertWithLease(ctx, OpMasterLease, c.masterLeaseKey(), c.Blobs.MasterLease, leaseID)
+	}
+	if leaseID, err := r.exec.leaseGrant(ctx, OpLeaseGrant, c.MasterLeaseTTL); err == nil {
+		_ = r.exec.upsertWithLease(ctx, OpPeerServerLease, c.peerServerLeaseKey(), c.Blobs.MasterLease, leaseID)
+	}
+	_ = r.exec.update(ctx, OpAPIServerLease, c.apiserverLeaseKey(), c.Blobs.NodeLease)
 }
 
 func (r *Runner) registerNode(ctx context.Context, i int) {
@@ -174,11 +233,10 @@ func (r *Runner) stopPod(ctx context.Context, node, slot int, gen uint64) {
 	_ = r.exec.delete(ctx, OpPodDelete, key)
 }
 
+// emitEvent writes event n of a pod's generation; lifecycle events are
+// numbered below EventsPerPodLifecycle.
 func (r *Runner) emitEvent(ctx context.Context, node, slot int, gen uint64, n int) {
 	c := &r.cfg
-	if n >= c.EventsPerPodLifecycle {
-		return
-	}
 	leaseID, err := r.events.get(ctx, r.exec)
 	if err != nil {
 		return
@@ -186,13 +244,26 @@ func (r *Runner) emitEvent(ctx context.Context, node, slot int, gen uint64, n in
 	_ = r.exec.create(ctx, OpEventCreate, c.eventKey(node, slot, gen, n), c.Blobs.Event, leaseID)
 }
 
-// churnPod replaces the pod in a slot with a new generation.
-func (r *Runner) churnPod(ctx context.Context, node, slot int) {
-	g := &r.podGen[node*r.cfg.PodsPerNode+slot]
+// churnPod replaces the pod in a slot with a new generation. It returns
+// false, doing nothing, if the slot's previous lifecycle is still running.
+func (r *Runner) churnPod(ctx context.Context, node, slot int) bool {
+	i := node*r.cfg.PodsPerNode + slot
+	if !r.slotBusy[i].CompareAndSwap(false, true) {
+		return false
+	}
+	defer r.slotBusy[i].Store(false)
+	g := &r.podGen[i]
 	gen := g.Load()
 	r.stopPod(ctx, node, slot, gen)
 	g.Store(gen + 1)
 	r.startPod(ctx, node, slot, gen+1)
+	return true
+}
+
+// currentPodKey is the key of the pod currently in a slot (which may be mid
+// lifecycle).
+func (r *Runner) currentPodKey(node, slot int) string {
+	return r.cfg.podKey(node, slot, r.podGen[node*r.cfg.PodsPerNode+slot].Load())
 }
 
 // Steady runs the steady-state workload for d and returns its report.
@@ -200,39 +271,15 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 	c := &r.cfg
 	stats := r.beginPhase()
 
-	// The apiserver lists then watches from the list's revision; here we just
-	// need a current revision to watch from.
-	revResp, err := r.client.Get(ctx, c.Prefix+"/health")
+	ws, err := r.startWatches(ctx, stats)
 	if err != nil {
-		return nil, fmt.Errorf("getting current revision: %w", err)
+		return nil, err
 	}
-	rev := revResp.Header.Revision
 
 	// schedCtx bounds the phase; ops still in flight at the deadline finish
 	// under the parent ctx.
 	schedCtx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
-	watchCtx, stopWatches := context.WithCancel(ctx)
-	defer stopWatches()
-
-	var watchers sync.WaitGroup
-	watcher := clientv3.NewWatcher(r.client)
-	for _, res := range watchedResources {
-		res := res
-		watchers.Add(1)
-		go func() {
-			defer watchers.Done()
-			r.watchPrefix(watchCtx, watcher, res, c.resourcePrefix(res), rev, stats.Watch(res))
-		}()
-	}
-
-	if r.WatcherStatus != nil {
-		watchers.Add(1)
-		go func() {
-			defer watchers.Done()
-			r.sampleWatchers(watchCtx, stats)
-		}()
-	}
 
 	p := newPool(schedCtx, ctx, r.Workers, stats)
 	var loops sync.WaitGroup
@@ -264,22 +311,8 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 			})
 		})
 	}
-	// apiserver housekeeping every MasterLeaseInterval: the masterlease
-	// reconciler reads and lists the masterleases then refreshes its own
-	// under a fresh lease; the peer-server lease and the apiserver's identity
-	// Lease are refreshed on the same cadence.
 	loop(func() {
-		p.every(c.MasterLeaseInterval, func(ctx context.Context) {
-			_ = r.exec.get(ctx, OpMasterLease, c.masterLeaseKey())
-			_ = r.exec.listAll(ctx, OpMasterLease, c.resourcePrefix(resourceMasterLeases))
-			if leaseID, err := r.exec.leaseGrant(ctx, OpLeaseGrant, c.MasterLeaseTTL); err == nil {
-				_ = r.exec.upsertWithLease(ctx, OpMasterLease, c.masterLeaseKey(), c.Blobs.MasterLease, leaseID)
-			}
-			if leaseID, err := r.exec.leaseGrant(ctx, OpLeaseGrant, c.MasterLeaseTTL); err == nil {
-				_ = r.exec.upsertWithLease(ctx, OpPeerServerLease, c.peerServerLeaseKey(), c.Blobs.MasterLease, leaseID)
-			}
-			_ = r.exec.update(ctx, OpAPIServerLease, c.apiserverLeaseKey(), c.Blobs.NodeLease)
-		})
+		p.every(c.MasterLeaseInterval, r.housekeeping)
 	})
 	loop(func() {
 		p.spread(len(countedResources), c.CountInterval, func(ctx context.Context, i int) {
@@ -296,8 +329,7 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 		loop(func() {
 			p.every(interval, func(ctx context.Context) {
 				start := time.Now()
-				err := watcher.RequestProgress(ctx)
-				_ = r.exec.observe(OpProgressRequest, start, err)
+				r.exec.record(OpProgressRequest, start, ws.watcher.RequestProgress(ctx))
 			})
 		})
 	}
@@ -319,16 +351,24 @@ func (r *Runner) Steady(ctx context.Context, d time.Duration) (*Report, error) {
 
 	loops.Wait()
 	p.close() // waits for in-flight ops, so the watches still see their events
-	time.Sleep(100 * time.Millisecond)
-	stopWatches()
-	watchers.Wait()
-	_ = watcher.Close()
+	ws.stop(ctx, r.lastWrittenRev())
+	r.endPhase()
 
 	return r.report("steady", stats, c.ExpectedRates()), nil
 }
 
+// lastWrittenRev is the highest revision any response has reported, which
+// with no write in flight is at or above every acknowledged write.
+func (r *Runner) lastWrittenRev() int64 {
+	if r.exec.check == nil {
+		return 0
+	}
+	return r.exec.check.Floor()
+}
+
 // ListStorm has concurrency clients each perform rounds full paginated lists
-// of the pods and nodes prefixes, all at once.
+// of the pods and nodes prefixes, all at once. Each list is checked to be
+// complete and consistent at its revision.
 func (r *Runner) ListStorm(ctx context.Context, concurrency, rounds int) (*Report, error) {
 	c := &r.cfg
 	stats := r.beginPhase()
@@ -340,12 +380,13 @@ func (r *Runner) ListStorm(ctx context.Context, concurrency, rounds int) (*Repor
 		go func() {
 			defer wg.Done()
 			for n := 0; n < rounds && ctx.Err() == nil; n++ {
-				_, _ = r.exec.list(ctx, OpList, c.resourcePrefix(resourcePods), c.ListPageSize)
-				_, _ = r.exec.list(ctx, OpList, c.resourcePrefix(resourceNodes), c.ListPageSize)
+				_, _ = r.exec.list(ctx, OpList, c.resourcePrefix(resourcePods), c.ListPageSize, true)
+				_, _ = r.exec.list(ctx, OpList, c.resourcePrefix(resourceNodes), c.ListPageSize, true)
 			}
 		}()
 	}
 	wg.Wait()
+	r.endPhase()
 	return r.report("list-storm", stats, nil), ctx.Err()
 }
 

@@ -28,9 +28,12 @@ type Report struct {
 	Phase    string        `json:"phase"`
 	Duration time.Duration `json:"duration"`
 
-	Nodes int `json:"nodes"`
-	Pods  int `json:"pods"`
-	Keys  int `json:"keys"`
+	Nodes   int `json:"nodes"`
+	Pods    int `json:"pods"`
+	Keys    int `json:"keys"`
+	Workers int `json:"workers"`
+	// Seed is the random seed of a seeded phase (Saturate), for re-running it.
+	Seed uint64 `json:"seed,omitempty"`
 
 	// Ops is keyed by op label.
 	Ops map[string]*OpReport `json:"ops"`
@@ -38,6 +41,14 @@ type Report struct {
 	TotalOps  int64   `json:"totalOps"`
 	TotalRate float64 `json:"totalRate"`
 	Errors    int64   `json:"errors"`
+	// Violations is the number of correctness violations the oracle found
+	// during the phase (see Checker).
+	Violations int64 `json:"violations"`
+
+	// WriteLatency aggregates the latency of every write op (conditional
+	// Txns); ReadLatency of every read op.
+	WriteLatency LatencyReport `json:"writeLatency"`
+	ReadLatency  LatencyReport `json:"readLatency"`
 
 	// SchedulingLag is how late ops started relative to the model's schedule.
 	SchedulingLag *LatencyReport `json:"schedulingLag,omitempty"`
@@ -116,11 +127,21 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 		Ops:      map[string]*OpReport{},
 		Watches:  map[string]*WatchReport{},
 	}
+	rep.Workers = r.Workers
+	if r.exec.check != nil {
+		rep.Violations = r.exec.check.ViolationCount() - stats.violationsBefore
+	}
+	var writes, reads Histogram
 	stats.mu.RLock()
 	defer stats.mu.RUnlock()
 	for label, st := range stats.ops {
 		count := st.Count.Load()
 		errs := st.Errors.Load()
+		if writeOps[label] {
+			writes.merge(&st.Latency)
+		} else if label != OpLeaseGrant && label != OpCompact && label != OpProgressRequest {
+			reads.merge(&st.Latency)
+		}
 		rep.Ops[label] = &OpReport{
 			Count:        count,
 			Errors:       errs,
@@ -138,6 +159,8 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 		}
 	}
 	rep.TotalRate = float64(rep.TotalOps) / secs
+	rep.WriteLatency = latencyReport(&writes)
+	rep.ReadLatency = latencyReport(&reads)
 	if stats.SchedulingLag.Count() > 0 {
 		lr := latencyReport(&stats.SchedulingLag)
 		rep.SchedulingLag = &lr
@@ -173,8 +196,8 @@ func (r *Runner) report(phase string, stats *Stats, expected map[string]float64)
 // Text renders the report as a table.
 func (r *Report) Text() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "== %s: %d nodes, %d pods (%d keys), %s, %d ops (%.0f/s), %d errors, heap %.0f MB",
-		r.Phase, r.Nodes, r.Pods, r.Keys, r.Duration.Round(time.Millisecond), r.TotalOps, r.TotalRate, r.Errors, float64(r.HeapInuseBytes)/(1<<20))
+	fmt.Fprintf(&sb, "== %s: %d nodes, %d pods (%d keys), %s, %d ops (%.0f/s), %d errors, %d violations, heap %.0f MB",
+		r.Phase, r.Nodes, r.Pods, r.Keys, r.Duration.Round(time.Millisecond), r.TotalOps, r.TotalRate, r.Errors, r.Violations, float64(r.HeapInuseBytes)/(1<<20))
 	if r.LogBytes > 0 {
 		fmt.Fprintf(&sb, ", log %.0f MB on disk", float64(r.LogBytes)/(1<<20))
 	}
@@ -231,6 +254,40 @@ func (r *Report) Text() string {
 		for _, m := range msgs {
 			fmt.Fprintf(&sb, "  %6d  %s\n", r.ErrorSamples[m], m)
 		}
+	}
+	return sb.String()
+}
+
+// Headline is the one-line benchmark summary of the phase: throughput, the
+// tail latency of writes and reads, and how far behind the watches were.
+// For a closed-loop phase (Populate, Saturate) the throughput is what the
+// server sustained; for Steady it is what the model asked for.
+func (r *Report) Headline() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s: %.0f ops/s over %s with %d workers (%d nodes x %d pods)",
+		r.Phase, r.TotalRate, r.Duration.Round(time.Millisecond), r.Workers, r.Nodes, r.Pods/max(r.Nodes, 1))
+	if r.WriteLatency.Count > 0 {
+		fmt.Fprintf(&sb, "; writes p50 %s p99 %s", fmtDur(r.WriteLatency.P50), fmtDur(r.WriteLatency.P99))
+	}
+	if r.ReadLatency.Count > 0 {
+		fmt.Fprintf(&sb, "; reads p50 %s p99 %s", fmtDur(r.ReadLatency.P50), fmtDur(r.ReadLatency.P99))
+	}
+	var events int64
+	for _, w := range r.Watches {
+		events += w.Events
+	}
+	if events > 0 {
+		var worst time.Duration
+		for _, w := range r.Watches {
+			if w.Lag.P99 > worst {
+				worst = w.Lag.P99
+			}
+		}
+		fmt.Fprintf(&sb, "; %d watch events, lag p99 %s", events, fmtDur(worst))
+	}
+	fmt.Fprintf(&sb, "; %d errors, %d violations", r.Errors, r.Violations)
+	if r.Seed != 0 {
+		fmt.Fprintf(&sb, " (seed %d)", r.Seed)
 	}
 	return sb.String()
 }

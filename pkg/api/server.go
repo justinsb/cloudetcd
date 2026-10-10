@@ -91,10 +91,30 @@ type watchStream struct {
 	server *Server
 	stream etcdserverpb.Watch_WatchServer
 	cancel context.CancelFunc
+	// sendMu serializes sends on the stream: each watch's events come from
+	// its own goroutine, and the request handler sends control responses,
+	// but a gRPC stream allows only one sender at a time.
+	sendMu sync.Mutex
 
 	mu          sync.RWMutex
 	watches     map[int64]*activeWatch
 	nextWatchID int64
+}
+
+// send writes one response to the stream.
+func (ws *watchStream) send(resp *etcdserverpb.WatchResponse) error {
+	ws.sendMu.Lock()
+	defer ws.sendMu.Unlock()
+	return ws.stream.Send(resp)
+}
+
+// sendControl writes a control response (created, canceled) to the stream.
+// A failure means the stream is going away, which its receive loop reports;
+// here it is only logged.
+func (ws *watchStream) sendControl(ctx context.Context, resp *etcdserverpb.WatchResponse) {
+	if err := ws.send(resp); err != nil {
+		klog.FromContext(ctx).Error(err, "failed to send watch control response", "watchID", resp.WatchId)
+	}
 }
 
 // activeWatch represents a single active watch
@@ -447,7 +467,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 	}
 
 	callback := func(resp *etcdserverpb.WatchResponse) error {
-		return ws.stream.Send(resp)
+		return ws.send(resp)
 	}
 
 	// Create storage watcher
@@ -463,12 +483,12 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 				log.Error(cerr, "failed to get current revision for compacted-watch cancel; using the compacted revision in the header")
 				current = logPosition
 			}
-			ws.stream.Send(&etcdserverpb.WatchResponse{
+			ws.sendControl(ctx, &etcdserverpb.WatchResponse{
 				Header:  ws.server.createHeader(current),
 				WatchId: watchID,
 				Created: true,
 			})
-			ws.stream.Send(&etcdserverpb.WatchResponse{
+			ws.sendControl(ctx, &etcdserverpb.WatchResponse{
 				Header:          ws.server.createHeader(current),
 				WatchId:         watchID,
 				Canceled:        true,
@@ -483,7 +503,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 			Created:  false,
 			Canceled: true,
 		}
-		ws.stream.Send(resp)
+		ws.sendControl(ctx, resp)
 		return err
 	}
 
@@ -493,7 +513,7 @@ func (ws *watchStream) handleCreateRequest(ctx context.Context, req *etcdserverp
 		WatchId: watchID,
 		Created: true,
 	}
-	ws.stream.Send(resp)
+	ws.sendControl(ctx, resp)
 
 	// Create active watch
 	activeWatch := &activeWatch{
@@ -542,36 +562,49 @@ func (ws *watchStream) handleCancelRequest(ctx context.Context, req *etcdserverp
 			WatchId:  watchID,
 			Canceled: true,
 		}
-		ws.stream.Send(resp)
+		ws.sendControl(ctx, resp)
 	}
 }
 
-// handleProgressRequest handles progress requests
+// handleProgressRequest handles a progress request. As in etcd, the reply
+// is one progress notification for the whole stream (watch ID -1), and it
+// is sent only when every watch on the stream has delivered everything
+// through the revision it carries: kube-apiserver's watch cache takes a
+// progress notification at revision R to mean it has seen every event
+// through R, and serves consistent reads at R on that basis. If some watch
+// is still behind, there is no reply; the client asks again.
 func (ws *watchStream) handleProgressRequest(ctx context.Context, req *etcdserverpb.WatchProgressRequest) error {
 	log := klog.FromContext(ctx)
 
-	// TODO: Should we send the watch position or the log position?
+	// The current revision is read before the watches' positions, so that a
+	// watch found to have delivered through it really has: events through
+	// the revision are sent (under sendMu) before the position advances.
 	logPosition, err := ws.server.storage.GetCurrentRevision(ctx)
 	if err != nil {
-		log := klog.FromContext(ctx)
 		log.Error(err, "failed to get current revision")
-		klog.Fatalf("failed to get revision: %v", err)
-	}
-	if logPosition == 0 {
-		klog.Warningf("logPosition is zero")
+		return fmt.Errorf("getting current revision for progress request: %w", err)
 	}
 
-	// Note: we send this to the magic -1 watch id, not to our watch specifically
-	// This is sort of weird, because what position are we sending?
+	ws.mu.RLock()
+	synced := true
+	for _, watch := range ws.watches {
+		if watch.watcher != nil && watch.watcher.Delivered() < logPosition {
+			synced = false
+			break
+		}
+	}
+	ws.mu.RUnlock()
+	if !synced {
+		return nil
+	}
+
 	resp := &etcdserverpb.WatchResponse{
 		Header:  ws.server.createHeader(logPosition),
-		WatchId: -1, // InvalidWatchID => broadcast
+		WatchId: -1, // InvalidWatchID: a notification for the whole stream
 	}
-
-	if err := ws.stream.Send(resp); err != nil {
+	if err := ws.send(resp); err != nil {
 		log.Error(err, "failed to send progress response")
 	}
-
 	return nil
 }
 

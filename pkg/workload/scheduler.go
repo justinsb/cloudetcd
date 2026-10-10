@@ -91,7 +91,6 @@ func (p *pool) spread(n int, interval time.Duration, fn func(ctx context.Context
 			if !sleepUntil(p.ctx, due) {
 				return
 			}
-			i := i
 			if !p.submit(job{due: due, fn: func(ctx context.Context) { fn(ctx, i) }}) {
 				return
 			}

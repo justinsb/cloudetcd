@@ -113,6 +113,33 @@ func TestRunnerSmoke(t *testing.T) {
 		t.Errorf("steady: only %d lease updates in 3s at 500ms for 4 nodes", rep.Ops[workload.OpNodeLeaseUpdate].Count)
 	}
 
+	rep, err = runner.Saturate(ctx, workload.SaturateOptions{Duration: 2 * time.Second, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("\n" + rep.Text())
+	t.Log(rep.Headline())
+	if rep.Errors != 0 {
+		t.Fatalf("saturate: %d errors", rep.Errors)
+	}
+	if rep.Seed != 1 {
+		t.Errorf("saturate: seed %d, want 1", rep.Seed)
+	}
+	for _, op := range []string{
+		workload.OpNodeLeaseUpdate, workload.OpNodeStatusUpdate, workload.OpPodCreate, workload.OpPodDelete,
+		workload.OpContendedUpdate, workload.OpGet, workload.OpConsistentRead, workload.OpList,
+	} {
+		if rep.Ops[op] == nil || rep.Ops[op].Count == 0 {
+			t.Errorf("saturate: no %s operations were performed", op)
+		}
+	}
+	if rep.Ops[workload.OpContendedUpdate].Conflicts == 0 && rep.Ops[workload.OpPodUpdate].Conflicts == 0 {
+		t.Errorf("saturate: no conflicts at all; the contention is not contending")
+	}
+	if rep.WriteLatency.Count == 0 || rep.ReadLatency.Count == 0 {
+		t.Errorf("saturate: write/read latency not aggregated: %+v %+v", rep.WriteLatency, rep.ReadLatency)
+	}
+
 	rep, err = runner.ListStorm(ctx, 3, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -123,5 +150,20 @@ func TestRunnerSmoke(t *testing.T) {
 	}
 	if got := rep.Ops[workload.OpList].Count; got != 12 {
 		t.Errorf("list-storm: %d lists, want 12", got)
+	}
+
+	// Nothing the server said disagreed with what was written, and the
+	// state at the end is exactly what the oracle expects.
+	check := runner.Checker()
+	if n, err := check.VerifyState(ctx, client, cfg.Prefix, cfg.ListPageSize); err != nil {
+		t.Fatal(err)
+	} else if n == 0 {
+		t.Error("verify-state listed no keys")
+	}
+	if n := check.ViolationCount(); n != 0 {
+		for _, v := range check.Violations() {
+			t.Errorf("violation: %v", v)
+		}
+		t.Fatalf("%d correctness violations", n)
 	}
 }
