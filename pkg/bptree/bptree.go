@@ -163,19 +163,64 @@ func (t *BPTree) AddRevision(key []byte, revision Revision, tombstone bool) {
 // through and the latest one below, which is all a read at or after through
 // can observe. A key whose latest revision is a delete at or below through is
 // removed. It returns the number of keys removed and revisions dropped.
+// It locks the tree for the whole walk; the server uses CompactFrom.
 func (t *BPTree) Compact(through Revision) (keysRemoved, revisionsDropped int) {
+	_, keysRemoved, revisionsDropped = t.CompactFrom(nil, through, 0)
+	return keysRemoved, revisionsDropped
+}
+
+// CompactFrom is Compact a chunk at a time: it prunes up to maxKeys keys in
+// key order (all of them if maxKeys <= 0), starting after start (from the
+// beginning if start is nil), and returns where to continue — nil when the
+// walk is done — with the counts. Callers loop over it, so the tree is
+// locked only a chunk at a time while reads and writes interleave. That is
+// sound because pruning only ever shrinks a key's revisions: revisions at
+// or above through, and everything written between chunks, are kept, and
+// reads pick each key's latest revision at or below their snapshot, which
+// pruning never touches for the snapshots still readable after Compact.
+func (t *BPTree) CompactFrom(start []byte, through Revision, maxKeys int) (next []byte, keysRemoved, revisionsDropped int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	dropped, gone := t.emptyKey.compact(through)
-	revisionsDropped += dropped
-	if gone {
-		keysRemoved++
+
+	s := &compactState{through: through, remaining: maxKeys}
+	if maxKeys <= 0 {
+		s.remaining = int(^uint(0) >> 1)
 	}
-	k, d := t.root.compact(through)
-	keysRemoved += k
-	revisionsDropped += d
-	t.keys -= keysRemoved
-	return keysRemoved, revisionsDropped
+	var walkStart []byte
+	if start == nil {
+		if t.emptyKey.revisions != nil {
+			dropped, gone := t.emptyKey.compact(through)
+			s.dropped += dropped
+			if gone {
+				s.removed++
+			}
+			s.remaining--
+		}
+		if s.remaining == 0 {
+			// Resume strictly after the empty key: at the first real key.
+			s.next = []byte{}
+		}
+	} else {
+		// Resume strictly after start: with byte-string keys, that is at or
+		// after start plus a zero byte.
+		walkStart = append(bytes.Clone(start), 0)
+	}
+	if s.next == nil {
+		t.root.compactWalk(make([]byte, 0, 256), walkStart, s)
+	}
+	t.keys -= s.removed
+	return s.next, s.removed, s.dropped
+}
+
+// compactState carries one CompactFrom chunk through the walk.
+type compactState struct {
+	through   Revision
+	remaining int
+	removed   int
+	dropped   int
+	// next is the last key pruned when the chunk ran out, nil while the
+	// walk should continue.
+	next []byte
 }
 
 // compactRevisions trims one key's revisions for Compact.
@@ -195,21 +240,55 @@ func compactRevisions(revisions []Revision, tombstone bool, through Revision) (k
 	return append(revisions[:0], revisions[i:]...), i, false
 }
 
-func (n *node) compact(through Revision) (keysRemoved, revisionsDropped int) {
-	for i := range n.entries {
+// compactWalk prunes the keys below this node in key order, skipping those
+// below start (relative to this node; nil once passed), stopping when the
+// chunk is used up. It returns false to unwind the walk, with state.next
+// set. The start handling mirrors (*node).list.
+func (n *node) compactWalk(path []byte, start []byte, s *compactState) bool {
+	i := 0
+	if len(start) > 0 {
+		i, _ = n.find(start[0])
+	}
+	for ; i < len(n.entries); i++ {
 		e := &n.entries[i]
-		dropped, gone := e.compact(through)
-		revisionsDropped += dropped
-		if gone {
-			keysRemoved++
+		childStart := []byte(nil)
+		pruneOwn := true
+		if len(start) > 0 {
+			m := min(len(e.prefix), len(start))
+			switch c := bytes.Compare(e.prefix[:m], start[:m]); {
+			case c < 0:
+				// The whole subtree is below start.
+				continue
+			case c == 0 && len(e.prefix) < len(start):
+				// start continues below this entry: the entry's own key is
+				// below start, and only part of its subtree qualifies.
+				pruneOwn = false
+				childStart = start[len(e.prefix):]
+			default:
+				// e.prefix >= start: everything from here on qualifies.
+			}
+			// Later siblings are entirely above start.
+			start = nil
+		}
+		key := append(path, e.prefix...)
+		if pruneOwn && e.revisions != nil {
+			dropped, gone := e.compact(s.through)
+			s.dropped += dropped
+			if gone {
+				s.removed++
+			}
+			if s.remaining--; s.remaining == 0 {
+				s.next = bytes.Clone(key)
+				return false
+			}
 		}
 		if e.child != nil {
-			k, d := e.child.compact(through)
-			keysRemoved += k
-			revisionsDropped += d
+			if !e.child.compactWalk(key, childStart, s) {
+				return false
+			}
 		}
 	}
-	return keysRemoved, revisionsDropped
+	return true
 }
 
 // addRevision adds revision for the key that continues with key from this

@@ -416,3 +416,42 @@ func TestCompactedReadsAndWatches(t *testing.T) {
 	}
 	w.Close()
 }
+
+// TestCompactedGateSurvivesRestart checks that the reads-below-the-point
+// gate is rebuilt from the log on startup: the compaction point is not
+// stored anywhere else, and before the log reported its floor a restarted
+// server answered reads below the point from the pruned index (absent keys)
+// instead of refusing them.
+func TestCompactedGateSurvivesRestart(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	opts := filesystemlog.Options{RotateBytes: 2000}
+	store := openStore(t, dir, opts)
+	defer func() { store.log.Close() }()
+
+	var putRev []Revision
+	for i := 0; i < 200; i++ {
+		resp, err := store.Put(ctx, &etcdserverpb.PutRequest{Key: []byte(fmt.Sprintf("/k/%02d", i%10)), Value: []byte(fmt.Sprintf("v%d", i))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		putRev = append(putRev, Revision(resp.Header.Revision))
+	}
+	point := putRev[150]
+	if compacted, err := store.Compact(ctx, point); err != nil || compacted != point {
+		t.Fatalf("Compact = %d, %v; want %d", compacted, err, point)
+	}
+	store.WaitForCompaction()
+
+	store = restart(t, store, dir, opts)
+	if _, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/01"), Revision: int64(putRev[50])}); !errors.Is(err, storage.ErrCompacted) {
+		t.Fatalf("read below the point after restart: got %v, want ErrCompacted", err)
+	}
+	cb := func(*etcdserverpb.WatchResponse) error { return nil }
+	if _, _, err := store.Watch(ctx, &etcdserverpb.WatchCreateRequest{WatchId: 1, Key: []byte("/k/01"), StartRevision: int64(putRev[50])}, cb); !errors.Is(err, storage.ErrCompacted) {
+		t.Fatalf("watch below the point after restart: got %v, want ErrCompacted", err)
+	}
+	if resp, err := store.Get(ctx, &etcdserverpb.RangeRequest{Key: []byte("/k/01"), Revision: int64(point)}); err != nil || len(resp.Kvs) == 0 {
+		t.Fatalf("read at the point after restart: %v, %v", resp.GetKvs(), err)
+	}
+}

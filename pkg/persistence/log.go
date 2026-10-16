@@ -74,6 +74,11 @@ type Log interface {
 	// SetListener sets the log listener
 	SetListener(listener LogListener)
 
+	// CompactedFloor returns a lower bound on the revision the log has been
+	// compacted through — reads at or below it may fail with ErrCompacted —
+	// recovered from the log itself, so it survives a restart.
+	CompactedFloor() Revision
+
 	// Compact discards records at or below through that are no longer live:
 	// deletes, and puts that live(key, revision) reports have been
 	// superseded. Records above through, and the latest put of every key,
